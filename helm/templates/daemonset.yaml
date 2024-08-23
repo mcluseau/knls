@@ -1,0 +1,145 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: knls
+  labels:
+    app: knls
+spec:
+  minReadySeconds: 60
+
+  updateStrategy:
+{{ if .Values.hostNetwork }}
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 10%
+{{ else }}
+    rollingUpdate:
+      maxSurge: 10%
+      maxUnavailable: 0
+{{ end }}
+
+  selector:
+    matchLabels:
+      app: knls
+  template:
+    metadata:
+      labels:
+        app: knls
+    spec:
+      priorityClassName: system-cluster-critical
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - key: CriticalAddonsOnly
+        operator: Exists
+
+      serviceAccountName: knls
+      hostNetwork: {{ .Values.hostNetwork }}
+{{- with .Values.hostAliases }}
+      hostAliases:
+{{ . |toYaml |indent 6 }}
+{{- end }}
+
+{{- if .Values.service_ips }}
+      initContainers:
+      - name: init-nftables
+        image: mcluseau/nftables:v1.0.9
+        securityContext:
+          capabilities:
+            add: [ NET_ADMIN ]
+
+        command:
+        - ash
+        - -c
+        - |
+          nft -f - <<EOF
+          table inet knls {};
+          delete table inet knls;
+          table inet knls {
+            chain prerouting {
+              type nat hook prerouting priority -101; policy accept;
+{{- if .Values.dns }}{{ range .Values.service_ips }}
+              ip daddr {{.}} udp dport 53 redirect;
+{{- end }}{{ end }}
+            }
+{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+            chain wireguard {
+              type nat hook postrouting priority 999; policy accept;
+              fib saddr type local oif {{ .ifname |quote }} masquerade
+            }
+{{- end }}{{ end }}
+{{ .Values.nft.extra_conf |indent 12 }}
+          }
+          EOF
+{{- end }}
+
+      containers:
+      - name: knls
+        args:
+        - --cluster-domain={{ .Values.cluster_domain }}
+{{- with .Values.cluster_url }}
+        - --cluster-url={{ . }}
+{{- end }}
+        - --proxy=nftables
+{{- with .Values.dns }}
+        - --dns={{ . }}
+{{- end }}
+{{- if .Values.connectivity}}
+        - --connectivity={{.Values.connectivity}}
+{{- end }}
+{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+        - --wireguard-ifname={{.ifname}}
+        - --wireguard-key=/var/lib/knls/wireguard/{{.key}}
+{{- end }}{{ end }}
+        image: docker.io/mcluseau/knls:0.1.0
+        imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
+        securityContext:
+          readOnlyRootFilesystem: true
+          capabilities:
+            add:
+            - NET_ADMIN
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        volumeMounts:
+{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+        - name: wireguard
+          mountPath: /var/lib/knls/wireguard
+{{- end }}{{ end }}
+        resources:
+{{ .Values.resources.knls |toYaml | indent 10 }}
+
+{{- if .Values.dns }}
+      - name: unbound
+        args: [ "-d", "-p", "-c", "/config/unbound.conf" ]
+        image: docker.io/mcluseau/unbound:1.20.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: zones
+          mountPath: /zones
+          readOnly: true
+        resources:
+{{ .Values.resources.unbound |toYaml | indent 10 }}
+{{- end }}
+
+      volumes:
+      - name: config
+        configMap:
+          name: knls-config
+      - name: empty
+        emptyDir:
+          medium: Memory
+          sizeLimit: 10Mi
+{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+      - name: wireguard
+        hostPath:
+          type: DirectoryOrCreate
+          path: {{ .key_dir }}
+{{- end }}{{ end }}
+

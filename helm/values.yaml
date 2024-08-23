@@ -1,0 +1,50 @@
+
+hostNetwork: true
+
+#service_ips: [ 1.2.3.4 ]
+cluster_domain: cluster.local
+extra_zones: {}
+
+# for direct connection:
+#
+#cluster_url: "https://kubernetes:6443"
+#hostAliases:
+#- { hostnames: [ kubernetes ], ip: 1.1.1.1 }
+#- { hostnames: [ kubernetes ], ip: 2.2.2.2 }
+#- { hostnames: [ kubernetes ], ip: 3.3.3.3 }
+
+nft:
+  extra_conf: ""
+
+# values: null, wireguard
+connectivity: null
+
+wireguard:
+  ifname: kwg
+  key_dir: /var/lib/knls/wireguard
+  key: wireguard.key
+
+dns: internal
+
+unbound:
+  listen: |
+    interface: 0.0.0.0
+    interface: ::0
+  server_extra: |
+    access-control: 0.0.0.0/0 allow
+  extra_conf: ""
+
+resources:
+  knls:
+    limits:
+      memory: 16Mi
+    requests:
+      memory: 10Mi
+      cpu: 10m
+  unbound:
+    limits:
+      memory: 12Mi
+    requests:
+      memory: 12Mi
+      cpu: 10m
+

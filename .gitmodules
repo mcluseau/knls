@@ -1,0 +1,3 @@
+[submodule "wireguard-rs"]
+	path = wireguard-rs
+	url = ./wireguard-rs

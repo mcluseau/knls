@@ -1,0 +1,85 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knls-config
+data:
+{{- if eq "knotd" .Values.dns}}
+  knot.conf: |
+    server:
+      listen:      127.0.0.1@1053
+      listen:            ::1@1053
+      automatic-acl: on
+
+    template:
+    - id: default
+      storage: /storage
+      file: %s
+
+{{ .Values.knotd.extra_conf |indent 4 }}
+{{- end }}
+
+{{- if eq "nsd" .Values.dns}}
+  nsd.conf: |
+    server:
+      server-count: 1
+      username: ""
+      zonesdir: /storage
+      confine-to-zone: yes
+
+    remote-control:
+      control-enable: yes
+      server-key-file:   /tls/nsd-server/tls.key
+      server-cert-file:  /tls/nsd-control/server.crt
+      control-key-file:  /tls/nsd-control/tls.key
+      control-cert-file: /tls/nsd-control/tls.crt
+
+    pattern:
+      name: zone
+      zonefile: "/storage/%s"
+
+{{ .Values.nsd.extra_conf |indent 4 }}
+{{- end }}
+
+  unbound.conf: |
+    server:
+{{ .Values.unbound.listen |indent 6 }}
+
+      chroot: ""
+      use-syslog: no
+      verbosity: 1
+      trust-anchor-file: "/usr/share/dnssec-root/trusted-key.key"
+      qname-minimisation: yes
+      do-not-query-localhost: no
+
+      domain-insecure: {{ .Values.cluster_domain |quote }}
+      local-zone: {{ .Values.cluster_domain |quote }} nodefault
+    {{- range (keys .Values.extra_zones) }}
+      domain-insecure: {{ . |quote }}
+      local-zone: {{ . |quote }} nodefault
+    {{- end}}
+
+{{ .Values.unbound.server_extra |indent 6 }}
+
+    stub-zone:
+      name: {{ .Values.cluster_domain |quote }}
+      stub-addr: 127.0.0.1@1053
+      stub-no-cache: yes
+
+    {{- range (keys .Values.extra_zones) }}
+    auth-zone:
+      name: {{ . |quote }}
+      zonefile: /zones/{{.}}
+      for-downstream: no
+    {{- end}}
+
+{{ .Values.unbound.extra_conf |indent 4 }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knls-zones
+data:
+{{ .Values.extra_zones |toYaml |indent 2 }}
+
