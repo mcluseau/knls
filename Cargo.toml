@@ -6,6 +6,12 @@ edition = "2021"
 [features]
 ingress = []
 
+[profile.release]
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.5.16", features = ["derive", "env"] }

@@ -21,7 +21,6 @@ pub async fn watch(
     disable_nodeports: bool,
     mut watcher: Watcher,
 ) -> Result<()> {
-    let mut n = 0;
     let mut table = TableTracker::new(format!("inet {table_name}"));
 
     loop {
@@ -37,68 +36,91 @@ pub async fn watch(
             continue;
         };
 
-        if log::log_enabled!(log::Level::Debug) {
-            nft_dump_table_to(&table_name, &format!("nftables.{:03}.initial", n)).await?;
-        }
-
-        if let Err(e) = update_table(&mut table, &my_node, &cfg).await {
-            if log::log_enabled!(log::Level::Debug) {
-                let err_file = format!("nftables.{:03}.conf", n);
-                error!("partial update of table failed ({e}, see {err_file}); doing a full update");
-                tokio::fs::write(&err_file, &table.nft).await?;
-                n += 1;
-            } else {
-                error!("partial update of table failed ({e}); doing a full update");
-            }
+        if let Err(e) = update_table(&mut table, &my_node, &cfg) {
+            error!("partial update of table failed ({e}); doing a full update");
 
             table.clear();
-            if let Err(e) = update_table(&mut table, &my_node, &cfg).await {
+            if let Err(e) = update_table(&mut table, &my_node, &cfg) {
                 error!("full update failed ({e}), will retry on next update");
                 table.clear();
                 continue;
             }
-        } else if log::log_enabled!(log::Level::Debug) && !table.nft.is_empty() {
-            let out_file = format!("nftables.{:03}.conf", n);
-            tokio::fs::write(&out_file, &table.nft).await?;
-            debug!("nft input saved to {out_file}");
-            n += 1;
         }
 
         table.update_done();
     }
 }
 
-async fn nft_dump_table_to(table_name: &str, out_file: &str) -> eyre::Result<()> {
-    let mut out = tokio::fs::File::create(&out_file).await?;
-
-    let child = tokio::process::Command::new("nft")
-        .args(["list", "table", "inet", table_name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::State) -> Result<()> {
+    let mut child = std::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
         .spawn()?;
 
-    let mut stdout = child.stdout.unwrap();
-    tokio::io::copy(&mut stdout, &mut out).await?;
+    let mut nft = io::BufWriter::new(child.stdin.as_mut().unwrap());
 
-    debug!("nft state saved to {out_file}");
-    Ok(())
+    update_table_to(&mut nft, table, my_node, cfg)?;
+
+    nft.flush()?;
+    drop(nft);
+
+    let status = child.wait()?;
+    if status.success() {
+        return Ok(()); // all good
+    }
+
+    // update failed; if debugging, dump the failing update script.
+    if log::log_enabled!(log::Level::Debug) {
+        // revert to the previous table state
+        table.update_failed();
+
+        debug!("update failed, writing update script to stderr");
+        let mut nft = std::io::stderr();
+
+        // and produce the script again
+        if let Err(e) = update_table_to(&mut nft, table, my_node, cfg) {
+            debug!("failed to write update script: {e}");
+        }
+    }
+
+    Err(format_err!("nft command failed ({status})"))
 }
 
-async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::State) -> Result<()> {
-    table.prepare()?;
+fn update_table_to<W: Write>(
+    nft: &mut W,
+    table: &mut TableTracker,
+    my_node: &Node,
+    cfg: &proxy::State,
+) -> Result<()> {
+    let mut update = table.update(nft);
+
+    update.prepare()?;
 
     // ----------------------------------------
     for (key, svc) in cfg.iter() {
-        write_service_slices_elements(table, &my_node, key, &svc, false, &svc.internal_slices)?;
+        write_service_slices_elements(
+            &mut update,
+            &my_node,
+            key,
+            &svc,
+            false,
+            &svc.internal_slices,
+        )?;
 
         if let Some(external_slices) = svc.external_slices.as_ref() {
-            write_service_slices_elements(table, &my_node, key, &svc, true, &external_slices)?;
+            write_service_slices_elements(
+                &mut update,
+                &my_node,
+                key,
+                &svc,
+                true,
+                &external_slices,
+            )?;
         };
     }
 
     // ----------------------------------------
-    table.ctr(CtrKind::Map, "service_ips", |buf| {
+    update.ctr(CtrKind::Map, "service_ips", |buf| {
         writeln!(
             buf,
             concat!(
@@ -117,14 +139,14 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
             let proto = nft_proto(proto);
 
             for ip in &svc.cluster_ips {
-                table.map_element(
+                update.map_element(
                     SERVICE_IPS,
                     format!("{ip} . {proto} . {port}"),
                     format!("goto {svc_chain}"),
                 )?;
             }
             for ip in &svc.external_ips {
-                table.map_element(
+                update.map_element(
                     SERVICE_IPS,
                     format!("{ip} . {proto} . {port}"),
                     format!("goto {svc_chain_ext}"),
@@ -134,7 +156,7 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
     }
 
     // ----------------------------------------
-    table.ctr(CtrKind::Map, SERVICE_NODEPORTS, |buf| {
+    update.ctr(CtrKind::Map, SERVICE_NODEPORTS, |buf| {
         writeln!(buf, "  comment \"NodePort traffic\"")?;
         writeln!(buf, "  type inet_proto . inet_service : verdict")
     })?;
@@ -146,7 +168,7 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
             let (proto, port) = port.0.protocol_port();
             let proto = nft_proto(proto);
 
-            table.map_element(
+            update.map_element(
                 SERVICE_NODEPORTS,
                 format!("{proto} . {port}"),
                 format!("goto {}", svc_chain_ext),
@@ -155,7 +177,7 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
     }
 
     // ----------------------------------------
-    table.ctr(CtrKind::Chain, "dispatch", |buf| {
+    update.ctr(CtrKind::Chain, "dispatch", |buf| {
         writeln!(
             buf,
             concat!(
@@ -166,33 +188,33 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
     })?;
 
     // ----------------------------------------
-    table.ctr(CtrKind::Chain, "a_hook_dnat_prerouting", |buf| {
+    update.ctr(CtrKind::Chain, "a_hook_dnat_prerouting", |buf| {
         writeln!(buf, "  type nat hook prerouting priority 0;")?;
         writeln!(buf, "  jump dispatch;")
     })?;
-    table.ctr(CtrKind::Chain, "a_hook_dnat_output", |buf| {
+    update.ctr(CtrKind::Chain, "a_hook_dnat_output", |buf| {
         writeln!(buf, "  type nat hook output priority 0;")?;
         writeln!(buf, "  jump dispatch;")
     })?;
 
     // ----------------------------------------
-    table.ctr(CtrKind::Set, "need_masquerade", |buf| {
+    update.ctr(CtrKind::Set, "need_masquerade", |buf| {
         writeln!(buf, "  type ipv4_addr . ipv4_addr . ipv4_addr")
     })?;
-    table.ctr(CtrKind::Set, "need_masquerade6", |buf| {
+    update.ctr(CtrKind::Set, "need_masquerade6", |buf| {
         writeln!(buf, "  type ipv6_addr . ipv6_addr . ipv6_addr")
     })?;
 
     for (_, svc) in cfg.iter().filter(|(_, svc)| !svc.cluster_ips.is_empty()) {
         for ep in svc.internal_endpoints().filter(|ep| ep.node_local) {
-            set_need_masquerade_for(table, ep, svc.cluster_ips.iter(), &my_node.ips)?;
+            set_need_masquerade_for(&mut update, ep, svc.cluster_ips.iter(), &my_node.ips)?;
         }
         for ep in svc.external_endpoints().filter(|ep| ep.node_local) {
-            set_need_masquerade_for(table, ep, svc.external_ips.iter(), &my_node.ips)?;
+            set_need_masquerade_for(&mut update, ep, svc.external_ips.iter(), &my_node.ips)?;
         }
     }
 
-    table.ctr(CtrKind::Chain, "a_hook_dnat_postrouting", |buf| {
+    update.ctr(CtrKind::Chain, "a_hook_dnat_postrouting", |buf| {
         writeln!(buf, "  type nat hook postrouting priority 0;")?;
         writeln!(
             buf,
@@ -201,50 +223,8 @@ async fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::Sta
     })?;
 
     // ----------------------------------------
-    for (kind, ctr_name) in table.ctrs.current_keys() {
-        let deleted: Box<dyn Iterator<Item = &String>> = match kind {
-            CtrKind::Set => Box::new(table.sets.get(ctr_name).unwrap().deleted()),
-            CtrKind::Map => Box::new(table.maps.get(ctr_name).unwrap().deleted()),
-            _ => {
-                continue;
-            }
-        };
-
-        for key in deleted {
-            writeln!(
-                &mut table.nft,
-                "delete element {} {ctr_name} {{ {key} }}",
-                table.table
-            )?;
-        }
-    }
-
-    for (kind, name) in table.ctrs.deleted() {
-        writeln!(&mut table.nft, "delete {kind} {} {name};", table.table)?;
-    }
-
-    // ----------------------------------------
-    if table.nft.is_empty() {
-        return Ok(());
-    }
-
-    let mut child = tokio::process::Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-
-    use tokio::io::AsyncWriteExt;
-    let stdin = child.stdin.as_mut().unwrap();
-    if let Err(e) = stdin.write_all(&table.nft).await {
-        error!("nft's stdin write failed: {e}");
-    }
-
-    let status = child.wait().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format_err!("nft command failed ({status})"))
-    }
+    update.finalize()?;
+    Ok(())
 }
 
 fn obj_chain(prefix: &str, key: &keys::Object) -> String {
@@ -267,8 +247,8 @@ fn affinity_set(key: &keys::Object, ip_version: char) -> String {
     obj_chain(&format!("affinity{ip_version}"), key)
 }
 
-fn write_service_slices_elements(
-    table: &mut TableTracker,
+fn write_service_slices_elements<W: Write>(
+    table: &mut TableUpdater<W>,
     my_node: &Node,
     key: &keys::Object,
     svc: &proxy::Service,
@@ -422,8 +402,8 @@ impl<'t> DnatWriter<'t> {
     }
 }
 
-fn set_need_masquerade_for<'t>(
-    table: &mut TableTracker,
+fn set_need_masquerade_for<'t, W: Write>(
+    table: &mut TableUpdater<W>,
     ep: &LocalEndpoint,
     ips: impl Iterator<Item = &'t IpAddr>,
     my_ips: &Vec<IpAddr>,
@@ -467,9 +447,6 @@ struct TableTracker {
     ctrs: change::Tracker<(CtrKind, String), u128>,
     sets: Map<String, change::Tracker<String, ()>>,
     maps: Map<String, change::Tracker<String, u128>>,
-    maps_to_define: Map<String, Vec<u8>>,
-    nft: Vec<u8>,
-    buf: Vec<u8>,
 }
 impl TableTracker {
     fn new(name: String) -> Self {
@@ -479,9 +456,6 @@ impl TableTracker {
             ctrs: change::Tracker::new(),
             sets: Map::new(),
             maps: Map::new(),
-            maps_to_define: Map::new(),
-            nft: Vec::with_capacity(1024),
-            buf: Vec::with_capacity(1024),
         }
     }
 
@@ -490,10 +464,13 @@ impl TableTracker {
         self.ctrs.clear();
         self.sets.clear();
         self.maps.clear();
-        self.reset_bufs();
     }
 
-    fn update_done(&mut self) {
+    pub fn update<'t, W: Write>(&'t mut self, nft: &'t mut W) -> TableUpdater<'t, W> {
+        TableUpdater::new(self, nft)
+    }
+
+    pub fn update_done(&mut self) {
         self.has_table = true;
 
         for (kind, key) in self.ctrs.deleted() {
@@ -515,11 +492,9 @@ impl TableTracker {
         for set in self.sets.values_mut() {
             set.update_done();
         }
-        self.reset_bufs();
     }
 
-    #[allow(unused)]
-    fn update_failed(&mut self) {
+    pub fn update_failed(&mut self) {
         self.ctrs.update_failed();
         for map in self.maps.values_mut() {
             map.update_failed();
@@ -527,35 +502,63 @@ impl TableTracker {
         for set in self.sets.values_mut() {
             set.update_failed();
         }
-        self.reset_bufs();
     }
+}
 
-    fn reset_bufs(&mut self) {
-        self.maps_to_define.clear();
-        Self::reset_buf(&mut self.nft);
-        Self::reset_buf(&mut self.buf);
-    }
+struct TableUpdater<'t, W>
+where
+    W: Write,
+{
+    tracker: &'t mut TableTracker,
+    nft: &'t mut W,
+    buf: Vec<u8>,
+    maps_to_define: Map<String, Vec<u8>>,
+}
 
-    fn reset_buf(buf: &mut Vec<u8>) {
-        if buf.capacity() > 1024 {
-            *buf = Vec::with_capacity(1024);
-        } else {
-            buf.clear();
+impl<'t, W: Write> TableUpdater<'t, W> {
+    pub fn new(tracker: &'t mut TableTracker, nft: &'t mut W) -> Self {
+        Self {
+            tracker,
+            nft,
+            buf: Vec::with_capacity(1024),
+            maps_to_define: Map::new(),
         }
     }
 
     fn prepare(&mut self) -> io::Result<()> {
-        if self.has_table {
+        if self.tracker.has_table {
             return Ok(());
         }
 
-        let table = &self.table;
-
+        let table = &self.tracker.table;
         info!("assuming no table, will recreate table {table}");
 
         writeln!(self.nft, "table {table} {{}};")?;
         writeln!(self.nft, "delete table {table};")?;
         writeln!(self.nft, "table {table} {{}};")?;
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<()> {
+        let table = &self.tracker.table;
+        for (kind, ctr_name) in self.tracker.ctrs.current_keys() {
+            let deleted: Box<dyn Iterator<Item = &String>> = match kind {
+                CtrKind::Set => Box::new(self.tracker.sets.get(ctr_name).unwrap().deleted()),
+                CtrKind::Map => Box::new(self.tracker.maps.get(ctr_name).unwrap().deleted()),
+                _ => {
+                    continue;
+                }
+            };
+
+            for key in deleted {
+                writeln!(self.nft, "delete element {table} {ctr_name} {{ {key} }}")?;
+            }
+        }
+
+        for (kind, name) in self.tracker.ctrs.deleted() {
+            writeln!(self.nft, "delete {kind} {table} {name};")?;
+        }
+
         Ok(())
     }
 
@@ -571,23 +574,27 @@ impl TableTracker {
 
         let name = name.to_string();
 
-        let Some(change) = self.ctrs.check((kind.clone(), name.clone()), &h) else {
-            // there's an nft bug when writing chains with map ref: the map must be defined in the
+        let Some(change) = self.tracker.ctrs.check((kind.clone(), name.clone()), &h) else {
+            // there's an nft bug when writing chains with map refs: the map must be defined in the
             // script otherwise it fails (even if the map was defined in a previous iteration).
             self.maps_to_define.insert(name.clone(), self.buf.clone());
             return Ok(false);
         };
 
         let nft = &mut self.nft;
-        let table = &self.table;
+        let table = &self.tracker.table;
 
         match change.kind {
             change::Kind::Created => match kind {
                 CtrKind::Set => {
-                    self.sets.insert(name.clone(), change::Tracker::new());
+                    self.tracker
+                        .sets
+                        .insert(name.clone(), change::Tracker::new());
                 }
                 CtrKind::Map => {
-                    self.maps.insert(name.clone(), change::Tracker::new());
+                    self.tracker
+                        .maps
+                        .insert(name.clone(), change::Tracker::new());
                 }
                 _ => {}
             },
@@ -598,10 +605,10 @@ impl TableTracker {
 
         // redefine maps to workaround nft bug
         for token in self.buf.split(|b| b" ;\t\n".contains(b)) {
-            if token.get(0) != Some(&b'@') {
-                continue; // not a ref
-            }
-            let name = String::from_utf8_lossy(&token[1..]).to_string();
+            let Some(name) = token.strip_prefix(b"@") else {
+                continue; // word is not a ref
+            };
+            let name = String::from_utf8_lossy(&name).to_string();
             let Some(def) = self.maps_to_define.get(&name) else {
                 continue; // not a ref to a map
             };
@@ -622,16 +629,14 @@ impl TableTracker {
 
     fn map_element(&mut self, map_name: &str, key: String, value: String) -> io::Result<()> {
         let h = xxhash_rust::xxh3::xxh3_128(value.as_bytes());
-        let Some(change) = self
-            .maps
-            .get_mut(map_name)
+        let Some(change) = (self.tracker.maps.get_mut(map_name))
             .unwrap() // 'element' must be called before
             .check(key, &h)
         else {
             return Ok(());
         };
 
-        let table = &self.table;
+        let table = &self.tracker.table;
         let key = change.key();
 
         match change.kind {
@@ -651,16 +656,14 @@ impl TableTracker {
     }
 
     fn set_element(&mut self, set_name: &str, key: String) -> io::Result<()> {
-        let Some(change) = self
-            .sets
-            .get_mut(set_name)
+        let Some(change) = (self.tracker.sets.get_mut(set_name))
             .unwrap() // 'element' must be call before
             .check(key, &())
         else {
             return Ok(());
         };
 
-        let table = &self.table;
+        let table = &self.tracker.table;
         let key = change.key();
 
         match change.kind {

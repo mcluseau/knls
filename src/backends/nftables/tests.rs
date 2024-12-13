@@ -1,18 +1,21 @@
 use super::*;
 
 #[test]
-fn test_table_tracker() -> io::Result<()> {
+fn test_table_tracker() -> eyre::Result<()> {
     let mut table = TableTracker::new("inet kube-proxy".into());
+    let mut nft = Vec::new();
 
     // initial table
-    table.prepare()?;
-    table.ctr(CtrKind::Chain, "dispatch", |buf| {
+    let mut update = table.update(&mut nft);
+    update.prepare()?;
+    update.ctr(CtrKind::Chain, "dispatch", |buf| {
         writeln!(buf, "  test rule")
     })?;
+    update.finalize()?;
 
     assert_eq!(
-        String::from_utf8_lossy(&table.nft),
-        "table inet kube-proxy {};
+        &nft,
+        b"table inet kube-proxy {};
 delete table inet kube-proxy;
 table inet kube-proxy {};
 chain inet kube-proxy dispatch {
@@ -22,27 +25,32 @@ chain inet kube-proxy dispatch {
     );
 
     table.update_done();
-    assert_eq!(String::from_utf8_lossy(&table.nft), "");
 
-    // update to the same table
-    table.prepare()?;
-    assert_eq!(String::from_utf8_lossy(&table.nft), "");
-    table.ctr(CtrKind::Chain, "dispatch", |buf| {
+    // update with the same table
+    nft.clear();
+    let mut update = table.update(&mut nft);
+    update.prepare()?;
+    assert_eq!(String::from_utf8_lossy(&update.nft), "");
+    update.ctr(CtrKind::Chain, "dispatch", |buf| {
         writeln!(buf, "  test rule")
     })?;
-    assert_eq!(String::from_utf8_lossy(&table.nft), "");
+    update.finalize()?;
+
+    assert_eq!(nft, b"");
     table.update_done();
-    assert_eq!(String::from_utf8_lossy(&table.nft), "");
 
     // update with a different chain
-    table.prepare()?;
-    table.ctr(CtrKind::Chain, "dispatch", |buf| {
+    nft.clear();
+    let mut update = table.update(&mut nft);
+    update.prepare()?;
+    update.ctr(CtrKind::Chain, "dispatch", |buf| {
         writeln!(buf, "  test rule2")
     })?;
+    update.finalize()?;
 
     assert_eq!(
-        String::from_utf8_lossy(&table.nft),
-        "flush chain inet kube-proxy dispatch;
+        nft,
+        b"flush chain inet kube-proxy dispatch;
 chain inet kube-proxy dispatch {
   test rule2
 };
@@ -50,7 +58,6 @@ chain inet kube-proxy dispatch {
     );
 
     table.update_done();
-    assert_eq!(String::from_utf8_lossy(&table.nft), "");
 
     Ok(())
 }

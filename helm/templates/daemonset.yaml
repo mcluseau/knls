@@ -41,10 +41,9 @@ spec:
 {{ . |toYaml |indent 6 }}
 {{- end }}
 
-{{- if .Values.service_ips }}
       initContainers:
       - name: init-nftables
-        image: mcluseau/nftables:v1.0.9
+        image: docker.io/mcluseau/knls:0.1.1
         securityContext:
           capabilities:
             add: [ NET_ADMIN ]
@@ -72,7 +71,6 @@ spec:
 {{ .Values.nft.extra_conf |indent 12 }}
           }
           EOF
-{{- end }}
 
       containers:
       - name: knls
@@ -92,7 +90,7 @@ spec:
         - --wireguard-ifname={{.ifname}}
         - --wireguard-key=/var/lib/knls/wireguard/{{.key}}
 {{- end }}{{ end }}
-        image: docker.io/mcluseau/knls:0.1.0
+        image: docker.io/mcluseau/knls:0.1.1
         imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
         securityContext:
           readOnlyRootFilesystem: true
@@ -102,8 +100,8 @@ spec:
         env:
         - name: NODE_NAME
           valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
-        volumeMounts:
 {{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+        volumeMounts:
         - name: wireguard
           mountPath: /var/lib/knls/wireguard
 {{- end }}{{ end }}
@@ -121,8 +119,8 @@ spec:
         - name: config
           mountPath: /config
           readOnly: true
-        - name: zones
-          mountPath: /zones
+        - mountPath: /zones
+          name: zones
           readOnly: true
         resources:
 {{ .Values.resources.unbound |toYaml | indent 10 }}
@@ -136,6 +134,9 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 10Mi
+      - name: zones
+        configMap:
+          name: knls-zones
 {{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       - name: wireguard
         hostPath:
