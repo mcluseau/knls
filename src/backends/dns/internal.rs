@@ -1,6 +1,5 @@
-use log::{debug, error};
+use log::debug;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::watch;
 
 use crate::dns;
 use crate::dns::{data, packet};
@@ -10,29 +9,49 @@ pub async fn watch<A: ToSocketAddrs>(
     cluster_domain: String,
     binding: A,
 ) -> eyre::Result<()> {
-    let (tx, rx) = watch::channel(dns::Domain::new());
-
     let listener = UdpSocket::bind(binding).await?;
-    tokio::spawn(async move {
-        if let Err(e) = serve_dns(listener, rx).await {
-            error!("dns server finished on error {e}");
-        } else {
-            error!("dns server finished with no error");
-        }
-        std::process::exit(1);
-    });
 
     let cluster_domain = data::DomainName::try_from(cluster_domain.as_str()).unwrap();
 
+    let mut root = data::Domain::new();
+    let recv_buf = &mut [0; 512];
+
     loop {
-        let cluster_zone = watcher.next(dns::cluster_zone_from_state).await?;
+        tokio::select!(
+            update = watcher.next(dns::cluster_zone_from_state) => {
+                let cluster_zone = update?;
 
-        let mut root = data::Domain::new();
+                if let Some(zone) = cluster_zone {
+                    root.set(&cluster_domain, zone);
+                }
+            },
+            recv = listener.recv_from(recv_buf) => {
+                let (len, remote) = match recv {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("recv error, ignoring request: {e}");
+                        continue;
+                    }
+                };
 
-        if let Some(zone) = cluster_zone {
-            root.set(&cluster_domain, zone);
-        }
-        tx.send_replace(root);
+                debug!("recv from {remote} ({len} bytes)");
+
+                let pkt = &recv_buf[0..len];
+                let resp = match handle_req(pkt, &root) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("request handler failed: {e:?}");
+                        let mut r = Vec::from(RESPONSE_PACKET);
+                        r[0] = recv_buf[0];
+                        r[1] = recv_buf[1];
+                        r[3] |= ((e as isize) as u8) & 0b0000_1111;
+                        r
+                    }
+                };
+
+                listener.send_to(&resp, remote).await?;
+            },
+        );
     }
 }
 
@@ -52,61 +71,6 @@ const RESPONSE_PACKET: [u8; 12] = [
     0,
 ];
 
-async fn serve_dns(listener: UdpSocket, rx: watch::Receiver<dns::Domain>) -> eyre::Result<()> {
-    let mut n = 0;
-
-    let buf = &mut [0; 512];
-    loop {
-        let (len, remote) = match listener.recv_from(buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("recv error, ignoring request: {e}");
-                continue;
-            }
-        };
-
-        debug!("recv from {remote} ({len} bytes)");
-
-        let pkt = &buf[0..len];
-        let resp = match handle_req(pkt, &rx) {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("request handler failed: {e:?}");
-                let mut r = Vec::from(RESPONSE_PACKET);
-                r[0] = buf[0];
-                r[1] = buf[1];
-                r[3] |= ((e as isize) as u8) & 0b0000_1111;
-                r
-            }
-        };
-
-        const COMPARE_TO_OTHER: bool = false;
-        if COMPARE_TO_OTHER {
-            let sock = UdpSocket::bind("127.0.0.1:0").await?;
-            sock.send_to(pkt, "127.0.0.1:1054").await?;
-
-            let buf = &mut [0; 4096];
-            let len = sock.recv(buf).await?;
-            let expected = &buf[..len];
-
-            if resp != expected {
-                let mut b = Vec::new();
-                hxdmp::hexdump(pkt, &mut b)?;
-                b.extend(b"\n--\n");
-                let pos = b.len();
-                hxdmp::hexdump(expected, &mut b)?;
-                std::fs::write(format!("tmp/{n}.exp.raw"), &b)?;
-                b.truncate(pos);
-                hxdmp::hexdump(&resp, &mut b)?;
-                std::fs::write(format!("tmp/{n}.got.raw"), &b)?;
-                n += 1;
-            }
-        }
-
-        listener.send_to(&resp, remote).await?;
-    }
-}
-
 #[allow(unused)]
 fn hexdump(data: &[u8]) -> String {
     let mut v = Vec::new();
@@ -114,7 +78,7 @@ fn hexdump(data: &[u8]) -> String {
     String::from_utf8_lossy(&v).to_string()
 }
 
-fn handle_req(pkt: &[u8], data: &watch::Receiver<dns::Domain>) -> packet::Result<Vec<u8>> {
+fn handle_req(pkt: &[u8], data: &dns::Domain) -> packet::Result<Vec<u8>> {
     use packet::ResponseCode;
 
     let mut pkt = packet::Reader::with_header(pkt);
@@ -179,7 +143,7 @@ fn handle_req(pkt: &[u8], data: &watch::Receiver<dns::Domain>) -> packet::Result
         return Err(ResponseCode::FormatError);
     };
 
-    let mut resolve = Resolve::new(data.borrow(), rtype);
+    let mut resolve = Resolve::new(data, rtype);
     resolve.resolve(&mut resp, name, name_offset)?;
 
     resp.set_an_count(resolve.an_count);
@@ -204,14 +168,14 @@ fn handle_req(pkt: &[u8], data: &watch::Receiver<dns::Domain>) -> packet::Result
 }
 
 struct Resolve<'t> {
-    root: watch::Ref<'t, data::Domain>,
+    root: &'t data::Domain,
     rtype: data::RecordType,
     an_count: u16,
     cname_depth: u8,
     ns: Vec<(data::DomainName, data::Record)>,
 }
 impl<'t> Resolve<'t> {
-    fn new(root: watch::Ref<'t, data::Domain>, rtype: data::RecordType) -> Self {
+    fn new(root: &'t data::Domain, rtype: data::RecordType) -> Self {
         Resolve {
             root,
             rtype,
