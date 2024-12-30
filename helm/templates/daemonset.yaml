@@ -43,7 +43,7 @@ spec:
 
       initContainers:
       - name: init-nftables
-        image: docker.io/mcluseau/knls:0.1.1
+        image: docker.io/mcluseau/knls:0.1.2
         securityContext:
           capabilities:
             add: [ NET_ADMIN ]
