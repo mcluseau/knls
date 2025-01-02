@@ -214,11 +214,63 @@ fn update_table_to<W: Write>(
         }
     }
 
+    update.ctr(CtrKind::Set, "masq_ext_svc", |buf| {
+        writeln!(buf, "  type ipv4_addr . inet_proto . inet_service")
+    })?;
+    update.ctr(CtrKind::Set, "masq_ext_svc6", |buf| {
+        writeln!(buf, "  type ipv6_addr . inet_proto . inet_service")
+    })?;
+
+    for (_, svc) in cfg.iter() {
+        for ip in svc.external_ips.iter() {
+            let set_name = match ip {
+                IpAddr::V4(_) => "masq_ext_svc",
+                IpAddr::V6(_) => "masq_ext_svc6",
+            };
+
+            for (proto_port, _) in &svc.ports {
+                let (proto, port) = proto_port.protocol_port();
+                let proto = nft_proto(proto);
+                update.set_element(set_name, format!("{ip} . {proto} . {port}"))?;
+            }
+        }
+    }
+
     update.ctr(CtrKind::Chain, "a_hook_dnat_postrouting", |buf| {
         writeln!(buf, "  type nat hook postrouting priority 0;")?;
         writeln!(
             buf,
             "  ip saddr . ip daddr . ct original ip daddr @need_masquerade masquerade;"
+        )?;
+        writeln!(
+            buf,
+            "  ip6 saddr . ip6 daddr . ct original ip6 daddr @need_masquerade6 masquerade;"
+        )?;
+
+        // do not masq local pods
+        for pod_cidr in &my_node.pod_cidrs {
+            let Some((ip, _)) = pod_cidr.split_once('/') else {
+                continue;
+            };
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                continue;
+            };
+            let ipv = match ip {
+                IpAddr::V4(_) => "ip",
+                IpAddr::V6(_) => "ip6",
+            };
+            writeln!(buf, "{ipv} saddr {pod_cidr} return;")?;
+            writeln!(buf, "{ipv} daddr {pod_cidr} return;")?;
+        }
+
+        // masq external services
+        writeln!(
+            buf,
+            "  ct original ip daddr . ip protocol . ct original proto-dst @masq_ext_svc masquerade;"
+        )?;
+        writeln!(
+            buf,
+            "  ct original ip6 daddr . ip protocol . ct original proto-dst @masq_ext_svc6 masquerade;"
         )
     })?;
 

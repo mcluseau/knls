@@ -1,3 +1,4 @@
+{{ $tag := "0.1.3" }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -43,7 +44,7 @@ spec:
 
       initContainers:
       - name: init-nftables
-        image: docker.io/mcluseau/knls:0.1.2
+        image: docker.io/mcluseau/knls:{{ $tag }}
         securityContext:
           capabilities:
             add: [ NET_ADMIN ]
@@ -90,7 +91,7 @@ spec:
         - --wireguard-ifname={{.ifname}}
         - --wireguard-key=/var/lib/knls/wireguard/{{.key}}
 {{- end }}{{ end }}
-        image: docker.io/mcluseau/knls:0.1.1
+        image: docker.io/mcluseau/knls:{{ $tag }}
         imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
         securityContext:
           readOnlyRootFilesystem: true
