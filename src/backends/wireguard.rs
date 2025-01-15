@@ -3,6 +3,7 @@ use eyre::Result;
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
 use netlink_packet_route::{
+    address::AddressAttribute,
     link::LinkAttribute::Mtu,
     route::{RouteAddress, RouteHeader},
 };
@@ -46,9 +47,8 @@ pub async fn watch(
 
     let link = {
         let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
-        links.try_next().await?
+        links.try_next().await?.unwrap()
     };
-    let link = link.unwrap();
     let link_id = link.header.index;
 
     let private_key = get_private_key(&key_path).await?;
@@ -93,7 +93,7 @@ pub async fn watch(
                 ..Default::default()
             }
         },
-        rtnl,
+        rtnl: rtnl.clone(),
     };
 
     for dest in oif_routes.list().await? {
@@ -118,6 +118,48 @@ pub async fn watch(
             continue;
         };
 
+        let vpn_ip = my_node.pod_cidrs.first().map(|cidr| match cidr.ip {
+            IpAddr::V4(ip) => IpAddr::V4(Ipv4Addr::from_bits(ip.to_bits() + 1)),
+            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from_bits(ip.to_bits() + 1)),
+        });
+
+        // interface IP
+        {
+            let mut found = false;
+            let mut addrs = (rtnl.address().get().set_link_index_filter(link_id)).execute();
+            while let Some(addr) = addrs.try_next().await? {
+                let Some(ip) = (addr.attributes.iter())
+                    .filter_map(|attr| match attr {
+                        AddressAttribute::Address(ip) => Some(ip),
+                        _ => None,
+                    })
+                    .next()
+                else {
+                    continue;
+                };
+
+                if Some(ip) == vpn_ip.as_ref() {
+                    found = true;
+                } else {
+                    rtnl.address().del(addr).execute().await?;
+                }
+            }
+
+            if let Some(ip) = vpn_ip {
+                if !found {
+                    let prefix_len = match ip {
+                        IpAddr::V4(_) => 32u8,
+                        IpAddr::V6(_) => 128u8,
+                    };
+                    rtnl.address()
+                        .add(link_id, ip, prefix_len)
+                        .execute()
+                        .await?;
+                }
+            }
+        }
+
+        // CNI config
         let cni_config = CniConfig {
             cni_version: "0.3.1",
             name: "knls",
@@ -136,19 +178,9 @@ pub async fn watch(
                 }],
             },
             dns: CniDns {
-                nameservers: my_node
-                    .pod_cidrs
-                    .first()
-                    .map(|cidr| match cidr.ip {
-                        IpAddr::V4(ip) => Ipv4Addr::from_bits(ip.to_bits() + 1).to_string(),
-                        IpAddr::V6(ip) => Ipv6Addr::from_bits(ip.to_bits() + 1).to_string(),
-                    })
-                    .into_iter()
-                    .collect(),
+                nameservers: vpn_ip.iter().map(|ip| ip.to_string()).collect(),
             },
-            mtu: link
-                .attributes
-                .iter()
+            mtu: (link.attributes.iter())
                 .filter_map(|attr| match attr {
                     Mtu(mtu) => Some(*mtu),
                     _ => None,
@@ -163,10 +195,11 @@ pub async fn watch(
             prev_cni_config = Some(cni_config);
         }
 
+        // publish public key
         if my_node.pubkey != Some(*pubkey.as_bytes()) {
             info!("updating node's pubkey");
             use crate::state::wireguard::ANN_PUBKEY;
-            let pubkey = wg::key::Key::new(*pubkey.as_bytes());
+            let pubkey = wg::key::Key::new(*pubkey.as_bytes()).to_string();
             let patch = json!(
                 {"metadata":{"annotations":{ ANN_PUBKEY: pubkey}}}
             );
@@ -179,7 +212,7 @@ pub async fn watch(
                 .patch(
                     &node_name,
                     &PatchParams::apply("knls"),
-                    &Patch::Apply(&patch),
+                    &Patch::Strategic(&patch),
                 )
                 .await
             {
