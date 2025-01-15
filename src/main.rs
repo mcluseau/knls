@@ -69,6 +69,10 @@ struct Cli {
     #[arg(long, default_value = "/var/lib/knls/wireguard.key")]
     wireguard_key: String,
 
+    /// CNI config path
+    #[arg(long, default_value = "/etc/cni/net.d/10-knls.conf")]
+    cni_config: String,
+
     /// DNS implementation to use (no DNS if not set).
     #[arg(long)]
     dns: Option<Dns>,
@@ -177,6 +181,7 @@ async fn main() -> eyre::Result<()> {
                     cli.node_name.clone(),
                     cli.wireguard_ifname.clone(),
                     cli.wireguard_key.clone(),
+                    cli.cni_config,
                     client,
                 ),
             ));

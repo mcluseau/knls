@@ -2,10 +2,13 @@ use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
 use eyre::Result;
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
-use netlink_packet_route::route::{RouteAddress, RouteHeader};
+use netlink_packet_route::{
+    link::LinkAttribute::Mtu,
+    route::{RouteAddress, RouteHeader},
+};
 use serde_json::json;
 use std::collections::BTreeMap as Map;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -31,6 +34,7 @@ pub async fn watch(
     node_name: String,
     ifname: String,
     key_path: String,
+    cni_config_path: String,
     kube: kube::Client,
 ) -> Result<()> {
     let default_port = 51820u16;
@@ -40,11 +44,12 @@ pub async fn watch(
 
     netlink::create_interface(&ifname)?;
 
-    let link_id = {
+    let link = {
         let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
-        links.try_next().await?.map(|link| link.header.index)
+        links.try_next().await?
     };
-    let link_id = link_id.unwrap();
+    let link = link.unwrap();
+    let link_id = link.header.index;
 
     let private_key = get_private_key(&key_path).await?;
     let pubkey: PublicKey = (&StaticSecret::from(private_key)).into();
@@ -102,6 +107,8 @@ pub async fn watch(
     // start watch
     let mut warned_about_pubkey = false;
 
+    let mut prev_cni_config = None;
+
     loop {
         let Some(nodes) = watcher.next(nodes_from_state).await? else {
             continue;
@@ -110,6 +117,51 @@ pub async fn watch(
         let Some(my_node) = nodes.get(&node_name) else {
             continue;
         };
+
+        let cni_config = CniConfig {
+            cni_version: "0.3.1",
+            name: "knls",
+            r#type: "ptp",
+            ipam: CniIpam {
+                r#type: "host-local",
+                ranges: vec![my_node
+                    .pod_cidrs
+                    .iter()
+                    .map(|cidr| CniRange {
+                        subnet: cidr.to_string(),
+                    })
+                    .collect()],
+                routes: vec![CniRoute {
+                    dst: "0.0.0.0/0".to_string(),
+                }],
+            },
+            dns: CniDns {
+                nameservers: my_node
+                    .pod_cidrs
+                    .first()
+                    .map(|cidr| match cidr.ip {
+                        IpAddr::V4(ip) => Ipv4Addr::from_bits(ip.to_bits() + 1).to_string(),
+                        IpAddr::V6(ip) => Ipv6Addr::from_bits(ip.to_bits() + 1).to_string(),
+                    })
+                    .into_iter()
+                    .collect(),
+            },
+            mtu: link
+                .attributes
+                .iter()
+                .filter_map(|attr| match attr {
+                    Mtu(mtu) => Some(*mtu),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(1420),
+        };
+
+        if prev_cni_config.as_ref() != Some(&cni_config) {
+            let value = serde_json::to_vec(&cni_config)?;
+            std::fs::write(&cni_config_path, value)?;
+            prev_cni_config = Some(cni_config);
+        }
 
         if my_node.pubkey != Some(*pubkey.as_bytes()) {
             info!("updating node's pubkey");
@@ -347,4 +399,41 @@ impl Peer {
             ..Default::default()
         }
     }
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniConfig<'t> {
+    cni_version: &'t str,
+    name: &'t str,
+    r#type: &'t str,
+    ipam: CniIpam<'t>,
+    dns: CniDns,
+    mtu: u32,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniIpam<'t> {
+    r#type: &'t str,
+    ranges: Vec<Vec<CniRange>>,
+    routes: Vec<CniRoute>,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniDns {
+    nameservers: Vec<String>,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniRange {
+    subnet: String,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniRoute {
+    dst: String,
 }

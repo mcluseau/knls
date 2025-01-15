@@ -104,11 +104,15 @@ spec:
         env:
         - name: NODE_NAME
           valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
-{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
         volumeMounts:
+{{- if .Values.connectivity }}
+        - name: cni-config
+          mountPath: /etc/cni/net.d
+{{-   if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
         - name: wireguard
           mountPath: /var/lib/knls/wireguard
-{{- end }}{{ end }}
+{{-   end }}{{ end }}
+{{- end }}
         resources:
 {{ .Values.resources.knls |toYaml | indent 10 }}
 
@@ -141,6 +145,12 @@ spec:
       - name: zones
         configMap:
           name: knls-zones
+{{- if .Values.connectivity }}
+      - name: cni-config
+        hostPath:
+          type: DirectoryOrCreate
+          path: /etc/cni/net.d
+{{- end }}
 {{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       - name: wireguard
         hostPath:
