@@ -122,14 +122,12 @@ pub async fn watch(
             use k8s_openapi::api::core::v1::Node;
             use kube::api::{Patch, PatchParams};
 
-            let node: Node = serde_json::from_value(patch.clone()).unwrap();
-
             let nodes = kube::api::Api::<Node>::all(kube.clone());
             if let Err(e) = nodes
                 .patch(
                     &node_name,
                     &PatchParams::apply("knls"),
-                    &Patch::Apply(&node),
+                    &Patch::Apply(&patch),
                 )
                 .await
             {
