@@ -96,7 +96,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
             };
 
             let zone = svc_zone.sub_or_create(Label::from_str(&key.namespace));
-            let zone = zone.sub_or_create(Label::from_str(&key.name));
+            let zone = zone.sub_or_create(Label::from_str(&key.service_name));
             let zone = zone.sub_or_create(Label::from_str(hostname));
 
             for ip in (&ep).ips() {
