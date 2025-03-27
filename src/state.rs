@@ -506,7 +506,7 @@ impl Endpoint {
         }
     }
 
-    pub fn ips(&self) -> impl Iterator<Item = IpAddr> {
+    pub fn ips(&self) -> impl Iterator<Item = IpAddr> + use<> {
         [self.ipv4, self.ipv6].into_iter().filter_map(|v| v)
     }
 

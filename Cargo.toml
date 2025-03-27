@@ -1,7 +1,7 @@
 [package]
 name = "knls"
 version = "0.1.4"
-edition = "2021"
+edition = "2024"
 
 [features]
 ingress = []

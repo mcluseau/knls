@@ -145,10 +145,9 @@ async fn main() -> eyre::Result<()> {
     let client: Client = cfg.try_into()?;
     let watcher_config = watcher::Config::default();
 
-    if let Some(ns) = &cli.namespace {
-        info!("watching namespace {ns}");
-    } else {
-        info!("watching all namespaces");
+    match &cli.namespace {
+        None => info!("watching all namespaces"),
+        Some(ns) => info!("watching namespace {ns}"),
     };
 
     let source = knls::watcher::Source::new(cli.node_name.clone());
