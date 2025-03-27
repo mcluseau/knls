@@ -431,10 +431,7 @@ impl TryFrom<&str> for Label {
 impl<'t> TryFrom<&[u8]> for Label {
     type Error = Error;
     fn try_from(v: &[u8]) -> Result<Self, Self::Error> {
-        if v.len() > 63 {
-            return Err(Error::LabelTooLong);
-        }
-        Ok(Self::from_str(String::from_utf8_lossy(v).as_ref()))
+        Self::try_from(String::from_utf8_lossy(v).as_ref())
     }
 }
 
