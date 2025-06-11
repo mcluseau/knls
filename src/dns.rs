@@ -4,6 +4,8 @@ use std::net::IpAddr;
 
 use crate::state::{ServiceTarget, State};
 
+pub mod internal;
+
 pub mod data;
 pub mod packet;
 

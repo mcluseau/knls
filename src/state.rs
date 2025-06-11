@@ -518,20 +518,14 @@ impl Endpoint {
     }
 
     fn from_slice_endpoint(endpoint: discovery::Endpoint) -> Endpoint {
-        let for_zones = endpoint
-            .hints
-            .as_ref()
+        let for_zones = (endpoint.hints.as_ref())
             .and_then(|hints| hints.for_zones.as_ref())
             .map(|zones| zones.iter().map(|z| z.name.clone()).collect());
 
         let mut ipv4 = None;
         let mut ipv6 = None;
 
-        for ip in endpoint
-            .addresses
-            .iter()
-            .filter_map(|addr| addr.parse::<IpAddr>().ok())
-        {
+        for ip in (endpoint.addresses.iter()).filter_map(|addr| addr.parse::<IpAddr>().ok()) {
             if ipv4.is_none() && ip.is_ipv4() {
                 ipv4 = Some(ip);
             }

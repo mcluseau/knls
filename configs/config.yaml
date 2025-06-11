@@ -1,0 +1,8 @@
+
+proxy: !nftables {}
+
+connectivity: !wireguard {}
+
+dns: !internal
+  cluster_domain: cluster.local
+

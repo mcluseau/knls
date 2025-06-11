@@ -1,17 +1,28 @@
 use log::debug;
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
+use tokio::net::UdpSocket;
 
 use crate::dns;
 use crate::dns::{data, packet};
 
-pub async fn watch<A: ToSocketAddrs>(
-    mut watcher: crate::watcher::Watcher,
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct Config {
     cluster_domain: String,
-    binding: A,
-) -> eyre::Result<()> {
-    let listener = UdpSocket::bind(binding).await?;
+    #[serde(default = "default_bind")]
+    bind: String,
+}
+fn default_bind() -> String {
+    "127.0.0.1:1053".into()
+}
 
-    let cluster_domain = data::DomainName::try_from(cluster_domain.as_str()).unwrap();
+pub async fn watch(
+    _ctx: Arc<crate::Context>,
+    cfg: Config,
+    mut watcher: crate::watcher::Watcher,
+) -> eyre::Result<()> {
+    let listener = UdpSocket::bind(cfg.bind).await?;
+
+    let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str()).unwrap();
 
     let mut root = data::Domain::new();
     let recv_buf = &mut [0; 512];

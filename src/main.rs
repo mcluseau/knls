@@ -3,12 +3,15 @@ use eyre::format_err;
 use kube::{runtime::watcher, Client};
 use log::{error, info};
 use std::process::exit;
+use std::sync::Arc;
 use tokio::{
     select,
     signal::unix::{signal, SignalKind},
 };
 
 use knls::kube_watch;
+
+pub mod config;
 
 /// Kubernetes Node-Local Services
 #[derive(Parser)]
@@ -29,67 +32,13 @@ struct Cli {
     )]
     node_name: String,
 
-    /// namespace to watch instead of the whole cluster
-    #[arg(short = 'n', long)]
-    namespace: Option<String>,
+    /// Config file path.
+    #[arg(long, short = 'c', default_value = "config.yaml")]
+    config: String,
 
-    /// Kubernetes API server URL
+    /// Test the config and exit.
     #[arg(long)]
-    cluster_url: Option<http::uri::Uri>,
-
-    /// Kubernetes cluster domain
-    #[arg(long, default_value = "cluster.local")]
-    cluster_domain: String,
-
-    /// Kubernetes watch events buffer size
-    #[arg(long, default_value = "100")]
-    event_buffer: usize,
-
-    /// Proxy implementation to use
-    #[arg(long)]
-    proxy: Option<Proxy>,
-
-    /// Disable node ports (since they are forced for load balancers at API level for non-technical reasons)
-    #[arg(long)]
-    disable_nodeports: bool,
-
-    /// nftables table's name
-    #[arg(long, default_value = "kube-proxy")]
-    nftables_table: String,
-
-    /// Node connectivity implementation to use
-    #[arg(long)]
-    connectivity: Option<Connectivity>,
-
-    /// Activate node connectivity through wireguard using this interface
-    #[arg(long, default_value = "kwg")]
-    wireguard_ifname: String,
-
-    /// Wireguard private key file (will be created as needed).
-    #[arg(long, default_value = "/var/lib/knls/wireguard.key")]
-    wireguard_key: String,
-
-    /// CNI config path
-    #[arg(long, default_value = "/etc/cni/net.d/10-knls.conf")]
-    cni_config: String,
-
-    /// DNS implementation to use (no DNS if not set).
-    #[arg(long)]
-    dns: Option<Dns>,
-
-    /// DNS implementation to use (no DNS if not set).
-    #[arg(long, default_value = "127.0.0.1:1053")]
-    internal_dns_binding: String,
-}
-
-#[derive(Clone, ValueEnum)]
-enum Proxy {
-    Nftables,
-}
-
-#[derive(Clone, ValueEnum)]
-enum Connectivity {
-    Wireguard,
+    test_config: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -100,7 +49,7 @@ enum Dns {
 const ABOUT: &'static str = r#"
 Kubernetes Node-Local Services
 
-Watch the Kubernetes API server to provide node-specific services:
+Watch the Kubernetes API server to provide node-level services:
 - kube-proxy service using nftables
 - authoritative DNS
 - pod connectivity through wireguard
@@ -113,6 +62,8 @@ fn default_nodename() -> String {
         .unwrap()
 }
 
+type Tasks = tokio::task::JoinSet<(String, eyre::Result<()>)>;
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
@@ -122,6 +73,21 @@ async fn main() -> eyre::Result<()> {
         .parse_write_style(cli.log_style.as_str())
         .format_timestamp_millis()
         .init();
+
+    use config::*;
+    let config = tokio::fs::read(&cli.config)
+        .await
+        .map_err(|e| format_err!("read config failed: {}: {e}", cli.config))?;
+    let config: Config =
+        serde_yaml::from_slice(&config).map_err(|e| format_err!("parse config failed: {e}"))?;
+
+    let cluster_url = config
+        .cluster_url()
+        .map_err(|e| format_err!("invalid cluster_url: {e}"))?;
+
+    if cli.test_config {
+        return Ok(());
+    }
 
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
@@ -135,88 +101,58 @@ async fn main() -> eyre::Result<()> {
 
     info!("starting as node {}", cli.node_name);
 
-    let mut cfg = kube::Config::infer().await?;
-    if let Some(cluster_url) = cli.cluster_url {
-        cfg.cluster_url = cluster_url;
+    let mut kube_cfg = kube::Config::infer().await?;
+    if let Some(cluster_url) = cluster_url {
+        kube_cfg.cluster_url = cluster_url;
     }
 
-    info!("kubernetes cluster at {}", cfg.cluster_url);
+    info!("kubernetes cluster at {}", kube_cfg.cluster_url);
 
-    let client: Client = cfg.try_into()?;
+    let kube: Client = kube_cfg.try_into()?;
     let watcher_config = watcher::Config::default();
 
-    match &cli.namespace {
+    match &config.namespace {
         None => info!("watching all namespaces"),
         Some(ns) => info!("watching namespace {ns}"),
     };
 
-    let source = knls::watcher::Source::new(cli.node_name.clone());
+    let ctx = Arc::new(knls::Context {
+        node_name: cli.node_name,
+        namespace: config.namespace,
+        kube,
+    });
 
-    let mut tasks = tokio::task::JoinSet::new();
+    let watch_config = kube_watch::Config {
+        client: ctx.kube.clone(),
+        watcher_config,
+        namespace: ctx.namespace.clone(),
+        node_name: ctx.node_name.clone(),
+        with_nodes: config.connectivity.is_some(),
+    };
 
-    match cli.proxy {
-        None => {}
-        Some(Proxy::Nftables) => {
-            let table_name = cli.nftables_table.clone();
-            tasks.spawn(named_task(
-                "nftables",
-                knls::backends::nftables::watch(
-                    table_name,
-                    cli.disable_nodeports,
-                    source.new_watcher(),
-                ),
-            ));
-        }
-    }
+    let source = knls::watcher::Source::new(ctx.node_name.clone());
 
-    match cli.connectivity {
-        None => {}
-        Some(Connectivity::Wireguard) => {
-            let client = client.clone();
-            tasks.spawn(named_task(
-                "wireguard",
-                knls::backends::wireguard::watch(
-                    source.new_watcher(),
-                    cli.node_name.clone(),
-                    cli.wireguard_ifname.clone(),
-                    cli.wireguard_key.clone(),
-                    cli.cni_config,
-                    client,
-                ),
-            ));
-        }
-    }
+    let mut tasks = Tasks::new();
 
-    match cli.dns {
-        None => {}
-        Some(Dns::Internal) => {
-            tasks.spawn(named_task(
-                "internal-dns",
-                knls::backends::dns::internal::watch(
-                    source.new_watcher(),
-                    cli.cluster_domain,
-                    cli.internal_dns_binding,
-                ),
-            ));
-        }
-    }
+    let mut services = Services {
+        tasks: &mut tasks,
+        ctx: &ctx,
+        source: &source,
+    };
+
+    services.spawn("proxy", config.proxy);
+    services.spawn("connectivity", config.connectivity);
+    services.spawn("dns", config.dns);
 
     #[cfg(feature = "ingress")]
     {
         tasks.spawn(knls::backends::ingress::watch(cfg_rx.clone()));
     }
 
-    let watch_config = kube_watch::Config {
-        client,
-        watcher_config,
-        namespace: cli.namespace,
-        node_name: cli.node_name,
-        with_nodes: cli.connectivity.is_some(),
-    };
     tokio::spawn(knls::process_kube_events(
         source,
         watch_config,
-        cli.event_buffer,
+        config.event_buffer,
     ));
 
     while let Some(res) = tasks.join_next().await {
@@ -239,10 +175,38 @@ async fn main() -> eyre::Result<()> {
     exit(1); // this is actually unexpected
 }
 
-async fn named_task<F>(name: &str, task: F) -> (&str, eyre::Result<()>)
-where
-    F: futures::Future<Output = eyre::Result<()>>,
-{
-    info!("starting task {name}");
-    (name, task.await)
+struct Services<'t> {
+    tasks: &'t mut Tasks,
+    ctx: &'t Arc<knls::Context>,
+    source: &'t knls::watcher::Source,
+}
+
+impl<'t> Services<'t> {
+    fn spawn<S>(&mut self, service_name: &'static str, service: Option<S>)
+    where
+        S: knls::Service + Send + 'static,
+    {
+        match service {
+            None => {
+                info!("{service_name}: no configuration, service not enabled.");
+            }
+            Some(service) => {
+                let flavor = service.impl_name();
+                info!("{service_name}: starting {flavor} implementation");
+
+                self.spawn_task(
+                    format!("{service_name}:{flavor}"),
+                    service.watch(self.ctx.clone(), self.source.new_watcher()),
+                );
+            }
+        }
+    }
+
+    fn spawn_task<F>(&mut self, task_name: String, task: F)
+    where
+        F: Future<Output = eyre::Result<()>>,
+        F: Send + 'static,
+    {
+        self.tasks.spawn(async move { (task_name, task.await) });
+    }
 }

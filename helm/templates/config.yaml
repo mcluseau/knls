@@ -4,41 +4,23 @@ kind: ConfigMap
 metadata:
   name: knls-config
 data:
-{{- if eq "knotd" .Values.dns}}
-  knot.conf: |
-    server:
-      listen:      127.0.0.1@1053
-      listen:            ::1@1053
-      automatic-acl: on
-
-    template:
-    - id: default
-      storage: /storage
-      file: %s
-
-{{ .Values.knotd.extra_conf |indent 4 }}
+  knls.yaml: |
+{{- with .Values.cluster_url }}
+    cluster_url: {{ . |quote }}
 {{- end }}
 
-{{- if eq "nsd" .Values.dns}}
-  nsd.conf: |
-    server:
-      server-count: 1
-      username: ""
-      zonesdir: /storage
-      confine-to-zone: yes
+    proxy: !nftables {}
+{{ if .Values.dns }}
+    dns: !{{.Values.dns}}
+      cluster_domain: {{ .Values.cluster_domain |quote }}
+{{- end }}
 
-    remote-control:
-      control-enable: yes
-      server-key-file:   /tls/nsd-server/tls.key
-      server-cert-file:  /tls/nsd-control/server.crt
-      control-key-file:  /tls/nsd-control/tls.key
-      control-cert-file: /tls/nsd-control/tls.crt
-
-    pattern:
-      name: zone
-      zonefile: "/storage/%s"
-
-{{ .Values.nsd.extra_conf |indent 4 }}
+{{ if .Values.connectivity}}
+    connectivity: !{{.Values.connectivity}}
+{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+      ifname: {{.ifname |quote}}
+      key_path: "/var/lib/knls/wireguard/{{.key}}"
+{{- end }}{{ end }}
 {{- end }}
 
   unbound.conf: |

@@ -1,4 +1,8 @@
 
+image:
+  repo: docker.io/mcluseau/knls
+  tag: 0.1.7
+
 hostNetwork: true
 
 #service_ips: [ 1.2.3.4 ]

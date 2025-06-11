@@ -1,4 +1,3 @@
-{{ $tag := "0.1.5" }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -44,8 +43,10 @@ spec:
 
       initContainers:
       - name: init-nftables
-        image: docker.io/mcluseau/knls:{{ $tag }}
+        image: {{.Values.image.repo}}:{{.Values.image.tag}}
+        imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
         securityContext:
+          readOnlyRootFilesystem: true
           capabilities:
             add: [ NET_ADMIN ]
 
@@ -80,22 +81,8 @@ spec:
       containers:
       - name: knls
         args:
-        - --cluster-domain={{ .Values.cluster_domain }}
-{{- with .Values.cluster_url }}
-        - --cluster-url={{ . }}
-{{- end }}
-        - --proxy=nftables
-{{- with .Values.dns }}
-        - --dns={{ . }}
-{{- end }}
-{{- if .Values.connectivity}}
-        - --connectivity={{.Values.connectivity}}
-{{- end }}
-{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
-        - --wireguard-ifname={{.ifname}}
-        - --wireguard-key=/var/lib/knls/wireguard/{{.key}}
-{{- end }}{{ end }}
-        image: docker.io/mcluseau/knls:{{ $tag }}
+        - --config=/config/knls.yaml
+        image: {{.Values.image.repo}}:{{.Values.image.tag}}
         imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
         securityContext:
           readOnlyRootFilesystem: true
@@ -106,6 +93,9 @@ spec:
         - name: NODE_NAME
           valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
         volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
 {{- if .Values.connectivity }}
         - name: cni-config
           mountPath: /etc/cni/net.d

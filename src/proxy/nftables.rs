@@ -4,6 +4,20 @@ use std::collections::BTreeMap as Map;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::process::Stdio;
+use std::sync::Arc;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct Config {
+    /// nftables table's name
+    #[serde(default = "default_table")]
+    table: String,
+    /// Disable node ports (since they are forced for load balancers at API level for non-technical reasons)
+    #[serde(default)]
+    disable_nodeports: bool,
+}
+fn default_table() -> String {
+    "kube-proxy".into()
+}
 
 use crate::change;
 use crate::state::{
@@ -16,19 +30,15 @@ const SERVICE_NODEPORTS: &'static str = "service_nodeports";
 const NEED_MASQ_V4: &'static str = "need_masquerade";
 const NEED_MASQ_V6: &'static str = "need_masquerade6";
 
-pub async fn watch(
-    table_name: String,
-    disable_nodeports: bool,
-    mut watcher: Watcher,
-) -> Result<()> {
-    let mut table = TableTracker::new(format!("inet {table_name}"));
+pub async fn watch(_ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) -> Result<()> {
+    let mut table = TableTracker::new(format!("inet {}", cfg.table));
 
     loop {
         let Some((my_node, cfg)) = watcher
             .next(|state| {
                 Some((
                     state.my_node.get().cloned()?,
-                    (proxy::from_state(state, disable_nodeports)?),
+                    (proxy::from_state(state, cfg.disable_nodeports)?),
                 ))
             })
             .await?

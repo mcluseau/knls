@@ -10,11 +10,39 @@ use netlink_packet_route::{
 use serde_json::json;
 use std::collections::BTreeMap as Map;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use tokio::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::change;
 use crate::state::wireguard::{decode_key, encode_key, Key};
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct Config {
+    /// Activate node connectivity through wireguard using this interface
+    #[serde(default = "defaults::ifname")]
+    ifname: String,
+
+    /// Wireguard private key file (will be created as needed).
+    #[serde(default = "defaults::key_path")]
+    key_path: String,
+
+    /// CNI config path
+    #[serde(default = "defaults::cni_config")]
+    cni_config: String,
+}
+
+mod defaults {
+    pub fn ifname() -> String {
+        "kwg".into()
+    }
+    pub fn key_path() -> String {
+        "/var/lib/knls/wireguard.key".into()
+    }
+    pub fn cni_config() -> String {
+        "/etc/cni/net.d/10-knls.conf".into()
+    }
+}
 
 fn nodes_from_state(
     state: &crate::state::State,
@@ -31,13 +59,17 @@ fn nodes_from_state(
 }
 
 pub async fn watch(
+    ctx: Arc<crate::Context>,
+    cfg: Config,
     mut watcher: crate::watcher::Watcher,
-    node_name: String,
-    ifname: String,
-    key_path: String,
-    cni_config_path: String,
-    kube: kube::Client,
 ) -> Result<()> {
+    let node_name = ctx.node_name.as_str();
+    let kube = ctx.kube.clone();
+
+    let ifname = cfg.ifname;
+    let key_path = cfg.key_path;
+    let cni_config_path = cfg.cni_config;
+
     let default_port = 51820u16;
 
     let (conn, rtnl, _) = rtnetlink::new_connection()?;
@@ -114,7 +146,7 @@ pub async fn watch(
             continue;
         };
 
-        let Some(my_node) = nodes.get(&node_name) else {
+        let Some(my_node) = nodes.get(node_name) else {
             continue;
         };
 
