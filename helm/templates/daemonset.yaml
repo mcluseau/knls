@@ -55,8 +55,8 @@ spec:
         - -c
         - |
 {{- if eq .Values.connectivity "wireguard" }}
-          ip link add {{ .ifname |quote }} type wireguard
-          ip link set {{ .ifname |quote }} up
+          ip link add {{ .Values.wireguard.ifname |quote }} type wireguard
+          ip link set {{ .Values.wireguard.ifname |quote }} up
 {{- end }}
           nft -f - <<EOF
           table inet knls {};
