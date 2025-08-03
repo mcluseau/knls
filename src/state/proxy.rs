@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::IpAddr;
 
-use crate::state::{keys, LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget};
+use crate::state::{LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget, keys};
 
 pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State> {
     if !(state.services.is_ready() && state.ep_slices.is_ready()) {

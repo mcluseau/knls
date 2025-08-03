@@ -2,7 +2,7 @@ use futures::{StreamExt, TryStreamExt};
 #[cfg(feature = "ingress")]
 use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
-use kube::{api::Api, runtime::watcher, Client};
+use kube::{Client, api::Api, runtime::watcher};
 use log::{error, info};
 use tokio::sync::mpsc;
 

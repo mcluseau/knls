@@ -15,7 +15,7 @@ use tokio::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::change;
-use crate::state::wireguard::{decode_key, encode_key, Key};
+use crate::state::wireguard::{Key, decode_key, encode_key};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -198,13 +198,15 @@ pub async fn watch(
             r#type: "ptp",
             ipam: CniIpam {
                 r#type: "host-local",
-                ranges: vec![my_node
-                    .pod_cidrs
-                    .iter()
-                    .map(|cidr| CniRange {
-                        subnet: cidr.to_string(),
-                    })
-                    .collect()],
+                ranges: vec![
+                    my_node
+                        .pod_cidrs
+                        .iter()
+                        .map(|cidr| CniRange {
+                            subnet: cidr.to_string(),
+                        })
+                        .collect(),
+                ],
                 routes: vec![CniRoute {
                     dst: "0.0.0.0/0".to_string(),
                 }],
@@ -250,7 +252,9 @@ pub async fn watch(
             {
                 if !warned_about_pubkey {
                     let patch_str = serde_json::to_string(&patch).unwrap();
-                    error!("failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}");
+                    error!(
+                        "failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}"
+                    );
                     warned_about_pubkey = true;
                 }
             }
@@ -411,8 +415,8 @@ impl OifRoutes {
     }
 
     fn route_msg(&self, dest: &IpAddrMask) -> netlink_packet_route::route::RouteMessage {
-        use netlink_packet_route::route::{RouteAttribute, RouteMessage};
         use netlink_packet_route::AddressFamily;
+        use netlink_packet_route::route::{RouteAttribute, RouteMessage};
 
         let (address_family, addr) = match dest.ip {
             IpAddr::V4(ip) => (AddressFamily::Inet, RouteAddress::Inet(ip)),

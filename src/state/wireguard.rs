@@ -1,4 +1,4 @@
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use defguard_wireguard_rs::net::IpAddrMask;
 use eyre::format_err;
 use k8s_openapi::api::core::v1 as core;

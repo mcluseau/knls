@@ -1,4 +1,4 @@
-use eyre::{format_err, Result};
+use eyre::{Result, format_err};
 use log::{debug, error, info};
 use std::collections::BTreeMap as Map;
 use std::io::{self, Write};
@@ -21,7 +21,7 @@ fn default_table() -> String {
 
 use crate::change;
 use crate::state::{
-    keys, proxy, LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity,
+    LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, keys, proxy,
 };
 use crate::watcher::Watcher;
 
