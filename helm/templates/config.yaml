@@ -17,7 +17,7 @@ data:
 {{ if .Values.dns }}
     dns: !{{.Values.dns}}
       cluster_domain: {{ .Values.cluster_domain |quote }}
-      on_create:
+      on_listen:
       - !nft_chain
         table: knls
         chain: dns
