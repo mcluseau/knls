@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, error};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
@@ -20,12 +20,12 @@ pub async fn watch(
     cfg: Config,
     mut watcher: crate::watcher::Watcher,
 ) -> eyre::Result<()> {
-    let listener = UdpSocket::bind(cfg.bind).await?;
+    let sock = UdpSocket::bind(cfg.bind).await?;
 
     let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str()).unwrap();
 
     let mut root = data::Domain::new();
-    let recv_buf = &mut [0; 512];
+    let mut recv_buf = [0; 512];
 
     loop {
         tokio::select!(
@@ -36,31 +36,12 @@ pub async fn watch(
                     root.set(&cluster_domain, zone);
                 }
             },
-            recv = listener.recv_from(recv_buf) => {
-                let (len, remote) = match recv {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("recv error, ignoring request: {e}");
-                        continue;
-                    }
+            result = sock.readable() => {
+                if let Err(e) = result {
+                    error!("failed waiting for next request: {e}");
+                    return Err(e.into());
                 };
-
-                debug!("recv from {remote} ({len} bytes)");
-
-                let pkt = &recv_buf[0..len];
-                let resp = match handle_req(pkt, &root) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("request handler failed: {e:?}");
-                        let mut r = Vec::from(RESPONSE_PACKET);
-                        r[0] = recv_buf[0];
-                        r[1] = recv_buf[1];
-                        r[3] |= ((e as isize) as u8) & 0b0000_1111;
-                        r
-                    }
-                };
-
-                listener.send_to(&resp, remote).await?;
+                handle_req(&mut recv_buf, &sock, &root).await?;
             },
         );
     }
@@ -89,7 +70,40 @@ fn hexdump(data: &[u8]) -> String {
     String::from_utf8_lossy(&v).to_string()
 }
 
-fn handle_req(pkt: &[u8], data: &dns::Domain) -> packet::Result<Vec<u8>> {
+async fn handle_req(
+    recv_buf: &mut [u8],
+    sock: &UdpSocket,
+    root: &dns::Domain,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    loop {
+        let (len, remote) = match sock.try_recv_from(recv_buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        };
+
+        debug!("recv from {remote} ({len} bytes)");
+
+        let pkt = &recv_buf[0..len];
+        let resp = match try_handle_req(pkt, &root) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("request handler failed: {e:?}");
+                let mut r = Vec::from(RESPONSE_PACKET);
+                r[0] = recv_buf[0];
+                r[1] = recv_buf[1];
+                r[3] |= ((e as isize) as u8) & 0b0000_1111;
+                r
+            }
+        };
+
+        sock.send_to(&resp, remote).await?;
+    }
+    Ok(())
+}
+
+fn try_handle_req(pkt: &[u8], data: &dns::Domain) -> packet::Result<Vec<u8>> {
     use packet::ResponseCode;
 
     let mut pkt = packet::Reader::with_header(pkt);
