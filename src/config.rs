@@ -13,6 +13,9 @@ pub struct Config {
     #[serde(default = "default_event_buffer")]
     pub event_buffer: usize,
 
+    #[serde(default)]
+    pub on_start: Vec<knls::actions::Action>,
+
     /// Proxy service, responsible for handling v1/Service semantics on the node.
     pub proxy: Option<Proxy>,
 

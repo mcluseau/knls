@@ -9,10 +9,23 @@ data:
     cluster_url: {{ . |quote }}
 {{- end }}
 
+{{- with .Values.extra_conf }}
+{{ . |indent 4 }}
+{{- end }}
+
     proxy: !nftables {}
 {{ if .Values.dns }}
     dns: !{{.Values.dns}}
       cluster_domain: {{ .Values.cluster_domain |quote }}
+      on_create:
+      - !nft_chain
+        table: knls
+        chain: dns
+        rules: |-
+          type nat hook prerouting priority -101; policy accept;
+{{-   range .Values.service_ips }}
+          ip daddr {{.}} udp dport 53 redirect;
+{{-   end }}
 {{- end }}
 
 {{ if .Values.connectivity}}
@@ -20,6 +33,13 @@ data:
 {{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       ifname: {{.ifname |quote}}
       key_path: "/var/lib/knls/wireguard/{{.key}}"
+      on_create:
+      - !nft_chain
+        table: knls
+        chain: wireguard
+        rules: |-
+          type nat hook postrouting priority 999; policy accept;
+          fib saddr type local oif {{ .ifname |quote }} masquerade
 {{- end }}{{ end }}
 {{- end }}
 

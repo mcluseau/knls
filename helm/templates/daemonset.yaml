@@ -26,6 +26,8 @@ spec:
     metadata:
       labels:
         app: knls
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum |quote }}
     spec:
       priorityClassName: system-cluster-critical
       tolerations:
@@ -40,43 +42,6 @@ spec:
       hostAliases:
 {{ . |toYaml |indent 6 }}
 {{- end }}
-
-      initContainers:
-      - name: init-nftables
-        image: {{.Values.image.repo}}:{{.Values.image.tag}}
-        imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
-        securityContext:
-          readOnlyRootFilesystem: true
-          capabilities:
-            add: [ NET_ADMIN ]
-
-        command:
-        - ash
-        - -c
-        - |
-{{- if eq .Values.connectivity "wireguard" }}
-          ip link add {{ .Values.wireguard.ifname |quote }} type wireguard
-          ip link set {{ .Values.wireguard.ifname |quote }} up
-{{- end }}
-          nft -f - <<EOF
-          table inet knls {};
-          delete table inet knls;
-          table inet knls {
-            chain prerouting {
-              type nat hook prerouting priority -101; policy accept;
-{{- if .Values.dns }}{{ range .Values.service_ips }}
-              ip daddr {{.}} udp dport 53 redirect;
-{{- end }}{{ end }}
-            }
-{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
-            chain wireguard {
-              type nat hook postrouting priority 999; policy accept;
-              fib saddr type local oif {{ .ifname |quote }} masquerade
-            }
-{{- end }}{{ end }}
-{{ .Values.nft.extra_conf |indent 12 }}
-          }
-          EOF
 
       containers:
       - name: knls

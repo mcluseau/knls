@@ -2,14 +2,17 @@ use log::{debug, error};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-use crate::dns;
-use crate::dns::{data, packet};
+use crate::actions;
+use crate::dns::{self, data, packet};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     cluster_domain: String,
     #[serde(default = "default_bind")]
     bind: String,
+
+    #[serde(default)]
+    on_listen: Vec<crate::actions::Action>,
 }
 fn default_bind() -> String {
     "127.0.0.1:1053".into()
@@ -21,6 +24,7 @@ pub async fn watch(
     mut watcher: crate::watcher::Watcher,
 ) -> eyre::Result<()> {
     let sock = UdpSocket::bind(cfg.bind).await?;
+    actions::run_event(module_path!(), "on_listen", &cfg.on_listen).await?;
 
     let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str()).unwrap();
 

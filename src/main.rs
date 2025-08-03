@@ -1,12 +1,12 @@
 use clap::{Parser, ValueEnum};
 use eyre::format_err;
-use kube::{Client, runtime::watcher};
+use kube::{runtime::watcher, Client};
 use log::{error, info};
 use std::process::exit;
 use std::sync::Arc;
 use tokio::{
     select,
-    signal::unix::{SignalKind, signal},
+    signal::unix::{signal, SignalKind},
 };
 
 use knls::kube_watch;
@@ -89,6 +89,13 @@ async fn main() -> eyre::Result<()> {
         return Ok(());
     }
 
+    info!(
+        "{} v{} (git commit {})",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_COMMIT")
+    );
+
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
@@ -131,6 +138,8 @@ async fn main() -> eyre::Result<()> {
     };
 
     let source = knls::watcher::Source::new(ctx.node_name.clone());
+
+    knls::actions::run_event(module_path!(), "on_start", &config.on_start).await?;
 
     let mut tasks = Tasks::new();
 

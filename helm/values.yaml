@@ -1,9 +1,12 @@
 
 image:
   repo: docker.io/mcluseau/knls
-  tag: 0.1.7
+  tag: 0.1.8
 
 hostNetwork: true
+
+#extra_conf: |-
+#  on_start: ...
 
 #service_ips: [ 1.2.3.4 ]
 cluster_domain: cluster.local
@@ -16,9 +19,6 @@ extra_zones: {}
 #- { hostnames: [ kubernetes ], ip: 1.1.1.1 }
 #- { hostnames: [ kubernetes ], ip: 2.2.2.2 }
 #- { hostnames: [ kubernetes ], ip: 3.3.3.3 }
-
-nft:
-  extra_conf: ""
 
 # values: null, wireguard
 connectivity: null
