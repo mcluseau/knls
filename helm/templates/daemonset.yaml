@@ -37,6 +37,7 @@ spec:
         operator: Exists
 
       serviceAccountName: knls
+      enableServiceLinks: false
       hostNetwork: {{ .Values.hostNetwork }}
 {{- with .Values.hostAliases }}
       hostAliases:

@@ -30,7 +30,7 @@ data:
 
 {{ if .Values.connectivity}}
     connectivity: !{{.Values.connectivity}}
-{{- if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
+{{-   if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       ifname: {{.ifname |quote}}
       key_path: "/var/lib/knls/wireguard/{{.key}}"
       on_create:
@@ -40,7 +40,7 @@ data:
         rules: |-
           type nat hook postrouting priority 999; policy accept;
           fib saddr type local oif {{ .ifname |quote }} masquerade
-{{- end }}{{ end }}
+{{-   end }}{{ end }}
 {{- end }}
 
   unbound.conf: |
