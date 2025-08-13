@@ -46,7 +46,7 @@ impl Domain {
         domain
     }
 
-    pub fn resolve(&self, dn: &DomainName) -> Resolved {
+    pub fn resolve(&self, dn: &DomainName) -> Resolved<'_> {
         let mut r = Resolved {
             soa: self.soa().map(|soa| (DomainName::new(), soa)),
             domain: None,

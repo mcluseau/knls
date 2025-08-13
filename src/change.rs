@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap as Map, btree_map};
+use std::collections::{btree_map, BTreeMap as Map};
 use std::mem;
 
 #[derive(Debug)]
@@ -14,11 +14,11 @@ impl<K: Ord + Clone, T: Eq> Tracker<K, T> {
         self.values.clear();
     }
 
-    pub fn check(&mut self, key: K, value: &T) -> Option<Change<K, T>> {
+    pub fn check(&mut self, key: K, value: &T) -> Option<Change<'_, K, T>> {
         // get current value and mark it as seen
         let entry = self.values.entry(key).and_modify(|e| e.touch());
 
-        use std::collections::btree_map::Entry;
+        use btree_map::Entry;
         let kind = match entry {
             Entry::Vacant(_) => Kind::Created,
             Entry::Occupied(ref e) => {
@@ -96,6 +96,8 @@ impl<T> Item<T> {
     }
 }
 
+type Entry<'t, K, T> = btree_map::Entry<'t, K, Item<T>>;
+
 #[derive(Debug)]
 enum State<T> {
     Unseen,
@@ -105,7 +107,7 @@ enum State<T> {
 
 pub struct Change<'a, K: Ord, T> {
     pub kind: Kind,
-    entry: btree_map::Entry<'a, K, Item<T>>,
+    entry: Entry<'a, K, T>,
 }
 impl<'a, K: Ord, T> Change<'a, K, T> {
     pub fn key(&self) -> &K {
@@ -113,7 +115,7 @@ impl<'a, K: Ord, T> Change<'a, K, T> {
     }
 
     pub fn set(self, value: T) {
-        use std::collections::btree_map::Entry;
+        use btree_map::Entry;
         let new_state = State::Modified(value);
         match self.entry {
             Entry::Vacant(e) => {

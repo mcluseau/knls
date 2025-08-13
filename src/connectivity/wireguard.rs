@@ -164,13 +164,10 @@ pub async fn watch(
             let mut found = false;
             let mut addrs = (rtnl.address().get().set_link_index_filter(link_id)).execute();
             while let Some(addr) = addrs.try_next().await? {
-                let Some(ip) = (addr.attributes.iter())
-                    .filter_map(|attr| match attr {
-                        AddressAttribute::Address(ip) => Some(ip),
-                        _ => None,
-                    })
-                    .next()
-                else {
+                let Some(ip) = addr.attributes.iter().find_map(|attr| match attr {
+                    AddressAttribute::Address(ip) => Some(ip),
+                    _ => None,
+                }) else {
                     continue;
                 };
 
@@ -181,17 +178,15 @@ pub async fn watch(
                 }
             }
 
-            if let Some(ip) = vpn_ip {
-                if !found {
-                    let prefix_len = match ip {
-                        IpAddr::V4(_) => 32u8,
-                        IpAddr::V6(_) => 128u8,
-                    };
-                    rtnl.address()
-                        .add(link_id, ip, prefix_len)
-                        .execute()
-                        .await?;
-                }
+            if !found && let Some(ip) = vpn_ip {
+                let prefix_len = match ip {
+                    IpAddr::V4(_) => 32u8,
+                    IpAddr::V6(_) => 128u8,
+                };
+                rtnl.address()
+                    .add(link_id, ip, prefix_len)
+                    .execute()
+                    .await?;
             }
         }
 
@@ -202,9 +197,7 @@ pub async fn watch(
             r#type: "ptp",
             ipam: CniIpam {
                 r#type: "host-local",
-                ranges: vec![my_node
-                    .pod_cidrs
-                    .iter()
+                ranges: vec![(my_node.pod_cidrs.iter())
                     .map(|cidr| CniRange {
                         subnet: cidr.to_string(),
                     })
@@ -217,11 +210,10 @@ pub async fn watch(
                 nameservers: vpn_ip.iter().map(|ip| ip.to_string()).collect(),
             },
             mtu: (link.attributes.iter())
-                .filter_map(|attr| match attr {
+                .find_map(|attr| match attr {
                     Mtu(mtu) => Some(*mtu),
                     _ => None,
                 })
-                .next()
                 .unwrap_or(1420),
         };
 

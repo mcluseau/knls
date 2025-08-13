@@ -1,5 +1,5 @@
 use kube::runtime::watcher::Event;
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{btree_map, BTreeMap};
 use std::ops::RangeBounds;
 
 pub struct Value<F, T> {
@@ -58,11 +58,11 @@ impl<F, T: KeyValueFrom<F>> Map<F, T> {
         self.map.get(key)
     }
 
-    pub fn iter(&self) -> btree_map::Iter<T::Key, T> {
+    pub fn iter(&self) -> btree_map::Iter<'_, T::Key, T> {
         self.map.iter()
     }
 
-    pub fn range<R: RangeBounds<T::Key>>(&self, bounds: R) -> btree_map::Range<T::Key, T> {
+    pub fn range<R: RangeBounds<T::Key>>(&self, bounds: R) -> btree_map::Range<'_, T::Key, T> {
         self.map.range(bounds)
     }
 

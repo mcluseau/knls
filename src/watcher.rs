@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::{
+    watch::{self, error::RecvError, Receiver, Sender},
     RwLock,
-    watch::{self, Receiver, Sender, error::RecvError},
 };
 
 use crate::state::State;
@@ -49,7 +49,7 @@ impl Source {
         }
     }
 
-    pub async fn write(&self) -> WriteGuard {
+    pub async fn write(&self) -> WriteGuard<'_> {
         self.shared_state.write().await
     }
 
