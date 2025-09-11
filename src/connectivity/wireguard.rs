@@ -327,12 +327,19 @@ struct OifRoutes {
 }
 impl OifRoutes {
     async fn list(&self) -> eyre::Result<Vec<IpAddrMask>> {
+        use rtnetlink::RouteMessageBuilder as B;
+
         let mut routes = Vec::new();
 
-        for ip_version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6].into_iter() {
+        for route_filter in [
+            self.route_msg(B::<Ipv4Addr>::new()),
+            self.route_msg(B::<Ipv6Addr>::new()),
+        ]
+        .into_iter()
+        {
             use netlink_packet_route::route::RouteAttribute;
 
-            let mut route_list = self.rtnl.route().get(ip_version).execute();
+            let mut route_list = self.rtnl.route().get(route_filter).execute();
             while let Some(route) = route_list.try_next().await? {
                 if route.header.table != self.default_hdr.table
                     || route.header.protocol != self.default_hdr.protocol
@@ -373,61 +380,41 @@ impl OifRoutes {
     }
 
     async fn add(&self, dest: &IpAddrMask) -> eyre::Result<()> {
-        let add_req = self
-            .rtnl
-            .route()
-            .add()
-            .table_id(self.default_hdr.table.into())
-            .scope(self.default_hdr.scope)
-            .kind(self.default_hdr.kind)
-            .protocol(self.default_hdr.protocol)
-            .output_interface(self.oif);
-
-        match dest.ip {
-            IpAddr::V4(ip) => {
-                add_req
-                    .v4()
-                    .destination_prefix(ip, dest.cidr)
-                    .execute()
-                    .await
-            }
-            IpAddr::V6(ip) => {
-                add_req
-                    .v6()
-                    .destination_prefix(ip, dest.cidr)
-                    .execute()
-                    .await
-            }
-        }?;
+        let msg = self.dest_route_msg(dest);
+        self.rtnl.route().add(msg).execute().await?;
         Ok(())
     }
 
     async fn del(&self, dest: &IpAddrMask) -> eyre::Result<()> {
-        let msg = self.route_msg(dest);
+        let msg = self.dest_route_msg(dest);
         self.rtnl.route().del(msg).execute().await?;
         Ok(())
     }
 
-    fn route_msg(&self, dest: &IpAddrMask) -> netlink_packet_route::route::RouteMessage {
-        use netlink_packet_route::route::{RouteAttribute, RouteMessage};
-        use netlink_packet_route::AddressFamily;
+    fn route_msg<T>(
+        &self,
+        builder: rtnetlink::RouteMessageBuilder<T>,
+    ) -> netlink_packet_route::route::RouteMessage {
+        builder
+            .table_id(self.default_hdr.table as u32) // TODO fix upstream?
+            .protocol(self.default_hdr.protocol)
+            .scope(self.default_hdr.scope)
+            .kind(self.default_hdr.kind)
+            .output_interface(self.oif)
+            .build()
+    }
 
-        let (address_family, addr) = match dest.ip {
-            IpAddr::V4(ip) => (AddressFamily::Inet, RouteAddress::Inet(ip)),
-            IpAddr::V6(ip) => (AddressFamily::Inet6, RouteAddress::Inet6(ip)),
-        };
+    fn dest_route_msg(&self, dest: &IpAddrMask) -> netlink_packet_route::route::RouteMessage {
+        use rtnetlink::RouteMessageBuilder as B;
 
-        let mut msg = RouteMessage::default();
-        msg.header = RouteHeader {
-            address_family,
-            destination_prefix_length: dest.cidr,
-            ..self.default_hdr.clone()
-        };
-
-        msg.attributes.push(RouteAttribute::Destination(addr));
-        msg.attributes.push(RouteAttribute::Oif(self.oif));
-
-        msg
+        match dest.ip {
+            IpAddr::V4(ip) => {
+                self.route_msg(B::<Ipv4Addr>::new().destination_prefix(ip, dest.cidr))
+            }
+            IpAddr::V6(ip) => {
+                self.route_msg(B::<Ipv6Addr>::new().destination_prefix(ip, dest.cidr))
+            }
+        }
     }
 }
 

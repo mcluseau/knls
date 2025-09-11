@@ -1,6 +1,6 @@
 [package]
 name = "knls"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 
 [features]
@@ -15,20 +15,20 @@ panic = "abort"
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.5.16", features = ["derive", "env"] }
-defguard_wireguard_rs = { version = "0.4.7", path = "./wireguard-rs" }
+defguard_wireguard_rs = { version = "0.7.6", path = "./wireguard-rs" }
 env_logger = "0.11.5"
 eyre = "0.6.12"
 futures = "0.3.30"
-gethostname = "0.5.0"
+gethostname = "1.0.2"
 hex = "0.4.3"
 http = "1.1.0"
 hxdmp = "0.2.1"
-itertools = "0.13.0"
-k8s-openapi = { version = "0.24.0", features = ["v1_28"] }
-kube = { version = "0.98.0", features = ["aws-lc-rs", "runtime"] }
+itertools = "0.14.0"
+k8s-openapi = { version = "0.26.0", features = ["earliest"] }
+kube = { version = "2.0.0", features = ["aws-lc-rs", "runtime"] }
 log = "0.4.22"
-netlink-packet-route = "0.19.0"
-rtnetlink = "0.14.1"
+netlink-packet-route = "0.25.1"
+rtnetlink = "0.18.1"
 serde = { version = "1.0.208", features = ["derive", "rc"] }
 serde_json = "1.0.125"
 serde_yaml = "0.9.34"
