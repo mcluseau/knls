@@ -1,3 +1,3 @@
 set -ex
 t=$(git describe)
-docker build . -t mcluseau/knls:$t &&  docker push mcluseau/knls:$t
+docker build --platform=linux/amd64,linux/arm64 --push . -t mcluseau/knls:$t
