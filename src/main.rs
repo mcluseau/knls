@@ -153,6 +153,15 @@ async fn main() -> eyre::Result<()> {
     services.spawn("connectivity", config.connectivity);
     services.spawn("dns", config.dns);
 
+    if let Some(hw_labels) = config.hw_labels {
+        let ctx = ctx.clone();
+
+        tasks.spawn(async move {
+            let result = knls::hw_labels::watch(ctx.clone(), hw_labels).await;
+            ("hw_labels".into(), result)
+        });
+    }
+
     #[cfg(feature = "ingress")]
     {
         tasks.spawn(knls::backends::ingress::watch(cfg_rx.clone()));

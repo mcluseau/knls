@@ -24,6 +24,9 @@ pub struct Config {
 
     /// DNS service, authoritative on the cluster domain.
     pub dns: Option<DNS>,
+
+    /// Add hardware labels to the current node
+    pub hw_labels: Option<knls::hw_labels::HwLabels>,
 }
 fn default_event_buffer() -> usize {
     100

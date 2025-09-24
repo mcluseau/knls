@@ -233,6 +233,7 @@ pub struct Node {
     pub ips: Vec<IpAddr>,
     pub zone: Option<String>,
     pub pod_cidrs: Vec<String>,
+    pub labels: Map<String, String>,
 }
 impl Node {
     fn from_kube(n: core::Node) -> Self {
@@ -248,6 +249,7 @@ impl Node {
                 .unwrap_or_default(),
             zone: n.get_zone().cloned(),
             pod_cidrs: n.spec.and_then(|s| s.pod_cidrs).unwrap_or_default(),
+            labels: n.metadata.labels.unwrap_or_default().clone(),
         }
     }
 }

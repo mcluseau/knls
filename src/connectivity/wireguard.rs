@@ -15,7 +15,7 @@ use tokio::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::state::wireguard::{decode_key, encode_key, Key};
-use crate::{actions, change};
+use crate::{actions, change, patch_params};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -233,15 +233,11 @@ pub async fn watch(
             );
 
             use k8s_openapi::api::core::v1::Node;
-            use kube::api::{Patch, PatchParams};
+            use kube::api::Patch;
 
             let nodes = kube::api::Api::<Node>::all(kube.clone());
             if let Err(e) = nodes
-                .patch(
-                    &node_name,
-                    &PatchParams::apply("knls"),
-                    &Patch::Strategic(&patch),
-                )
+                .patch(&node_name, &patch_params(), &Patch::Strategic(&patch))
                 .await
             {
                 if !warned_about_pubkey {

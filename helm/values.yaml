@@ -1,7 +1,7 @@
 
 image:
   repo: docker.io/mcluseau/knls
-  tag: 0.1.8
+  tag: 0.2.0
 
 hostNetwork: true
 
@@ -41,6 +41,8 @@ unbound:
     access-control: 192.168.0.0/16 allow
     access-control: fd00::/8       allow
   extra_conf: ""
+
+hw_labels: true
 
 resources:
   knls:

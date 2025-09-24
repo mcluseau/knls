@@ -1,13 +1,15 @@
-pub mod change;
 pub mod actions;
+pub mod change;
 pub mod connectivity;
 pub mod dns;
+pub mod hw_labels;
 pub mod kube_watch;
 pub mod memstore;
 pub mod proxy;
 pub mod state;
 pub mod watcher;
 
+use kube::api::PatchParams;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
@@ -71,6 +73,10 @@ pub async fn process_kube_events(
         drop(state);
         source.notify();
     }
+}
+
+pub fn patch_params() -> PatchParams {
+    PatchParams::apply("knls")
 }
 
 /// Helper to define standard services. A standard service is defined as:

@@ -14,7 +14,7 @@ data:
 {{- end }}
 
     proxy: !nftables {}
-{{ if .Values.dns }}
+{{- if .Values.dns }}
     dns: !{{.Values.dns}}
       cluster_domain: {{ .Values.cluster_domain |quote }}
       on_listen:
@@ -28,7 +28,7 @@ data:
 {{-   end }}
 {{- end }}
 
-{{ if .Values.connectivity}}
+{{- if .Values.connectivity}}
     connectivity: !{{.Values.connectivity}}
 {{-   if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       ifname: {{.ifname |quote}}
@@ -41,6 +41,11 @@ data:
           type nat hook postrouting priority 999; policy accept;
           fib saddr type local oif {{ .ifname |quote }} masquerade
 {{-   end }}{{ end }}
+{{- end }}
+{{- if .Values.hw_labels}}
+    hw_labels:
+      disk_wwid: true
+      part_uuid: true
 {{- end }}
 
   unbound.conf: |
