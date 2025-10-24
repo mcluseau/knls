@@ -86,10 +86,12 @@ async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Set<String>> {
 
     let mut dir = fs::read_dir("/sys/class/block").await?;
     while let Some(sys_dir) = dir.next_entry().await? {
-        if cfg.disk_wwid
-            && let Some(wwid) = read_sub(&sys_dir, "wwid").await?
-        {
-            add("disk-wwid", wwid.trim_ascii());
+        if cfg.disk_wwid {
+            if let Some(wwid) = read_sub(&sys_dir, "wwid").await? {
+                add("disk-wwid", wwid.trim_ascii());
+            } else if let Some(wwid) = read_sub(&sys_dir, "device/wwid").await? {
+                add("disk-wwid", wwid.trim_ascii());
+            }
         }
 
         if cfg.part_uuid {
