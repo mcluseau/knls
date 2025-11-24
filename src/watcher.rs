@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::{
-    watch::{self, error::RecvError, Receiver, Sender},
     RwLock,
+    watch::{self, Receiver, Sender, error::RecvError},
 };
 
 use crate::state::State;

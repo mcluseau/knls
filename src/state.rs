@@ -1,3 +1,4 @@
+use cidr::IpCidr;
 use itertools::Itertools;
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use log::trace;
@@ -278,6 +279,7 @@ pub struct Service {
     pub external_traffic: TrafficPolicy,
     pub external_ips: Set<IpAddr>,
     pub session_affinity: SessionAffinity,
+    pub external_allow_list: Option<Set<String>>,
 }
 
 impl memstore::KeyValueFrom<core::Service> for Service {
@@ -298,10 +300,11 @@ impl memstore::KeyValueFrom<core::Service> for Service {
                 external_traffic: Default::default(),
                 external_ips: Set::new(),
                 session_affinity: SessionAffinity::None,
+                external_allow_list: None,
             });
         };
 
-        let target = match spec.type_.as_ref().map(|s| s.as_str()) {
+        let target = match spec.type_.as_deref() {
             None => ServiceTarget::None,
             Some("ExternalName") => match &spec.external_name {
                 None => ServiceTarget::None,
@@ -343,7 +346,7 @@ impl memstore::KeyValueFrom<core::Service> for Service {
             })
             .collect();
 
-        let session_affinity = match spec.session_affinity.as_ref().map(|a| a.as_str()) {
+        let session_affinity = match spec.session_affinity.as_deref() {
             Some("ClientIP") => {
                 match (spec.session_affinity_config.as_ref())
                     .and_then(|ac| ac.client_ip.as_ref())
@@ -356,8 +359,14 @@ impl memstore::KeyValueFrom<core::Service> for Service {
             _ => SessionAffinity::None,
         };
 
+        let external_allow_list = (spec.load_balancer_source_ranges.as_ref().cloned()).map(|ips| {
+            ips.into_iter()
+                .filter(|ip| ip.parse::<IpCidr>().is_ok())
+                .collect()
+        });
+
         Some(Self {
-            is_load_balancer: spec.type_ == Some("LoadBalancer".to_string()),
+            is_load_balancer: spec.type_.as_deref() == Some("LoadBalancer"),
             target,
             ports,
             node_ports,
@@ -365,6 +374,7 @@ impl memstore::KeyValueFrom<core::Service> for Service {
             external_traffic: (&spec.external_traffic_policy).into(),
             external_ips: parse_ips(&spec.external_ips),
             session_affinity,
+            external_allow_list,
         })
     }
 }
@@ -393,7 +403,7 @@ impl TrafficPolicy {
 impl From<&Option<String>> for TrafficPolicy {
     fn from(v: &Option<String>) -> Self {
         use TrafficPolicy::*;
-        match v.as_ref().map(String::as_str) {
+        match v.as_deref() {
             Some("Local") => Local,
             _ => Cluster,
         }
@@ -415,10 +425,10 @@ pub enum ProtoPort {
 }
 impl ProtoPort {
     fn from_service_port(sp: &core::ServicePort) -> Option<Self> {
-        Self::from_protocol_port(sp.protocol.as_ref().map(|s| s.as_str()), sp.port)
+        Self::from_protocol_port(sp.protocol.as_deref(), sp.port)
     }
     fn from_service_node_port(sp: &core::ServicePort) -> Option<Self> {
-        Self::from_protocol_port(sp.protocol.as_ref().map(|s| s.as_str()), sp.node_port?)
+        Self::from_protocol_port(sp.protocol.as_deref(), sp.node_port?)
     }
 
     fn from_protocol_port(protocol: Option<&str>, port: i32) -> Option<Self> {

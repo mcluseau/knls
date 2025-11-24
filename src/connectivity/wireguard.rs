@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::fs;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::state::wireguard::{decode_key, encode_key, Key};
+use crate::state::wireguard::{Key, decode_key, encode_key};
 use crate::{actions, change, patch_params};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -197,11 +197,13 @@ pub async fn watch(
             r#type: "ptp",
             ipam: CniIpam {
                 r#type: "host-local",
-                ranges: vec![(my_node.pod_cidrs.iter())
-                    .map(|cidr| CniRange {
-                        subnet: cidr.to_string(),
-                    })
-                    .collect()],
+                ranges: vec![
+                    (my_node.pod_cidrs.iter())
+                        .map(|cidr| CniRange {
+                            subnet: cidr.to_string(),
+                        })
+                        .collect(),
+                ],
                 routes: vec![CniRoute {
                     dst: "0.0.0.0/0".to_string(),
                 }],

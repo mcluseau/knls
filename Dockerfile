@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-from rust:1.90.0-alpine3.22 as build
+from rust:1.91.0-alpine3.22 as build
 
 run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git
 
@@ -12,7 +12,7 @@ run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry 
 #  cargo install --path . --root /dist
 
 # ------------------------------------------------------------------------
-from alpine:3.22.1
+from alpine:3.22.2
 entrypoint ["knls"]
 run apk add --no-cache nftables wireguard-tools
 copy --from=build /dist/bin/ /bin/

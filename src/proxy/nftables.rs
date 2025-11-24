@@ -117,14 +117,14 @@ fn update_table_to<W: Write>(
             &svc.internal_slices,
         )?;
 
-        if let Some(external_slices) = svc.external_slices.as_ref() {
+        if svc.needs_ext_chain() {
             write_service_slices_elements(
                 &mut update,
                 &my_node,
                 key,
                 &svc,
                 true,
-                &external_slices,
+                svc.external_slices(),
             )?;
         };
     }
@@ -299,7 +299,7 @@ fn svc_chain(key: &keys::Object) -> String {
 
 fn svc_chain_ext(key: &keys::Object, svc: &proxy::Service) -> String {
     let mut base = svc_chain(key);
-    if svc.external_slices.is_some() {
+    if svc.needs_ext_chain() {
         base.push_str("_ext")
     }
     base
@@ -340,6 +340,15 @@ fn write_service_slices_elements<W: Write>(
     }
 
     let mut pre_rules = Vec::new();
+
+    if ext && let Some(ref allow_list) = svc.external_allow_list {
+        let set: Vec<_> = allow_list.iter().map(|ip| ip.to_string()).collect();
+        writeln!(
+            pre_rules,
+            "  ip saddr != {{{set}}} reject",
+            set = set.join(", ")
+        )?;
+    }
 
     let mut n_ipv4 = 0;
     let mut n_ipv6 = 0;

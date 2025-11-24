@@ -1,4 +1,4 @@
-use std::collections::{btree_map, BTreeMap as Map};
+use std::collections::{BTreeMap as Map, btree_map};
 use std::mem;
 
 #[derive(Debug)]

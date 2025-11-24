@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::IpAddr;
 
-use crate::state::{LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget, keys};
+use crate::state::{keys, LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget};
 
 pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State> {
     if !(state.services.is_ready() && state.ep_slices.is_ready()) {
@@ -40,6 +40,7 @@ pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State
         let service = Service {
             cluster_ips: cluster_ips.clone(),
             external_ips: svc.external_ips.clone(),
+            external_allow_list: svc.external_allow_list.clone(),
             ports: svc.ports.clone(),
             node_ports,
             internal_slices,
@@ -59,6 +60,7 @@ pub type State = Map<keys::Object, Service>;
 pub struct Service {
     pub cluster_ips: Set<IpAddr>,
     pub external_ips: Set<IpAddr>,
+    pub external_allow_list: Option<Set<String>>,
     pub ports: Vec<(ProtoPort, String)>,
     pub node_ports: Vec<(ProtoPort, String)>,
     pub internal_slices: Vec<LocalEndpointSlice>,
@@ -66,6 +68,10 @@ pub struct Service {
     pub session_affinity: crate::state::SessionAffinity,
 }
 impl Service {
+    pub fn needs_ext_chain(&self) -> bool {
+        !self.external_ips.is_empty()
+    }
+
     pub fn external_slices(&self) -> &Vec<LocalEndpointSlice> {
         self.external_slices
             .as_ref()

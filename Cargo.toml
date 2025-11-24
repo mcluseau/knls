@@ -14,6 +14,7 @@ panic = "abort"
 
 [dependencies]
 base64 = "0.22.1"
+cidr = "0.3.1"
 clap = { version = "4.5.16", features = ["derive", "env"] }
 defguard_wireguard_rs = { version = "0.7.6", path = "./wireguard-rs" }
 env_logger = "0.11.5"
