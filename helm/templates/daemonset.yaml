@@ -41,7 +41,12 @@ spec:
       hostNetwork: {{ .Values.hostNetwork }}
 {{- with .Values.hostAliases }}
       hostAliases:
-{{ . |toYaml |indent 6 }}
+{{ . |toYaml |indent 8 }}
+{{- end }}
+
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+{{ . |toYaml |indent 8 }}
 {{- end }}
 
       containers:

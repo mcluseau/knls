@@ -4,6 +4,7 @@ image:
   tag: 0.2.0
 
 hostNetwork: true
+nodeSelector: null
 
 #extra_conf: |-
 #  on_start: ...
@@ -35,6 +36,7 @@ unbound:
     interface: 0.0.0.0
     interface: ::0
   server_extra: |
+    access-control: ::1/128        allow
     access-control: 127.0.0.0/8    allow
     access-control: 10.0.0.0/8     allow
     access-control: 172.16.0.0/12  allow
