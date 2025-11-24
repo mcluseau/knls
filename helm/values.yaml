@@ -8,6 +8,15 @@ nodeSelector: null
 
 #extra_conf: |-
 #  on_start: ...
+#
+# a common requirement would be to masq pods' outgoing traffic; pod are usually connected with veth:
+#  on_start:
+#  - !nft_chain
+#    table: knls
+#    chain: masq-pods
+#    rules: |-
+#      type nat hook postrouting priority 999; policy accept;
+#      meta iifkind "veth" oifname != "kwg" masquerade
 
 #service_ips: [ 1.2.3.4 ]
 cluster_domain: cluster.local
