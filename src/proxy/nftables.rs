@@ -25,6 +25,8 @@ use crate::state::{
 };
 use crate::watcher::Watcher;
 
+const MASQ_MARK: u32 = 1<<14;
+
 const SERVICE_IPS: &'static str = "service_ips";
 const SERVICE_NODEPORTS: &'static str = "service_nodeports";
 const NEED_MASQ_V4: &'static str = "need_masquerade";
@@ -224,28 +226,6 @@ fn update_table_to<W: Write>(
         }
     }
 
-    update.ctr(CtrKind::Set, "masq_ext_svc", |buf| {
-        writeln!(buf, "  type ipv4_addr . inet_proto . inet_service")
-    })?;
-    update.ctr(CtrKind::Set, "masq_ext_svc6", |buf| {
-        writeln!(buf, "  type ipv6_addr . inet_proto . inet_service")
-    })?;
-
-    for (_, svc) in cfg.iter() {
-        for ip in svc.external_ips.iter() {
-            let set_name = match ip {
-                IpAddr::V4(_) => "masq_ext_svc",
-                IpAddr::V6(_) => "masq_ext_svc6",
-            };
-
-            for (proto_port, _) in &svc.ports {
-                let (proto, port) = proto_port.protocol_port();
-                let proto = nft_proto(proto);
-                update.set_element(set_name, format!("{ip} . {proto} . {port}"))?;
-            }
-        }
-    }
-
     update.ctr(CtrKind::Chain, "a_hook_dnat_postrouting", |buf| {
         writeln!(buf, "  type nat hook postrouting priority 0;")?;
         writeln!(
@@ -273,15 +253,11 @@ fn update_table_to<W: Write>(
             writeln!(buf, "{ipv} daddr {pod_cidr} return;")?;
         }
 
-        // masq external services
+        // masq what's marked for masquerading (tldr: anything that was dnat by us)
         writeln!(
-            buf,
-            "  ct original ip daddr . ip protocol . ct original proto-dst @masq_ext_svc masquerade;"
-        )?;
+            buf, "  mark and {MASQ_MARK} == 0 return;")?;
         writeln!(
-            buf,
-            "  ct original ip6 daddr . ip protocol . ct original proto-dst @masq_ext_svc6 masquerade;"
-        )
+            buf, "  mark set mark xor {MASQ_MARK} masquerade fully-random;")
     })?;
 
     // ----------------------------------------
@@ -468,7 +444,7 @@ impl<'t> DnatWriter<'t> {
         return if self.my_ips.contains(ip) {
             writeln!(self, "redirect to {target_port}")
         } else {
-            writeln!(self, "dnat to {ip}:{target_port}")
+            writeln!(self, "mark set mark or {MASQ_MARK} dnat to {ip}:{target_port}")
         };
     }
 }
