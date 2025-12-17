@@ -1,7 +1,7 @@
 
 image:
   repo: docker.io/mcluseau/knls
-  tag: 0.2.0
+  tag: 0.2.2
 
 hostNetwork: true
 nodeSelector: null
