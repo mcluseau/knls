@@ -58,6 +58,7 @@ data:
       trust-anchor-file: "/usr/share/dnssec-root/trusted-key.key"
       qname-minimisation: yes
       do-not-query-localhost: no
+      interface-automatic: yes
 
       domain-insecure: {{ .Values.cluster_domain |quote }}
       local-zone: {{ .Values.cluster_domain |quote }} nodefault
