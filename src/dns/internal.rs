@@ -1,3 +1,6 @@
+#![allow(clippy::unusual_byte_groupings)]
+
+use eyre::format_err;
 use log::{debug, error};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -26,7 +29,8 @@ pub async fn watch(
     let sock = UdpSocket::bind(cfg.bind).await?;
     actions::run_event(module_path!(), "on_listen", &cfg.on_listen).await?;
 
-    let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str()).unwrap();
+    let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str())
+        .map_err(|_| format_err!("invalid cluster domain"))?;
 
     let mut root = data::Domain::new();
     let mut recv_buf = [0; 512];
@@ -67,13 +71,6 @@ const RESPONSE_PACKET: [u8; 12] = [
     0,
 ];
 
-#[allow(unused)]
-fn hexdump(data: &[u8]) -> String {
-    let mut v = Vec::new();
-    hxdmp::hexdump(data, &mut v).unwrap();
-    String::from_utf8_lossy(&v).to_string()
-}
-
 async fn handle_req(
     recv_buf: &mut [u8],
     sock: &UdpSocket,
@@ -90,7 +87,7 @@ async fn handle_req(
         debug!("recv from {remote} ({len} bytes)");
 
         let pkt = &recv_buf[0..len];
-        let resp = match try_handle_req(pkt, &root) {
+        let resp = match try_handle_req(pkt, root) {
             Ok(v) => v,
             Err(e) => {
                 debug!("request handler failed: {e:?}");
@@ -193,7 +190,7 @@ fn try_handle_req(pkt: &[u8], data: &dns::Domain) -> packet::Result<Vec<u8>> {
 
     debug!("reply ok");
 
-    return Ok(resp.into_vec());
+    Ok(resp.into_vec())
 }
 
 struct Resolve<'t> {
@@ -232,32 +229,30 @@ impl<'t> Resolve<'t> {
 
         let mut answered = false;
 
-        for record in resolved.domain.iter().map(|d| d.records().iter()).flatten() {
+        for record in resolved.domain.iter().flat_map(|d| d.records().iter()) {
             debug!("evaluating {record:?}");
             if record.rtype() == &self.rtype {
                 resp.push_label(&jump);
                 record.push_to(resp);
                 self.an_count += 1;
                 answered = true;
-            } else if record.rtype() == &data::RecordType::CNAME {
-                if cname.is_none() {
-                    cname = Some(record);
-                }
+            } else if record.rtype() == &data::RecordType::CNAME && cname.is_none() {
+                cname = Some(record);
             }
         }
 
         let Some(cname) = cname else {
-            if self.cname_depth == 0 {
-                if let Some(soa) = resolved.soa {
-                    resp.set_aa(true);
+            if self.cname_depth == 0
+                && let Some(soa) = resolved.soa
+            {
+                resp.set_aa(true);
 
-                    if !answered {
-                        self.ns.push((soa.0, soa.1.clone()));
-                    }
+                if !answered {
+                    self.ns.push((soa.0, soa.1.clone()));
+                }
 
-                    if resolved.domain.is_none() {
-                        resp.set_rcode(ResponseCode::NameError);
-                    }
+                if resolved.domain.is_none() {
+                    resp.set_rcode(ResponseCode::NameError);
                 }
             }
 

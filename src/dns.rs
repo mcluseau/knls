@@ -37,7 +37,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
         return None;
     }
 
-    let ns_dn = DomainName::try_from("localhost.localdomain").unwrap();
+    let ns_dn = DomainName::unchecked_new("localhost.localdomain");
 
     let mut domain = Domain::new();
 
@@ -46,7 +46,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
         // @ 5 SOA ns.dns clusteradmin {zone_serial} 7200 1800 86400 {ttl}
         data::Soa {
             mname: ns_dn.clone(),
-            rname: "cluster-admin".try_into().unwrap(),
+            rname: DomainName::unchecked_new("cluster-admin"),
             serial: 1,
             refresh: 60,
             retry: ttl,
@@ -57,11 +57,11 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
     );
     domain.push_record(Record::ns(5, &ns_dn));
 
-    let svc_zone = domain.sub_or_create(Label::from_str("svc"));
+    let svc_zone = domain.sub_or_create(Label::new("svc"));
 
     for (key, svc) in state.services.iter() {
-        let zone = svc_zone.sub_or_create(Label::from_str(&key.namespace));
-        let zone = zone.sub_or_create(Label::from_str(&key.name));
+        let zone = svc_zone.sub_or_create(Label::new(&key.namespace));
+        let zone = zone.sub_or_create(Label::new(&key.name));
 
         match &svc.target {
             ServiceTarget::None => { /* noop */ }
@@ -81,7 +81,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
             ServiceTarget::Headless => {
                 for slice in state.slices(key, svc.internal_traffic.is_local()) {
                     for ep in slice.endpoints.into_iter() {
-                        for ip in ep.into_ips() {
+                        for ip in ep.ips() {
                             zone.push_record(Record::alias(ttl, ip));
                         }
                     }
@@ -97,11 +97,11 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
                 continue;
             };
 
-            let zone = svc_zone.sub_or_create(Label::from_str(&key.namespace));
-            let zone = zone.sub_or_create(Label::from_str(&key.service_name));
-            let zone = zone.sub_or_create(Label::from_str(hostname));
+            let zone = svc_zone.sub_or_create(Label::new(&key.namespace));
+            let zone = zone.sub_or_create(Label::new(&key.service_name));
+            let zone = zone.sub_or_create(Label::new(hostname));
 
-            for ip in (&ep).ips() {
+            for ip in ep.ips() {
                 zone.push_record(Record::alias(ttl, ip));
             }
         }

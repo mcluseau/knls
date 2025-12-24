@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::IpAddr;
 
-use crate::state::{keys, LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget};
+use crate::state::{LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget, keys};
 
 pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State> {
     if !(state.services.is_ready() && state.ep_slices.is_ready()) {
@@ -15,18 +15,12 @@ pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State
             continue;
         };
 
-        let internal_slices = state
-            .slices(&key, svc.internal_traffic.is_local())
-            .collect();
+        let internal_slices = state.slices(key, svc.internal_traffic.is_local()).collect();
 
         let external_slices = if !svc.external_ips.is_empty()
             && svc.internal_traffic.is_local() != svc.external_traffic.is_local()
         {
-            Some(
-                state
-                    .slices(&key, svc.external_traffic.is_local())
-                    .collect(),
-            )
+            Some(state.slices(key, svc.external_traffic.is_local()).collect())
         } else {
             None // same as internal_endpoints
         };
@@ -72,23 +66,21 @@ impl Service {
         !self.external_ips.is_empty()
     }
 
-    pub fn external_slices(&self) -> &Vec<LocalEndpointSlice> {
+    pub fn external_slices(&self) -> &[LocalEndpointSlice] {
         self.external_slices
             .as_ref()
             .unwrap_or(&self.internal_slices)
     }
 
-    pub fn internal_endpoints<'t>(&'t self) -> impl Iterator<Item = &'t LocalEndpoint> {
+    pub fn internal_endpoints(&self) -> impl Iterator<Item = &LocalEndpoint> {
         self.internal_slices
             .iter()
-            .map(|slice| slice.endpoints.iter())
-            .flatten()
+            .flat_map(|slice| slice.endpoints.iter())
     }
 
-    pub fn external_endpoints<'t>(&'t self) -> impl Iterator<Item = &'t LocalEndpoint> {
+    pub fn external_endpoints(&self) -> impl Iterator<Item = &LocalEndpoint> {
         self.external_slices()
             .iter()
-            .map(|slice| slice.endpoints.iter())
-            .flatten()
+            .flat_map(|slice| slice.endpoints.iter())
     }
 }

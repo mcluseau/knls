@@ -107,7 +107,7 @@ async fn watch_to_events<K>(
             return;
         };
 
-        if let Err(_) = tx.send(map(event)).await {
+        if tx.send(map(event)).await.is_err() {
             info!("receiver of {resource} stopped");
             return;
         }

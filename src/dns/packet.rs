@@ -1,5 +1,6 @@
 use super::data::{self, DomainName};
 
+#[allow(clippy::unusual_byte_groupings)]
 mod header {
     pub const ID_IDX: usize = 0;
     pub const OPCODE_IDX: usize = 2;
@@ -105,7 +106,7 @@ impl<'t> Reader<'t> {
     }
 
     pub fn remainer(&self) -> &[u8] {
-        &self.pkt.get(self.pos..).unwrap_or_default()
+        self.pkt.get(self.pos..).unwrap_or_default()
     }
 
     fn get(&self, pos: usize) -> Result<u8> {
@@ -145,9 +146,6 @@ impl<'t> Reader<'t> {
         Ok((label, len))
     }
 
-    pub fn next(&mut self) -> Result<u8> {
-        self.get(self.pos).inspect(|_| self.pos += 1)
-    }
     pub fn next_n(&mut self, n: usize) -> Result<&'t [u8]> {
         self.get_n(self.pos, n).inspect(|_| self.pos += n)
     }
@@ -355,6 +353,12 @@ impl Writer {
 
     pub fn into_vec(self) -> Vec<u8> {
         self.pkt
+    }
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

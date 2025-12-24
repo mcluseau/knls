@@ -25,12 +25,12 @@ use crate::state::{
 };
 use crate::watcher::Watcher;
 
-const MASQ_MARK: u32 = 1<<14;
+const MASQ_MARK: u32 = 1 << 14;
 
-const SERVICE_IPS: &'static str = "service_ips";
-const SERVICE_NODEPORTS: &'static str = "service_nodeports";
-const NEED_MASQ_V4: &'static str = "need_masquerade";
-const NEED_MASQ_V6: &'static str = "need_masquerade6";
+const SERVICE_IPS: &str = "service_ips";
+const SERVICE_NODEPORTS: &str = "service_nodeports";
+const NEED_MASQ_V4: &str = "need_masquerade";
+const NEED_MASQ_V6: &str = "need_masquerade6";
 
 pub async fn watch(_ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) -> Result<()> {
     let mut table = TableTracker::new(format!("inet {}", cfg.table));
@@ -69,7 +69,7 @@ fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::State) ->
         .stdin(Stdio::piped())
         .spawn()?;
 
-    let mut nft = io::BufWriter::new(child.stdin.as_mut().unwrap());
+    let mut nft = io::BufWriter::new(child.stdin.as_mut().expect("stdin should be defined"));
 
     update_table_to(&mut nft, table, my_node, cfg)?;
 
@@ -110,21 +110,14 @@ fn update_table_to<W: Write>(
 
     // ----------------------------------------
     for (key, svc) in cfg.iter() {
-        write_service_slices_elements(
-            &mut update,
-            &my_node,
-            key,
-            &svc,
-            false,
-            &svc.internal_slices,
-        )?;
+        write_service_slices_elements(&mut update, my_node, key, svc, false, &svc.internal_slices)?;
 
         if svc.needs_ext_chain() {
             write_service_slices_elements(
                 &mut update,
-                &my_node,
+                my_node,
                 key,
-                &svc,
+                svc,
                 true,
                 svc.external_slices(),
             )?;
@@ -254,10 +247,11 @@ fn update_table_to<W: Write>(
         }
 
         // masq what's marked for masquerading (tldr: anything that was dnat by us)
+        writeln!(buf, "  mark and {MASQ_MARK} == 0 return;")?;
         writeln!(
-            buf, "  mark and {MASQ_MARK} == 0 return;")?;
-        writeln!(
-            buf, "  mark set mark xor {MASQ_MARK} masquerade fully-random;")
+            buf,
+            "  mark set mark xor {MASQ_MARK} masquerade fully-random;"
+        )
     })?;
 
     // ----------------------------------------
@@ -291,7 +285,7 @@ fn write_service_slices_elements<W: Write>(
     key: &keys::Object,
     svc: &proxy::Service,
     ext: bool,
-    slices: &Vec<LocalEndpointSlice>,
+    slices: &[LocalEndpointSlice],
 ) -> eyre::Result<()> {
     let svc_chain = if ext {
         svc_chain_ext(key, svc)
@@ -405,9 +399,9 @@ fn write_service_slices_elements<W: Write>(
 
 struct DnatWriter<'t> {
     content: &'t mut Vec<u8>,
-    my_ips: &'t Vec<IpAddr>,
+    my_ips: &'t [IpAddr],
     slice: &'t LocalEndpointSlice,
-    ip: &'t IpAddr,
+    ip: IpAddr,
     node_port: bool,
 }
 
@@ -441,11 +435,14 @@ impl<'t> DnatWriter<'t> {
         write!(self, "meta nfproto {ipvx} {protocol} dport {port} ")?;
 
         let ip = self.ip;
-        return if self.my_ips.contains(ip) {
+        if self.my_ips.contains(&ip) {
             writeln!(self, "redirect to {target_port}")
         } else {
-            writeln!(self, "mark set mark or {MASQ_MARK} dnat to {ip}:{target_port}")
-        };
+            writeln!(
+                self,
+                "mark set mark or {MASQ_MARK} dnat to {ip}:{target_port}"
+            )
+        }
     }
 }
 
@@ -453,12 +450,12 @@ fn set_need_masquerade_for<'t, W: Write>(
     table: &mut TableUpdater<W>,
     ep: &LocalEndpoint,
     ips: impl Iterator<Item = &'t IpAddr>,
-    my_ips: &Vec<IpAddr>,
+    my_ips: &[IpAddr],
 ) -> Result<()> {
     for svc_ip in ips {
         let (set, ep_ip) = match svc_ip {
-            IpAddr::V4(_) => (NEED_MASQ_V4, ep.ipv4),
-            IpAddr::V6(_) => (NEED_MASQ_V6, ep.ipv6),
+            IpAddr::V4(_) => (NEED_MASQ_V4, ep.ipv4.map(IpAddr::V4)),
+            IpAddr::V6(_) => (NEED_MASQ_V6, ep.ipv6.map(IpAddr::V6)),
         };
         let Some(ep_ip) = ep_ip else {
             continue;
@@ -590,8 +587,8 @@ impl<'t, W: Write> TableUpdater<'t, W> {
         let table = &self.tracker.table;
         for (kind, ctr_name) in self.tracker.ctrs.current_keys() {
             let deleted: Box<dyn Iterator<Item = &String>> = match kind {
-                CtrKind::Set => Box::new(self.tracker.sets.get(ctr_name).unwrap().deleted()),
-                CtrKind::Map => Box::new(self.tracker.maps.get(ctr_name).unwrap().deleted()),
+                CtrKind::Set => Box::new(self.tracker.sets[ctr_name].deleted()),
+                CtrKind::Map => Box::new(self.tracker.maps[ctr_name].deleted()),
                 _ => {
                     continue;
                 }
@@ -655,29 +652,29 @@ impl<'t, W: Write> TableUpdater<'t, W> {
             let Some(name) = token.strip_prefix(b"@") else {
                 continue; // word is not a ref
             };
-            let name = String::from_utf8_lossy(&name).to_string();
+            let name = String::from_utf8_lossy(name).to_string();
             let Some(def) = self.maps_to_define.get(&name) else {
                 continue; // not a ref to a map
             };
             writeln!(nft, "map {table} {name} {{")?;
-            nft.write(def)?;
+            nft.write_all(def)?;
             writeln!(nft, "}}")?;
             self.maps_to_define.remove(&name);
         }
 
         // write the container & its content
         writeln!(nft, "{kind} {table} {name} {{")?;
-        nft.write(&self.buf)?;
+        nft.write_all(&self.buf)?;
         writeln!(nft, "}};")?;
 
         change.set(h);
         Ok(true)
     }
 
-    fn map_element(&mut self, map_name: &str, key: String, value: String) -> io::Result<()> {
+    fn map_element(&mut self, map_name: &str, key: String, value: String) -> Result<()> {
         let h = xxhash_rust::xxh3::xxh3_128(value.as_bytes());
         let Some(change) = (self.tracker.maps.get_mut(map_name))
-            .unwrap() // 'element' must be called before
+            .ok_or_else(|| format_err!("'ctr(Map, {map_name:?})' must be called before"))?
             .check(key, &h)
         else {
             return Ok(());
@@ -702,9 +699,9 @@ impl<'t, W: Write> TableUpdater<'t, W> {
         Ok(())
     }
 
-    fn set_element(&mut self, set_name: &str, key: String) -> io::Result<()> {
+    fn set_element(&mut self, set_name: &str, key: String) -> Result<()> {
         let Some(change) = (self.tracker.sets.get_mut(set_name))
-            .unwrap() // 'element' must be call before
+            .ok_or_else(|| format_err!("'ctr(Set, {set_name:?})' must be called before"))?
             .check(key, &())
         else {
             return Ok(());

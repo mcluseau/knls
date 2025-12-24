@@ -3,17 +3,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::packet;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Domain {
     subs: Map<Label, Domain>,
     records: Vec<Record>,
 }
 impl Domain {
     pub fn new() -> Self {
-        Self {
-            subs: Map::new(),
-            records: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -31,7 +28,7 @@ impl Domain {
     }
 
     pub fn sub_or_create(&mut self, label: Label) -> &mut Domain {
-        self.subs.entry(label).or_insert_with(Domain::new)
+        self.subs.entry(label).or_default()
     }
 
     pub fn set(&mut self, dn: &DomainName, domain: Domain) {
@@ -272,12 +269,16 @@ pub struct Opt {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainName(Vec<Label>);
 
 impl DomainName {
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self::default()
+    }
+
+    pub(super) fn unchecked_new(v: &str) -> Self {
+        Self(v.split('.').map(Label::unchecked_new).collect())
     }
 
     pub fn push(&mut self, label: Label) {
@@ -293,7 +294,7 @@ impl DomainName {
 
     pub fn raw_len(&self) -> usize {
         self.0.len() // 1 byte per label
-            + self.iter().map(|s| s.0.as_bytes().len()).sum::<usize>()
+            + self.iter().map(|s| s.0.len()).sum::<usize>()
             + 1 // ROOT terminator
     }
 
@@ -337,7 +338,7 @@ impl std::cmp::Ord for DomainName {
                 (None, None) => Equal,
                 (None, Some(_)) => Less,
                 (Some(_), None) => Greater,
-                (Some(a), Some(b)) => match a.cmp(&b) {
+                (Some(a), Some(b)) => match a.cmp(b) {
                     Equal => {
                         continue;
                     }
@@ -371,7 +372,7 @@ impl From<Label> for DomainName {
 impl TryFrom<&str> for DomainName {
     type Error = Error;
     fn try_from(v: &str) -> Result<Self, Self::Error> {
-        if v.as_bytes().len() > 255 {
+        if v.len() > 255 {
             return Err(Error::DomainNameTooLong);
         }
 
@@ -402,7 +403,11 @@ pub enum Error {
 #[derive(Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub struct Label(String);
 impl Label {
-    pub fn from_str(v: &str) -> Self {
+    pub(super) fn unchecked_new(v: impl Into<String>) -> Self {
+        Self(v.into())
+    }
+
+    pub fn new(v: &str) -> Self {
         // downcase name so the comparisons are case insensitive (including sort, otherwise we
         // could use eq_ignore_ascii_case).
         let v = v.to_lowercase();
@@ -410,7 +415,7 @@ impl Label {
     }
 
     pub fn raw_len(&self) -> usize {
-        self.0.as_bytes().len() + 1
+        self.0.len() + 1
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -421,21 +426,21 @@ impl Label {
 impl TryFrom<&str> for Label {
     type Error = Error;
     fn try_from(v: &str) -> Result<Self, Self::Error> {
-        if v.as_bytes().len() > 63 {
+        if v.len() > 63 {
             return Err(Error::LabelTooLong);
         }
-        Ok(Self::from_str(v))
+        Ok(Self::new(v))
     }
 }
 
-impl<'t> TryFrom<&[u8]> for Label {
+impl TryFrom<&[u8]> for Label {
     type Error = Error;
     fn try_from(v: &[u8]) -> Result<Self, Self::Error> {
         Self::try_from(String::from_utf8_lossy(v).as_ref())
     }
 }
 
-impl<'t> std::fmt::Display for Label {
+impl std::fmt::Display for Label {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_str(&self.0)
     }

@@ -83,7 +83,10 @@ pub async fn watch(
 
     let link = {
         let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
-        links.try_next().await?.unwrap()
+        links
+            .try_next()
+            .await?
+            .expect("at least one link should exist")
     };
     let link_id = link.header.index;
 
@@ -239,16 +242,15 @@ pub async fn watch(
 
             let nodes = kube::api::Api::<Node>::all(kube.clone());
             if let Err(e) = nodes
-                .patch(&node_name, &patch_params(), &Patch::Strategic(&patch))
+                .patch(node_name, &patch_params(), &Patch::Strategic(&patch))
                 .await
+                && !warned_about_pubkey
             {
-                if !warned_about_pubkey {
-                    let patch_str = serde_json::to_string(&patch).unwrap();
-                    error!(
-                        "failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}"
-                    );
-                    warned_about_pubkey = true;
-                }
+                let patch_str = serde_json::to_string(&patch).expect("patch should serialize");
+                error!(
+                    "failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}"
+                );
+                warned_about_pubkey = true;
             }
         }
 
@@ -284,7 +286,7 @@ pub async fn watch(
                         info!("updating peer {name}");
                     }
                 };
-                netlink::set_peer(&ifname, &peer.clone().to_wg_peer(pubkey))?;
+                netlink::set_peer(&ifname, &peer.clone().into_wg_peer(pubkey))?;
                 change.set(peer);
             }
 
@@ -301,7 +303,7 @@ pub async fn watch(
         }
 
         for removed_peer in peers.deleted() {
-            let pubkey = &wg::key::Key::new(removed_peer.clone());
+            let pubkey = &wg::key::Key::new(*removed_peer);
             info!("deleting peer {pubkey}");
             netlink::delete_peer(&ifname, pubkey)?;
         }
@@ -358,7 +360,7 @@ impl OifRoutes {
                     }
                 }
 
-                if !oif.is_some_and(|oif| oif == self.oif) {
+                if oif != Some(self.oif) {
                     continue;
                 };
 
@@ -370,7 +372,7 @@ impl OifRoutes {
                     }
                 };
 
-                let dest = IpAddrMask::new(dest.into(), route.header.destination_prefix_length);
+                let dest = IpAddrMask::new(dest, route.header.destination_prefix_length);
                 routes.push(dest);
             }
         }
@@ -418,7 +420,7 @@ impl OifRoutes {
 
 async fn get_private_key(key_path: &String) -> Result<Key> {
     match fs::read(key_path).await {
-        Ok(encoded_key) => decode_key(&encoded_key.trim_ascii()),
+        Ok(encoded_key) => decode_key(encoded_key.trim_ascii()),
         Err(e) => {
             warn!("failed to read private key: {e}");
             info!("creating a new key");
@@ -439,7 +441,7 @@ struct Peer {
     allowed_ips: Vec<wg::net::IpAddrMask>,
 }
 impl Peer {
-    fn to_wg_peer(self, pubkey: Key) -> wg::host::Peer {
+    fn into_wg_peer(self, pubkey: Key) -> wg::host::Peer {
         wg::host::Peer {
             public_key: wg::key::Key::new(pubkey),
             endpoint: self.endpoint,

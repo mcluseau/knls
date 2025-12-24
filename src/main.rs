@@ -1,12 +1,12 @@
 use clap::{Parser, ValueEnum};
 use eyre::format_err;
-use kube::{Client, runtime::watcher};
+use kube::{runtime::watcher, Client};
 use log::{error, info};
 use std::process::exit;
 use std::sync::Arc;
 use tokio::{
     select,
-    signal::unix::{SignalKind, signal},
+    signal::unix::{signal, SignalKind},
 };
 
 use knls::kube_watch;
@@ -46,7 +46,7 @@ enum Dns {
     Internal,
 }
 
-const ABOUT: &'static str = r#"
+const ABOUT: &str = r#"
 Kubernetes Node-Local Services
 
 Watch the Kubernetes API server to provide node-level services:
@@ -58,8 +58,7 @@ Watch the Kubernetes API server to provide node-level services:
 fn default_nodename() -> String {
     gethostname::gethostname()
         .into_string()
-        .map_err(|s| format_err!("invalid hostname: {s:?}"))
-        .unwrap()
+        .expect("hostname should be valid")
 }
 
 type Tasks = tokio::task::JoinSet<(String, eyre::Result<()>)>;
@@ -97,8 +96,8 @@ async fn main() -> eyre::Result<()> {
     );
 
     tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).expect("should listen for SIGTERM");
+        let mut sigint = signal(SignalKind::interrupt()).expect("should listen for SIGINT");
         select! {
             _ = sigterm.recv() => println!("Received SIGTERM"),
             _ = sigint.recv() => println!("Received SIGINT"),

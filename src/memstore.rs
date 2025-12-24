@@ -44,10 +44,7 @@ pub struct Map<F, T: KeyValueFrom<F>> {
 
 impl<F, T: KeyValueFrom<F>> Map<F, T> {
     pub fn new() -> Self {
-        Self {
-            map: BTreeMap::new(),
-            ready: false,
-        }
+        Self::default()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -89,6 +86,15 @@ impl<F, T: KeyValueFrom<F>> Map<F, T> {
                     self.map.remove(&key);
                 }
             }
+        }
+    }
+}
+
+impl<F, T: KeyValueFrom<F>> Default for Map<F, T> {
+    fn default() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            ready: false,
         }
     }
 }

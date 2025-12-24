@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap as Map, btree_map};
+use std::collections::{btree_map, BTreeMap as Map};
 use std::mem;
 
 #[derive(Debug)]
@@ -7,7 +7,7 @@ pub struct Tracker<K: Ord, T: Eq> {
 }
 impl<K: Ord + Clone, T: Eq> Tracker<K, T> {
     pub fn new() -> Self {
-        Self { values: Map::new() }
+        Self::default()
     }
 
     pub fn clear(&mut self) {
@@ -37,10 +37,7 @@ impl<K: Ord + Clone, T: Eq> Tracker<K, T> {
         let Some(v) = self.values.get(key) else {
             return true; // not in the set
         };
-        match v.state {
-            State::Unseen => true,
-            _ => false,
-        }
+        matches!(v.state, State::Unseen)
     }
 
     pub fn deleted(&self) -> impl Iterator<Item = &K> {
@@ -79,6 +76,12 @@ impl<K: Ord + Clone, T: Eq> Tracker<K, T> {
     }
 }
 
+impl<K: Ord + Clone, T: Eq> Default for Tracker<K, T> {
+    fn default() -> Self {
+        Self { values: Map::new() }
+    }
+}
+
 #[derive(Debug)]
 struct Item<T> {
     prev: Option<T>,
@@ -87,11 +90,8 @@ struct Item<T> {
 impl<T> Item<T> {
     fn touch(&mut self) {
         use State::*;
-        match self.state {
-            Unseen => {
-                self.state = Seen;
-            }
-            _ => {}
+        if let Unseen = self.state {
+            self.state = Seen;
         }
     }
 }

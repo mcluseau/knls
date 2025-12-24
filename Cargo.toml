@@ -12,6 +12,9 @@ lto = true
 debug = false
 panic = "abort"
 
+[lints.clippy]
+unwrap_used = "deny"
+
 [dependencies]
 base64 = "0.22.1"
 cidr = "0.3.1"

@@ -18,12 +18,12 @@ pub const ANN_ENDPOINT_FROM: &str = "kwg-endpoint-from/";
 pub const ZONE_LABEL: &str = "topology.kubernetes.io/zone";
 
 fn default_zone() -> String {
-    "default".to_string()
+    "default".into()
 }
 
 pub type Key = [u8; 32];
 pub fn encode_key(key: &Key) -> String {
-    BASE64_STANDARD.encode(&key)
+    BASE64_STANDARD.encode(key)
 }
 pub fn decode_key(s: &[u8]) -> eyre::Result<Key> {
     let mut key: Key = [0; 32];
@@ -34,7 +34,7 @@ pub fn decode_key(s: &[u8]) -> eyre::Result<Key> {
     Ok(key)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Node {
     pub zone: String,
     pub listen_port: Option<u16>,
@@ -47,17 +47,13 @@ impl Node {
     pub fn new() -> Self {
         Self {
             zone: default_zone(),
-            listen_port: None,
-            pubkey: None,
-            endpoint: None,
-            endpoint_from: None,
-            pod_cidrs: Vec::new(),
+            ..Default::default()
         }
     }
 
     pub fn if_addr(&self) -> Option<String> {
         // TODO first address in range
-        self.pod_cidrs.iter().next().map(|c| c.to_string())
+        self.pod_cidrs.first().map(|c| c.to_string())
     }
 
     pub fn get_endpoint_from(
@@ -87,7 +83,7 @@ impl memstore::KeyValueFrom<core::Node> for Node {
         let first_address = n
             .status
             .and_then(|st| st.addresses)
-            .and_then(|addrs| addrs.iter().next().cloned())
+            .and_then(|addrs| addrs.first().cloned())
             .and_then(|addr| addr.address.parse().ok());
 
         let listen_port = anns.get(ANN_LISTEN_PORT).and_then(|p| p.parse().ok());
@@ -108,9 +104,9 @@ impl memstore::KeyValueFrom<core::Node> for Node {
                 }),
             },
             endpoint_from: Some(
-                anns.into_iter()
+                anns.iter()
                     .filter_map(|(k, v)| {
-                        let k = k.strip_prefix(ANN_ENDPOINT_FROM)?.to_string();
+                        let k = k.strip_prefix(ANN_ENDPOINT_FROM)?.into();
                         let v = v.parse().ok()?;
                         Some((k, v))
                     })
@@ -144,9 +140,9 @@ impl std::str::FromStr for Endpoint {
                 port: None,
             });
         };
-        return Ok(Self {
+        Ok(Self {
             address: sa.ip(),
             port: Some(sa.port()),
-        });
+        })
     }
 }

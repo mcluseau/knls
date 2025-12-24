@@ -49,8 +49,7 @@ impl Action {
                 }
             }
             A::Exec { cmd, args } => {
-                let s = (Command::new(cmd).args(args).status().await)
-                    .map_err(|e| Error::ExecFailed(e))?;
+                let s = (Command::new(cmd).args(args).status().await).map_err(Error::ExecFailed)?;
                 if !s.success() {
                     return Err(Error::ExecCommandFailed(s.code().unwrap_or(0)));
                 }
@@ -102,16 +101,16 @@ async fn exec_nft(script: String) -> Result {
     debug!("nft script:\n{script}");
 
     let mut cmd = Command::new("nft");
-    cmd.args(&["-f", "-"]);
+    cmd.args(["-f", "-"]);
     cmd.stdin(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| Error::NftFailed(e))?;
+    let mut child = cmd.spawn().map_err(Error::NftFailed)?;
 
-    let mut nft_in = child.stdin.take().unwrap();
+    let mut nft_in = child.stdin.take().expect("stdin should exist");
 
     tokio::spawn(async move { nft_in.write_all(script.as_bytes()).await });
 
-    let s = child.wait().await.map_err(|e| Error::NftFailed(e))?;
+    let s = child.wait().await.map_err(Error::NftFailed)?;
     if !s.success() {
         return Err(Error::NftCommandFailed(s.code().unwrap_or(0)));
     }

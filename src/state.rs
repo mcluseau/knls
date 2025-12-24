@@ -4,7 +4,7 @@ use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::{kube_watch, memstore};
 
@@ -58,7 +58,7 @@ impl State {
         if local {
             self.local_slices(service_key)
         } else {
-            self.zoned_slices(&service_key)
+            self.zoned_slices(service_key)
         }
     }
 
@@ -142,33 +142,31 @@ impl State {
 pub struct LocalEndpoint {
     pub node_local: bool,
     pub hostname: Option<String>,
-    pub ipv4: Option<IpAddr>,
-    pub ipv6: Option<IpAddr>,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
 }
 impl LocalEndpoint {
     fn from_endpoint(ep: &Endpoint, node_name: &String) -> Self {
         Self {
             node_local: ep.node.as_ref() == Some(node_name),
             hostname: ep.hostname.clone(),
-            ipv4: ep.ipv4.clone(),
-            ipv6: ep.ipv6.clone(),
+            ipv4: ep.ipv4,
+            ipv6: ep.ipv6,
         }
     }
 
-    pub fn ip(&self, ipv4: bool) -> Option<&IpAddr> {
+    pub fn ip(&self, ipv4: bool) -> Option<IpAddr> {
         if ipv4 {
-            self.ipv4.as_ref()
+            self.ipv4.map(IpAddr::V4)
         } else {
-            self.ipv6.as_ref()
+            self.ipv6.map(IpAddr::V6)
         }
     }
 
-    pub fn ips(&self) -> impl Iterator<Item = &IpAddr> {
-        self.ipv4.iter().chain(self.ipv6.iter())
-    }
-
-    pub fn into_ips(self) -> impl Iterator<Item = IpAddr> {
-        self.ipv4.into_iter().chain(self.ipv6.into_iter())
+    pub fn ips(&self) -> impl Iterator<Item = IpAddr> {
+        let ipv4 = self.ipv4.map(IpAddr::V4);
+        let ipv6 = self.ipv6.map(IpAddr::V6);
+        ipv4.into_iter().chain(ipv6)
     }
 }
 
@@ -201,15 +199,15 @@ impl LocalEndpointSlice {
         })
     }
 
-    pub fn ips(&self) -> impl Iterator<Item = &IpAddr> {
-        self.endpoints.iter().map(|ep| ep.ips()).flatten()
+    pub fn ips(&self) -> impl Iterator<Item = IpAddr> {
+        self.endpoints.iter().flat_map(|ep| ep.ips())
     }
 
-    pub fn ipsv4(&self) -> impl Iterator<Item = &IpAddr> {
-        self.endpoints.iter().filter_map(|ep| ep.ipv4.as_ref())
+    pub fn ipsv4(&self) -> impl Iterator<Item = Ipv4Addr> {
+        self.endpoints.iter().filter_map(|ep| ep.ipv4)
     }
-    pub fn ipsv6(&self) -> impl Iterator<Item = &IpAddr> {
-        self.endpoints.iter().filter_map(|ep| ep.ipv6.as_ref())
+    pub fn ipsv6(&self) -> impl Iterator<Item = Ipv6Addr> {
+        self.endpoints.iter().filter_map(|ep| ep.ipv6)
     }
 }
 
@@ -501,8 +499,8 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Endpoint {
-    ipv4: Option<IpAddr>,
-    ipv6: Option<IpAddr>,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
     node: Option<String>,
     for_zones: Option<Vec<String>>,
@@ -519,14 +517,16 @@ impl Endpoint {
     }
 
     pub fn ips(&self) -> impl Iterator<Item = IpAddr> + use<> {
-        [self.ipv4, self.ipv6].into_iter().filter_map(|v| v)
+        let ipv4 = self.ipv4.map(IpAddr::V4);
+        let ipv6 = self.ipv6.map(IpAddr::V6);
+        ipv4.into_iter().chain(ipv6)
     }
 
     fn from_slice_endpoints<I>(endpoints: I) -> impl Iterator<Item = Endpoint>
     where
         I: Iterator<Item = discovery::Endpoint> + 'static,
     {
-        endpoints.map(|ep| Self::from_slice_endpoint(ep))
+        endpoints.map(Self::from_slice_endpoint)
     }
 
     fn from_slice_endpoint(endpoint: discovery::Endpoint) -> Endpoint {
@@ -537,12 +537,14 @@ impl Endpoint {
         let mut ipv4 = None;
         let mut ipv6 = None;
 
-        for ip in (endpoint.addresses.iter()).filter_map(|addr| addr.parse::<IpAddr>().ok()) {
-            if ipv4.is_none() && ip.is_ipv4() {
-                ipv4 = Some(ip);
-            }
-            if ipv6.is_none() && ip.is_ipv6() {
-                ipv6 = Some(ip);
+        for ip in endpoint.addresses {
+            let Ok(ip) = ip.parse() else {
+                continue;
+            };
+            match ip {
+                IpAddr::V4(ip) if ipv4.is_none() => ipv4 = Some(ip),
+                IpAddr::V6(ip) if ipv6.is_none() => ipv6 = Some(ip),
+                _ => continue,
             }
             if ipv4.is_some() && ipv6.is_some() {
                 break;
