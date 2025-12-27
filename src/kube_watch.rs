@@ -1,6 +1,4 @@
 use futures::{StreamExt, TryStreamExt};
-#[cfg(feature = "ingress")]
-use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use kube::{api::Api, runtime::watcher, Client};
 use log::{error, info};
@@ -12,8 +10,6 @@ pub enum Event {
     Service(watcher::Event<core::Service>),
     EndpointSlice(watcher::Event<discovery::EndpointSlice>),
     Node(watcher::Event<core::Node>),
-    #[cfg(feature = "ingress")]
-    Ingress(watcher::Event<networking::Ingress>),
 }
 
 pub struct Config {
@@ -68,14 +64,6 @@ impl Config {
                 Event::Node,
             ));
         }
-
-        #[cfg(feature = "ingress")]
-        tokio::spawn(watch_to_events(
-            self.namespaced_api(),
-            self.watcher_config.clone(),
-            tx.clone(),
-            Event::Ingress,
-        ));
     }
 }
 

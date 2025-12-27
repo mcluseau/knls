@@ -21,8 +21,6 @@ pub struct State {
     pub services: memstore::Map<core::Service, Service>,
     pub ep_slices: memstore::Map<discovery::EndpointSlice, EndpointSlice>,
     pub wg_nodes: memstore::Map<core::Node, wireguard::Node>,
-    #[cfg(feature = "ingress")]
-    ingresses: memstore::Map<networking::Ingress, Ingress>,
 }
 impl State {
     pub fn new(node_name: String) -> Self {
@@ -32,22 +30,11 @@ impl State {
             services: memstore::Map::new(),
             ep_slices: memstore::Map::new(),
             wg_nodes: memstore::Map::new(),
-            #[cfg(feature = "ingress")]
-            ingresses: memstore::Map::new(),
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        let ready =
-            self.my_node.is_ready() && self.services.is_ready() && self.ep_slices.is_ready();
-        #[cfg(not(feature = "ingress"))]
-        {
-            ready
-        }
-        #[cfg(feature = "ingress")]
-        {
-            ready && self.ingresses.is_ready()
-        }
+        self.my_node.is_ready() && self.services.is_ready() && self.ep_slices.is_ready()
     }
 
     pub fn slices<'a>(
@@ -130,10 +117,6 @@ impl State {
             }
             Node(e) => {
                 self.wg_nodes.ingest(e);
-            }
-            #[cfg(feature = "ingress")]
-            Ingress(e) => {
-                self.ingresses.ingest(e);
             }
         }
     }

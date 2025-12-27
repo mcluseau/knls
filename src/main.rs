@@ -161,11 +161,6 @@ async fn main() -> eyre::Result<()> {
         });
     }
 
-    #[cfg(feature = "ingress")]
-    {
-        tasks.spawn(knls::backends::ingress::watch(cfg_rx.clone()));
-    }
-
     tokio::spawn(knls::process_kube_events(
         source,
         watch_config,
