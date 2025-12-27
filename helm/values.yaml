@@ -64,7 +64,7 @@ resources:
       cpu: 10m
   unbound:
     limits:
-      memory: 16Mi
+      memory: 24Mi
     requests:
       memory: 12Mi
       cpu: 10m
