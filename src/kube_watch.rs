@@ -1,15 +1,21 @@
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
+use k8s_openapi::api::{
+    core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
+};
 use kube::{api::Api, runtime::watcher, Client};
 use log::{error, info};
 use tokio::sync::mpsc;
 
+// boxed everything to avoid large enum
 #[derive(Debug)]
 pub enum Event {
-    MyNode(watcher::Event<core::Node>),
-    Service(watcher::Event<core::Service>),
-    EndpointSlice(watcher::Event<discovery::EndpointSlice>),
-    Node(watcher::Event<core::Node>),
+    MyNode(Box<watcher::Event<core::Node>>),
+    Service(Box<watcher::Event<core::Service>>),
+    EndpointSlice(Box<watcher::Event<discovery::EndpointSlice>>),
+    Node(Box<watcher::Event<core::Node>>),
+    NetworkPolicy(Box<watcher::Event<networking::NetworkPolicy>>),
+    Namespace(Box<watcher::Event<core::Namespace>>),
+    Pod(Box<watcher::Event<core::Pod>>),
 }
 
 pub struct Config {
@@ -18,6 +24,7 @@ pub struct Config {
     pub client: Client,
     pub watcher_config: watcher::Config,
     pub with_nodes: bool,
+    pub with_netpols: bool,
 }
 
 impl Config {
@@ -64,6 +71,27 @@ impl Config {
                 Event::Node,
             ));
         }
+
+        if self.with_netpols {
+            tokio::spawn(watch_to_events(
+                self.namespaced_api(),
+                self.watcher_config.clone(),
+                tx.clone(),
+                Event::NetworkPolicy,
+            ));
+            tokio::spawn(watch_to_events(
+                Api::all(self.client.clone()),
+                self.watcher_config.clone(),
+                tx.clone(),
+                Event::Namespace,
+            ));
+            tokio::spawn(watch_to_events(
+                Api::all(self.client.clone()),
+                self.watcher_config.clone(),
+                tx.clone(),
+                Event::Pod,
+            ));
+        }
     }
 }
 
@@ -71,7 +99,7 @@ async fn watch_to_events<K>(
     api: Api<K>,
     watcher_config: watcher::Config,
     tx: mpsc::Sender<Event>,
-    map: fn(watcher::Event<K>) -> Event,
+    map: fn(Box<watcher::Event<K>>) -> Event,
 ) where
     K: kube::api::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
 {
@@ -95,7 +123,7 @@ async fn watch_to_events<K>(
             return;
         };
 
-        if tx.send(map(event)).await.is_err() {
+        if tx.send(map(Box::new(event))).await.is_err() {
             info!("receiver of {resource} stopped");
             return;
         }

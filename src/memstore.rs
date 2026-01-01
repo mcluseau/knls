@@ -1,5 +1,5 @@
 use kube::runtime::watcher::Event;
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{btree_map, BTreeMap};
 use std::ops::RangeBounds;
 
 pub struct Value<F, T> {
@@ -42,20 +42,32 @@ pub struct Map<F, T: KeyValueFrom<F>> {
     ready: bool,
 }
 
-impl<F, T: KeyValueFrom<F>> Map<F, T> {
+impl<F, T: KeyValueFrom<F> + Clone> Map<F, T>
+where
+    T: Clone,
+    T::Key: Clone,
+{
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn map(&self) -> BTreeMap<T::Key, T> {
+        self.map.clone()
     }
 
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 
+    pub fn ready_map(&self) -> Option<BTreeMap<T::Key, T>> {
+        self.ready.then(|| self.map())
+    }
+
     pub fn get(&self, key: &T::Key) -> Option<&T> {
         self.map.get(key)
     }
 
-    pub fn iter(&self) -> btree_map::Iter<'_, T::Key, T> {
+    pub fn iter(&self) -> impl Iterator<Item = (&T::Key, &T)> {
         self.map.iter()
     }
 

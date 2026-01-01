@@ -27,6 +27,9 @@ pub struct Config {
 
     /// Add hardware labels to the current node
     pub hw_labels: Option<knls::hw_labels::HwLabels>,
+
+    /// DNS service, authoritative on the cluster domain.
+    pub network_policy: Option<NetworkPolicy>,
 }
 fn default_event_buffer() -> usize {
     100
@@ -42,7 +45,7 @@ impl Config {
     }
 }
 
-use knls::{connectivity, dns, proxy};
+use knls::{connectivity, dns, netpol, proxy};
 
 knls::service!("proxy" Proxy {
     "nftables" Nftables: proxy::nftables::Config => proxy::nftables::watch,
@@ -54,4 +57,8 @@ knls::service!("connectivity" Connectivity {
 
 knls::service!("dns" DNS {
     "internal" Internal: dns::internal::Config => dns::internal::watch,
+});
+
+knls::service!("network policy" NetworkPolicy {
+    "nftables" Nftables: netpol::nftables::Config => netpol::nftables::watch,
 });

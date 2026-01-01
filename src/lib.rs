@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod netpol;
 pub mod change;
 pub mod connectivity;
 pub mod dns;

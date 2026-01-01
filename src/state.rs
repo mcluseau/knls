@@ -1,12 +1,15 @@
 use cidr::IpCidr;
+use eyre::format_err;
 use itertools::Itertools;
-use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
+use k8s_openapi::api::{
+    core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
+};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::{kube_watch, memstore};
+use crate::{kube_watch, memstore, netpol};
 
 pub mod keys;
 pub mod proxy;
@@ -21,6 +24,9 @@ pub struct State {
     pub services: memstore::Map<core::Service, Service>,
     pub ep_slices: memstore::Map<discovery::EndpointSlice, EndpointSlice>,
     pub wg_nodes: memstore::Map<core::Node, wireguard::Node>,
+    pub netpols: memstore::Map<networking::NetworkPolicy, netpol::Policy>,
+    pub namespaces: memstore::Map<core::Namespace, Namespace>,
+    pub pods: memstore::Map<core::Pod, Pod>,
 }
 impl State {
     pub fn new(node_name: String) -> Self {
@@ -30,6 +36,9 @@ impl State {
             services: memstore::Map::new(),
             ep_slices: memstore::Map::new(),
             wg_nodes: memstore::Map::new(),
+            netpols: memstore::Map::new(),
+            namespaces: memstore::Map::new(),
+            pods: memstore::Map::new(),
         }
     }
 
@@ -106,18 +115,13 @@ impl State {
         trace!("got k8s event: {event:?}");
         use kube_watch::Event::*;
         match event {
-            MyNode(e) => {
-                self.my_node.ingest(e);
-            }
-            Service(e) => {
-                self.services.ingest(e);
-            }
-            EndpointSlice(e) => {
-                self.ep_slices.ingest(e);
-            }
-            Node(e) => {
-                self.wg_nodes.ingest(e);
-            }
+            MyNode(e) => self.my_node.ingest(*e),
+            Service(e) => self.services.ingest(*e),
+            EndpointSlice(e) => self.ep_slices.ingest(*e),
+            Node(e) => self.wg_nodes.ingest(*e),
+            NetworkPolicy(e) => self.netpols.ingest(*e),
+            Namespace(e) => self.namespaces.ingest(*e),
+            Pod(e) => self.pods.ingest(*e),
         }
     }
 }
@@ -236,7 +240,7 @@ impl Node {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub enum ServiceTarget {
     None,
     Headless,
@@ -250,7 +254,7 @@ pub enum SessionAffinity {
     ClientIP { timeout: i32 },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Service {
     pub is_load_balancer: bool,
     pub target: ServiceTarget,
@@ -367,7 +371,7 @@ fn parse_ips(ips: &Option<Vec<String>>) -> Set<IpAddr> {
         .collect()
 }
 
-#[derive(Default, PartialEq, Eq, Serialize)]
+#[derive(Default, PartialEq, Eq, Serialize, Clone)]
 pub enum TrafficPolicy {
     #[default]
     Cluster,
@@ -398,6 +402,18 @@ pub enum Protocol {
     SCTP,
 }
 
+impl TryFrom<&Option<String>> for Protocol {
+    type Error = eyre::Error;
+    fn try_from(v: &Option<String>) -> Result<Protocol, eyre::Error> {
+        match v.as_deref() {
+            None | Some("TCP") => Ok(Protocol::TCP),
+            Some("UDP") => Ok(Protocol::UDP),
+            Some("SCTP") => Ok(Protocol::SCTP),
+            Some(v) => Err(format_err!("invalid protocol: {v}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum ProtoPort {
     TCP(u16),
@@ -416,6 +432,7 @@ impl ProtoPort {
         match protocol.unwrap_or("TCP") {
             "TCP" => Some(ProtoPort::TCP(port as u16)),
             "UDP" => Some(ProtoPort::UDP(port as u16)),
+            "SCTP" => Some(ProtoPort::SCTP(port as u16)),
             _ => None,
         }
     }
@@ -438,7 +455,7 @@ impl ProtoPort {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EndpointSlice {
     pub target_ports: Map<String, u16>,
     pub endpoints: Set<Endpoint>,
@@ -480,7 +497,7 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]
 pub struct Endpoint {
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
@@ -541,5 +558,65 @@ impl Endpoint {
             node: endpoint.node_name.clone(),
             for_zones: for_zones.clone(),
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Namespace {
+    pub labels: Map<String, String>,
+}
+impl memstore::KeyValueFrom<core::Namespace> for Namespace {
+    type Key = String;
+
+    fn key_from(ns: &core::Namespace) -> Option<Self::Key> {
+        ns.metadata.name.clone()
+    }
+
+    fn value_from(ns: core::Namespace) -> Option<Self> {
+        Some(Self {
+            labels: ns.metadata.labels.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Pod {
+    pub labels: Map<String, String>,
+    pub node: String,
+    pub ipsv4: Vec<Ipv4Addr>,
+    pub ipsv6: Vec<Ipv6Addr>,
+    pub host_network: bool,
+}
+impl memstore::KeyValueFrom<core::Pod> for Pod {
+    type Key = keys::Object;
+
+    fn key_from(pod: &core::Pod) -> Option<Self::Key> {
+        keys::Object::try_from(&pod.metadata).ok()
+    }
+
+    fn value_from(pod: core::Pod) -> Option<Self> {
+        let spec = pod.spec?;
+        let ips = pod.status?.pod_ips?;
+
+        let mut ipsv4 = Vec::with_capacity(ips.len());
+        let mut ipsv6 = Vec::with_capacity(ips.len());
+
+        for ip in (ips.iter()).filter_map(|ip| ip.ip.parse::<IpAddr>().ok()) {
+            match ip {
+                IpAddr::V4(ip) => ipsv4.push(ip),
+                IpAddr::V6(ip) => ipsv6.push(ip),
+            }
+        }
+
+        ipsv4.shrink_to_fit();
+        ipsv6.shrink_to_fit();
+
+        Some(Self {
+            labels: pod.metadata.labels.unwrap_or_default(),
+            node: spec.node_name?,
+            ipsv4,
+            ipsv6,
+            host_network: spec.host_network.unwrap_or(false),
+        })
     }
 }

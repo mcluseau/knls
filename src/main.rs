@@ -134,6 +134,7 @@ async fn main() -> eyre::Result<()> {
         namespace: ctx.namespace.clone(),
         node_name: ctx.node_name.clone(),
         with_nodes: config.connectivity.is_some(),
+        with_netpols: config.network_policy.is_some(),
     };
 
     let source = knls::watcher::Source::new(ctx.node_name.clone());
@@ -151,6 +152,7 @@ async fn main() -> eyre::Result<()> {
     services.spawn("proxy", config.proxy);
     services.spawn("connectivity", config.connectivity);
     services.spawn("dns", config.dns);
+    services.spawn("network policy", config.network_policy);
 
     if let Some(hw_labels) = config.hw_labels {
         let ctx = ctx.clone();

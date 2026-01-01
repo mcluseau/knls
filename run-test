@@ -1,13 +1,13 @@
 set -ex
 
 opts=
-opts="$opts --log=info,knls::backends::nftables=debug"
-opts="$opts --proxy=nftables" # --disable-nodeports"
-opts="$opts --dns=internal"
+opts="$opts --log=info,knls::netpol::nftables=debug"
+opts="$opts --config=/src/configs/netpol.yaml"
 #opts="$opts --connectivity=wireguard --wireguard-ifname=wgknls"
 
 exec docker run --rm --name knls-test -t --cap-add net_admin \
     -v $KUBECONFIG:/root/.kube/config:ro \
-    -e NODE_NAME \
+    -v $PWD:/src:ro \
     -v $PWD/tmp/var-lib-knls:/var/lib/knls \
+    -e NODE_NAME \
     knls:test $opts

@@ -5,6 +5,13 @@ pub struct Object {
     pub namespace: String,
     pub name: String,
 }
+
+impl Object {
+    pub fn as_str(&self) -> (&str, &str) {
+        (self.namespace.as_str(), self.name.as_str())
+    }
+}
+
 impl TryFrom<&meta::ObjectMeta> for Object {
     type Error = &'static str;
     fn try_from(metadata: &meta::ObjectMeta) -> Result<Self, Self::Error> {
@@ -14,6 +21,7 @@ impl TryFrom<&meta::ObjectMeta> for Object {
         })
     }
 }
+
 impl std::fmt::Display for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "{}/{}", self.namespace, self.name)
