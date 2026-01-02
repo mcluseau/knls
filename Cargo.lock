@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "knls"
-version = "0.2.2"
+version = "0.2.3-alpha.1"
 dependencies = [
  "base64",
  "cidr",
