@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use serde_json::json;
 
 use memstore::KeyValueFrom;

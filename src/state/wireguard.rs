@@ -1,4 +1,4 @@
-use base64::prelude::{BASE64_STANDARD, Engine as _};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use defguard_wireguard_rs::net::IpAddrMask;
 use eyre::format_err;
 use k8s_openapi::api::core::v1 as core;
@@ -75,15 +75,15 @@ impl memstore::KeyValueFrom<core::Node> for Node {
         n.metadata.name.clone()
     }
 
-    fn value_from(n: core::Node) -> Option<Self> {
+    fn value_from(n: &core::Node) -> Option<Self> {
         let anns = n.metadata.annotations.as_ref()?;
+        let spec = n.spec.as_ref()?;
 
         let topo_zone = n.get_zone().cloned().unwrap_or_else(default_zone);
 
-        let first_address = n
-            .status
-            .and_then(|st| st.addresses)
-            .and_then(|addrs| addrs.first().cloned())
+        let first_address = (n.status.as_ref())
+            .and_then(|st| st.addresses.as_ref())
+            .and_then(|addrs| addrs.first())
             .and_then(|addr| addr.address.parse().ok());
 
         let listen_port = anns.get(ANN_LISTEN_PORT).and_then(|p| p.parse().ok());
@@ -112,11 +112,10 @@ impl memstore::KeyValueFrom<core::Node> for Node {
                     })
                     .collect(),
             ),
-            pod_cidrs: n
-                .spec
-                .and_then(|spec| spec.pod_cidrs)
-                .map(|cidrs| cidrs.iter().filter_map(|s| s.parse().ok()).collect())
-                .unwrap_or_default(),
+            pod_cidrs: (spec.pod_cidrs.iter())
+                .flatten()
+                .filter_map(|cidr| cidr.parse().ok())
+                .collect(),
         })
     }
 }

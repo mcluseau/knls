@@ -4,18 +4,20 @@ use k8s_openapi::api::{
 };
 use kube::{api::Api, runtime::watcher, Client};
 use log::{error, info};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-// boxed everything to avoid large enum
-#[derive(Debug)]
+pub type EventReceiver = mpsc::Receiver<Event>;
+
+#[derive(Debug, Clone)]
 pub enum Event {
-    MyNode(Box<watcher::Event<core::Node>>),
-    Service(Box<watcher::Event<core::Service>>),
-    EndpointSlice(Box<watcher::Event<discovery::EndpointSlice>>),
-    Node(Box<watcher::Event<core::Node>>),
-    NetworkPolicy(Box<watcher::Event<networking::NetworkPolicy>>),
-    Namespace(Box<watcher::Event<core::Namespace>>),
-    Pod(Box<watcher::Event<core::Pod>>),
+    MyNode(Arc<watcher::Event<core::Node>>),
+    Service(Arc<watcher::Event<core::Service>>),
+    EndpointSlice(Arc<watcher::Event<discovery::EndpointSlice>>),
+    Node(Arc<watcher::Event<core::Node>>),
+    NetworkPolicy(Arc<watcher::Event<networking::NetworkPolicy>>),
+    Namespace(Arc<watcher::Event<core::Namespace>>),
+    Pod(Arc<watcher::Event<core::Pod>>),
 }
 
 pub struct Config {
@@ -99,7 +101,7 @@ async fn watch_to_events<K>(
     api: Api<K>,
     watcher_config: watcher::Config,
     tx: mpsc::Sender<Event>,
-    map: fn(Box<watcher::Event<K>>) -> Event,
+    map: fn(Arc<watcher::Event<K>>) -> Event,
 ) where
     K: kube::api::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
 {
@@ -123,7 +125,7 @@ async fn watch_to_events<K>(
             return;
         };
 
-        if tx.send(map(Box::new(event))).await.is_err() {
+        if tx.send(map(Arc::new(event))).await.is_err() {
             info!("receiver of {resource} stopped");
             return;
         }

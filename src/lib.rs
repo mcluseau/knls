@@ -1,18 +1,17 @@
 pub mod actions;
-pub mod netpol;
 pub mod change;
 pub mod connectivity;
 pub mod dns;
 pub mod hw_labels;
 pub mod kube_watch;
 pub mod memstore;
+pub mod netpol;
 pub mod proxy;
 pub mod state;
-pub mod watcher;
 
 use kube::api::PatchParams;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::mpsc;
 
 pub struct Context {
     pub node_name: String,
@@ -30,49 +29,22 @@ pub trait Service {
     fn watch(
         self,
         ctx: Arc<Context>,
-        watcher: watcher::Watcher,
+        events: kube_watch::EventReceiver,
     ) -> impl Future<Output = eyre::Result<()>> + Send;
 }
 
 pub async fn process_kube_events(
-    mut source: watcher::Source,
     watch_config: kube_watch::Config,
-    event_buffer_size: usize,
+    targets: Vec<mpsc::Sender<kube_watch::Event>>,
 ) {
-    let (tx, mut rx) = mpsc::channel(event_buffer_size);
+    let (tx, mut rx) = mpsc::channel(1);
 
     watch_config.watch_to(tx);
 
     while let Some(event) = rx.recv().await {
-        let mut state = source.write().await;
-
-        // consume this new event
-        state.ingest(event);
-
-        // also consume the current event queue.
-        // Don't process more than the requested buffer size as an heuristic on how many events we
-        // want to consume before forcing a state update.
-        for _ in 0..event_buffer_size {
-            match rx.try_recv() {
-                Ok(event) => {
-                    state.ingest(event);
-                }
-                Err(e) => {
-                    use TryRecvError::*;
-                    match e {
-                        Empty => {
-                            break;
-                        }
-                        Disconnected => {
-                            return;
-                        }
-                    };
-                }
-            }
+        for tx in &targets {
+            let _ = tx.send(event.clone()).await;
         }
-
-        drop(state);
-        source.notify();
     }
 }
 
@@ -82,7 +54,7 @@ pub fn patch_params() -> PatchParams {
 
 /// Helper to define standard services. A standard service is defined as:
 /// - a config and
-/// - a watch fn(ctx: knls::Context, cfg: the given config, watcher: knls::watcher::Watcher) -> eyre::Result<()>
+/// - a watch fn(ctx: knls::Context, cfg: $cfg, watcher: knls::watcher::Watcher) -> eyre::Result<()>
 #[macro_export]
 macro_rules! service {
     ($name:literal $type:ident { $( $flavor:literal $var:ident: $cfg:ty => $impl:expr , )+ }) => {
@@ -108,12 +80,12 @@ macro_rules! service {
 
             fn watch(
                 self,
-                ctx: Arc<knls::Context>,
-                watcher: knls::watcher::Watcher,
+                ctx: Arc<$crate::Context>,
+                events: $crate::kube_watch::EventReceiver,
             ) -> impl Future<Output = Result<()>> + Send {
                 match self {
                     $(
-                    Self::$var(cfg) => $impl(ctx, cfg, watcher),
+                    Self::$var(cfg) => $impl(ctx, cfg, events),
                     )+
                 }
             }

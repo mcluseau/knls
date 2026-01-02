@@ -1,15 +1,12 @@
 use cidr::IpCidr;
 use eyre::format_err;
 use itertools::Itertools;
-use k8s_openapi::api::{
-    core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
-};
-use log::trace;
+use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::{kube_watch, memstore, netpol};
+use crate::{kube_watch, memstore};
 
 pub mod keys;
 pub mod proxy;
@@ -18,32 +15,29 @@ pub mod wireguard;
 #[cfg(test)]
 mod tests;
 
+crate::multimap!(
+    pub StateMaps {
+        services: Service(core::Service) => Service,
+        ep_slices: EndpointSlice(discovery::EndpointSlice) => EndpointSlice,
+    }
+);
+
 pub struct State {
     pub node_name: String,
     pub my_node: memstore::Value<core::Node, Node>,
-    pub services: memstore::Map<core::Service, Service>,
-    pub ep_slices: memstore::Map<discovery::EndpointSlice, EndpointSlice>,
-    pub wg_nodes: memstore::Map<core::Node, wireguard::Node>,
-    pub netpols: memstore::Map<networking::NetworkPolicy, netpol::Policy>,
-    pub namespaces: memstore::Map<core::Namespace, Namespace>,
-    pub pods: memstore::Map<core::Pod, Pod>,
+    pub maps: StateMaps,
 }
 impl State {
     pub fn new(node_name: String) -> Self {
         Self {
             node_name,
             my_node: memstore::Value::new(Node::from_kube),
-            services: memstore::Map::new(),
-            ep_slices: memstore::Map::new(),
-            wg_nodes: memstore::Map::new(),
-            netpols: memstore::Map::new(),
-            namespaces: memstore::Map::new(),
-            pods: memstore::Map::new(),
+            maps: StateMaps::new(),
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.my_node.is_ready() && self.services.is_ready() && self.ep_slices.is_ready()
+        self.my_node.is_ready() && self.maps.is_ready()
     }
 
     pub fn slices<'a>(
@@ -105,24 +99,35 @@ impl State {
 
         use std::ops::Bound;
 
-        self.ep_slices
+        (self.maps.ep_slices)
             .range((Bound::Included(key_min), Bound::Unbounded))
             .take_while(|(k, _)| k.is_service(service_key))
             .map(|(_, v)| v)
     }
 
-    pub fn ingest(&mut self, event: kube_watch::Event) {
-        trace!("got k8s event: {event:?}");
+    pub fn ingest(&mut self, event: kube_watch::Event) -> bool {
         use kube_watch::Event::*;
         match event {
-            MyNode(e) => self.my_node.ingest(*e),
-            Service(e) => self.services.ingest(*e),
-            EndpointSlice(e) => self.ep_slices.ingest(*e),
-            Node(e) => self.wg_nodes.ingest(*e),
-            NetworkPolicy(e) => self.netpols.ingest(*e),
-            Namespace(e) => self.namespaces.ingest(*e),
-            Pod(e) => self.pods.ingest(*e),
+            MyNode(e) => {
+                self.my_node.ingest(&e);
+                true
+            }
+            _ => self.maps.ingest(event),
         }
+    }
+
+    /// See crate::memstore::multimap.ingest_events
+    pub async fn ingest_events(
+        &mut self,
+        rx: &mut crate::kube_watch::EventReceiver,
+    ) -> Option<bool> {
+        let mut updated = self.ingest(rx.recv().await?);
+
+        while let Ok(e) = rx.try_recv() {
+            updated |= self.ingest(e);
+        }
+
+        Some(updated)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -222,7 +227,7 @@ pub struct Node {
     pub labels: Map<String, String>,
 }
 impl Node {
-    fn from_kube(n: core::Node) -> Self {
+    fn from_kube(n: &core::Node) -> Self {
         Self {
             ips: (n.status.as_ref())
                 .and_then(|s| s.addresses.as_ref())
@@ -234,8 +239,10 @@ impl Node {
                 })
                 .unwrap_or_default(),
             zone: n.get_zone().cloned(),
-            pod_cidrs: n.spec.and_then(|s| s.pod_cidrs).unwrap_or_default(),
-            labels: n.metadata.labels.unwrap_or_default().clone(),
+            pod_cidrs: (n.spec.as_ref())
+                .and_then(|s| s.pod_cidrs.clone())
+                .unwrap_or_default(),
+            labels: n.metadata.labels.clone().unwrap_or_default(),
         }
     }
 }
@@ -274,7 +281,7 @@ impl memstore::KeyValueFrom<core::Service> for Service {
         keys::Object::try_from(&svc.metadata).ok()
     }
 
-    fn value_from(svc: core::Service) -> Option<Self> {
+    fn value_from(svc: &core::Service) -> Option<Self> {
         let Some(ref spec) = svc.spec else {
             return Some(Self {
                 is_load_balancer: false,
@@ -476,23 +483,16 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
         })
     }
 
-    fn value_from(eps: discovery::EndpointSlice) -> Option<Self> {
+    fn value_from(eps: &discovery::EndpointSlice) -> Option<Self> {
         Some(Self {
-            target_ports: eps
-                .ports
-                .as_ref()
-                .map(|ports| {
-                    ports
-                        .iter()
-                        .filter_map(|p| {
-                            let name = p.name.clone().unwrap_or_default();
-                            Some((name, p.port? as u16))
-                        })
-                        .collect()
+            target_ports: (eps.ports.iter().flatten())
+                .filter_map(|p| {
+                    let name = p.name.clone().unwrap_or_default();
+                    Some((name, p.port? as u16))
                 })
-                .unwrap_or_default(),
+                .collect(),
 
-            endpoints: Endpoint::from_slice_endpoints(eps.endpoints.into_iter()).collect(),
+            endpoints: Endpoint::from_slice_endpoints(&eps.endpoints).collect(),
         })
     }
 }
@@ -522,14 +522,11 @@ impl Endpoint {
         ipv4.into_iter().chain(ipv6)
     }
 
-    fn from_slice_endpoints<I>(endpoints: I) -> impl Iterator<Item = Endpoint>
-    where
-        I: Iterator<Item = discovery::Endpoint> + 'static,
-    {
-        endpoints.map(Self::from_slice_endpoint)
+    fn from_slice_endpoints(endpoints: &[discovery::Endpoint]) -> impl Iterator<Item = Endpoint> {
+        endpoints.iter().map(Self::from_slice_endpoint)
     }
 
-    fn from_slice_endpoint(endpoint: discovery::Endpoint) -> Endpoint {
+    fn from_slice_endpoint(endpoint: &discovery::Endpoint) -> Endpoint {
         let for_zones = (endpoint.hints.as_ref())
             .and_then(|hints| hints.for_zones.as_ref())
             .map(|zones| zones.iter().map(|z| z.name.clone()).collect());
@@ -537,7 +534,7 @@ impl Endpoint {
         let mut ipv4 = None;
         let mut ipv6 = None;
 
-        for ip in endpoint.addresses {
+        for ip in &endpoint.addresses {
             let Ok(ip) = ip.parse() else {
                 continue;
             };
@@ -554,7 +551,7 @@ impl Endpoint {
         Self {
             ipv4,
             ipv6,
-            hostname: endpoint.hostname,
+            hostname: endpoint.hostname.clone(),
             node: endpoint.node_name.clone(),
             for_zones: for_zones.clone(),
         }
@@ -572,9 +569,9 @@ impl memstore::KeyValueFrom<core::Namespace> for Namespace {
         ns.metadata.name.clone()
     }
 
-    fn value_from(ns: core::Namespace) -> Option<Self> {
+    fn value_from(ns: &core::Namespace) -> Option<Self> {
         Some(Self {
-            labels: ns.metadata.labels.unwrap_or_default(),
+            labels: ns.metadata.labels.clone().unwrap_or_default(),
         })
     }
 }
@@ -594,10 +591,11 @@ impl memstore::KeyValueFrom<core::Pod> for Pod {
         keys::Object::try_from(&pod.metadata).ok()
     }
 
-    fn value_from(pod: core::Pod) -> Option<Self> {
-        let spec = pod.spec?;
-        let ips = pod.status?.pod_ips?;
+    fn value_from(pod: &core::Pod) -> Option<Self> {
+        let spec = pod.spec.as_ref()?;
+        let node = spec.node_name.clone()?;
 
+        let ips = pod.status.as_ref()?.pod_ips.as_ref()?;
         let mut ipsv4 = Vec::with_capacity(ips.len());
         let mut ipsv6 = Vec::with_capacity(ips.len());
 
@@ -612,8 +610,8 @@ impl memstore::KeyValueFrom<core::Pod> for Pod {
         ipsv6.shrink_to_fit();
 
         Some(Self {
-            labels: pod.metadata.labels.unwrap_or_default(),
-            node: spec.node_name?,
+            labels: pod.metadata.labels.clone().unwrap_or_default(),
+            node,
             ipsv4,
             ipsv6,
             host_network: spec.host_network.unwrap_or(false),

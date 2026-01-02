@@ -8,14 +8,20 @@ use netlink_packet_route::{
     route::{RouteAddress, RouteHeader},
 };
 use serde_json::json;
-use std::collections::BTreeMap as Map;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::fs;
+use k8s_openapi::api::{core::v1 as core};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::state::wireguard::{Key, decode_key, encode_key};
-use crate::{actions, change, patch_params};
+use crate::state::wireguard::{Key, decode_key, encode_key, Node};
+use crate::{actions, change, patch_params, kube_watch::EventReceiver};
+
+crate::multimap!(
+    State{
+        nodes: Node(core::Node) => Node,
+    }
+);
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -47,24 +53,10 @@ mod defaults {
     }
 }
 
-fn nodes_from_state(
-    state: &crate::state::State,
-) -> Option<Map<String, crate::state::wireguard::Node>> {
-    if !state.wg_nodes.is_ready() {
-        return None;
-    }
-    let nodes = state
-        .wg_nodes
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    Some(nodes)
-}
-
 pub async fn watch(
     ctx: Arc<crate::Context>,
     cfg: Config,
-    mut watcher: crate::watcher::Watcher,
+    mut events: EventReceiver
 ) -> Result<()> {
     let node_name = ctx.node_name.as_str();
     let kube = ctx.kube.clone();
@@ -148,11 +140,15 @@ pub async fn watch(
 
     let mut prev_cni_config = None;
 
-    loop {
-        let Some(nodes) = watcher.next(nodes_from_state).await? else {
-            continue;
-        };
+    let mut state = State::new();
 
+    loop {
+        let Some(updated) = state.ingest_events(&mut events).await else { return Ok(())};
+        if !updated || !state.is_ready() {
+            continue;
+        }
+
+        let nodes = state.nodes.map();
         let Some(my_node) = nodes.get(node_name) else {
             continue;
         };

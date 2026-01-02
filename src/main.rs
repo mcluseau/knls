@@ -7,9 +7,10 @@ use std::sync::Arc;
 use tokio::{
     select,
     signal::unix::{signal, SignalKind},
+    sync::mpsc,
 };
 
-use knls::kube_watch;
+use knls::kube_watch::{self, Event};
 
 pub mod config;
 
@@ -137,16 +138,13 @@ async fn main() -> eyre::Result<()> {
         with_netpols: config.network_policy.is_some(),
     };
 
-    let source = knls::watcher::Source::new(ctx.node_name.clone());
-
     knls::actions::run_event(module_path!(), "on_start", &config.on_start).await?;
 
-    let mut tasks = Tasks::new();
-
     let mut services = Services {
-        tasks: &mut tasks,
+        tasks: Tasks::new(),
         ctx: &ctx,
-        source: &source,
+        event_buffer: config.event_buffer,
+        targets: Vec::new(),
     };
 
     services.spawn("proxy", config.proxy);
@@ -157,17 +155,16 @@ async fn main() -> eyre::Result<()> {
     if let Some(hw_labels) = config.hw_labels {
         let ctx = ctx.clone();
 
-        tasks.spawn(async move {
+        services.tasks.spawn(async move {
             let result = knls::hw_labels::watch(ctx.clone(), hw_labels).await;
             ("hw_labels".into(), result)
         });
     }
 
-    tokio::spawn(knls::process_kube_events(
-        source,
-        watch_config,
-        config.event_buffer,
-    ));
+    let mut tasks = services.tasks;
+    let targets = services.targets;
+
+    tokio::spawn(knls::process_kube_events(watch_config, targets));
 
     while let Some(res) = tasks.join_next().await {
         match res {
@@ -185,14 +182,15 @@ async fn main() -> eyre::Result<()> {
         exit(1);
     }
 
-    error!("all tasks finished");
-    exit(1); // this is actually unexpected
+    info!("all tasks finished");
+    Ok(())
 }
 
 struct Services<'t> {
-    tasks: &'t mut Tasks,
     ctx: &'t Arc<knls::Context>,
-    source: &'t knls::watcher::Source,
+    tasks: Tasks,
+    event_buffer: usize,
+    targets: Vec<mpsc::Sender<Event>>,
 }
 
 impl<'t> Services<'t> {
@@ -200,27 +198,20 @@ impl<'t> Services<'t> {
     where
         S: knls::Service + Send + 'static,
     {
-        match service {
-            None => {
-                info!("{service_name}: no configuration, service not enabled.");
-            }
-            Some(service) => {
-                let flavor = service.impl_name();
-                info!("{service_name}: starting {flavor} implementation");
+        let Some(service) = service else {
+            info!("{service_name}: no configuration, service not enabled.");
+            return;
+        };
 
-                self.spawn_task(
-                    format!("{service_name}:{flavor}"),
-                    service.watch(self.ctx.clone(), self.source.new_watcher()),
-                );
-            }
-        }
-    }
+        let flavor = service.impl_name();
+        info!("{service_name}: starting {flavor} implementation");
 
-    fn spawn_task<F>(&mut self, task_name: String, task: F)
-    where
-        F: Future<Output = eyre::Result<()>>,
-        F: Send + 'static,
-    {
+        let (tx, rx) = mpsc::channel(self.event_buffer);
+        self.targets.push(tx);
+
+        let task_name = format!("{service_name}:{flavor}");
+        let task = service.watch(self.ctx.clone(), rx);
+
         self.tasks.spawn(async move { (task_name, task.await) });
     }
 }

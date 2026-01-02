@@ -1,12 +1,13 @@
 use super::{EgressRule, IngressRule, Policy};
 use crate::{
+    kube_watch::EventReceiver,
     state::{keys, Namespace, Pod},
-    watcher::Watcher,
 };
 use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
 use eyre::Result;
 use k8s_openapi::{
-    api::networking::v1::{NetworkPolicyPeer, NetworkPolicyPort},
+    api::core::v1 as core,
+    api::networking::v1::{self as networking, NetworkPolicyPeer, NetworkPolicyPort},
     apimachinery::pkg::apis::meta::v1::LabelSelector,
     apimachinery::pkg::util::intstr::IntOrString,
 };
@@ -27,24 +28,28 @@ fn default_table() -> String {
     "kube-netpol".into()
 }
 
-pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) -> Result<()> {
+crate::multimap!(
+    State {
+        netpols: NetworkPolicy(networking::NetworkPolicy) => Policy,
+        pods: Pod(core::Pod) => Pod,
+        nses: Namespace(core::Namespace) => Namespace,
+    }
+);
+
+pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
     let mut prev = 0;
 
     let node_name = ctx.node_name.as_str();
 
+    let mut state = State::new();
+
     loop {
-        let Some((netpols, nses, pods)) = watcher
-            .next(|state| {
-                Some((
-                    state.netpols.ready_map()?,
-                    state.namespaces.ready_map()?,
-                    state.pods.ready_map()?,
-                ))
-            })
-            .await?
-        else {
-            continue;
+        let Some(updated) = state.ingest_events(&mut events).await else {
+            return Ok(());
         };
+        if !updated || !state.is_ready() {
+            continue;
+        }
 
         let mut rules = String::new();
         macro_rules! w {
@@ -59,7 +64,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
         let mut pod_ingress6 = String::new();
         let mut pod_egress6 = String::new();
 
-        let helper = NetpolHelper { nses, pods: &pods };
+        let helper = NetpolHelper { state: &state };
 
         w!("table inet {} {{}}", cfg.table);
         w!("delete table inet {};", cfg.table);
@@ -67,7 +72,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
 
         let mut used_netpols = Set::new();
 
-        for (pod_key, pod) in &pods {
+        for (pod_key, pod) in state.pods.iter() {
             if pod.host_network {
                 continue; // no filtering on host-network pods
             }
@@ -77,7 +82,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
 
             let (ns, name) = pod_key.as_str();
 
-            let netpols: Vec<_> = (netpols.iter())
+            let netpols: Vec<_> = (state.netpols.iter())
                 .filter(|(_, np)| np.matches_pod(pod_key, pod))
                 .collect();
 
@@ -136,7 +141,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
             }
         }
 
-        for (np_key, np) in &netpols {
+        for (np_key, np) in state.netpols.iter() {
             let (ns, name) = np_key.as_str();
             if !used_netpols.contains(&(ns, name)) {
                 continue;
@@ -215,7 +220,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
             .spawn()?;
 
         let mut rules_rd = std::io::Cursor::new(rules.as_bytes());
-        let stdin = nft.stdin.as_mut().take().expect("stdin must exist");
+        let stdin = nft.stdin.as_mut().expect("stdin must exist");
         tokio::io::copy(&mut rules_rd, stdin).await?;
 
         let status = nft.wait().await?;
@@ -232,8 +237,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut watcher: Watcher) 
 }
 
 struct NetpolHelper<'t> {
-    pods: &'t Map<keys::Object, Pod>,
-    nses: Map<String, Namespace>,
+    state: &'t State,
 }
 
 impl<'t> NetpolHelper<'t> {
@@ -268,7 +272,7 @@ impl<'t> NetpolHelper<'t> {
             return rule;
         }
 
-        rule.push_str(&format!("meta l4proto . th dport {{"));
+        rule.push_str("meta l4proto . th dport {");
         for port in ports {
             let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
             let port_range = match (port.port.as_ref(), port.end_port) {
@@ -304,9 +308,7 @@ impl<'t> NetpolHelper<'t> {
                 else {
                     continue;
                 };
-                let except = (ip_block.except.as_ref())
-                    .map(|b| b.as_slice())
-                    .unwrap_or(&[]);
+                let except = ip_block.except.as_deref().unwrap_or(&[]);
                 match cidr {
                     IpCidr::V4(cidr) => {
                         if let Some(ib) = IpBlock::new(cidr, except) {
@@ -323,23 +325,19 @@ impl<'t> NetpolHelper<'t> {
             }
 
             let ns_filter: Option<Vec<_>> = peer.namespace_selector.as_ref().map(|ns_sel| {
-                (self.nses.iter())
+                (self.state.nses.iter())
                     .filter(|(_, ns)| ns_sel.matches_labels(&ns.labels))
                     .map(|(ns, _)| ns)
                     .collect()
             });
 
-            for (key, pod) in self.pods {
-                if let Some(ref ns_filter) = ns_filter {
-                    if ns_filter.iter().all(|v| *v != &key.namespace) {
-                        continue;
-                    }
+            for (key, pod) in self.state.pods.iter() {
+                if let Some(ref ns_filter) = ns_filter && ns_filter.iter().all(|v| *v != &key.namespace) {
+                    continue;
                 }
 
-                if let Some(ref filter) = peer.pod_selector {
-                    if !filter.matches_pod(key, pod) {
-                        continue;
-                    }
+                if let Some(ref filter) = peer.pod_selector && !filter.matches_pod(key, pod) {
+                    continue;
                 }
 
                 results.ipsv4.extend(&pod.ipsv4);

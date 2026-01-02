@@ -1,6 +1,7 @@
+#![allow(clippy::unusual_byte_groupings)]
+
 use super::data::{self, DomainName};
 
-#[allow(clippy::unusual_byte_groupings)]
 mod header {
     pub const ID_IDX: usize = 0;
     pub const OPCODE_IDX: usize = 2;

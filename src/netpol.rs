@@ -27,10 +27,10 @@ impl KeyValueFrom<NetworkPolicy> for Policy {
         keys::Object::try_from(&v.metadata).ok()
     }
 
-    fn value_from(v: NetworkPolicy) -> Option<Self> {
-        let spec = v.spec?;
+    fn value_from(v: &NetworkPolicy) -> Option<Self> {
+        let spec = v.spec.as_ref()?;
         Some(Self {
-            namespace: v.metadata.namespace?,
+            namespace: v.metadata.namespace.clone()?,
             is_ingress: match spec.policy_types {
                 Some(ref v) => v.iter().any(|v| v == "Ingress"),
                 // (ref) all policies (whether or not they contain an ingress section) are assumed to affect ingress
@@ -41,9 +41,9 @@ impl KeyValueFrom<NetworkPolicy> for Policy {
                 // (ref) policies that contain an egress section are assumed to affect egress
                 None => spec.egress.is_some(),
             },
-            pod_selector: spec.pod_selector.unwrap_or_default(),
-            ingress: spec.ingress.unwrap_or_default(),
-            egress: spec.egress.unwrap_or_default(),
+            pod_selector: spec.pod_selector.clone().unwrap_or_default(),
+            ingress: spec.ingress.clone().unwrap_or_default(),
+            egress: spec.egress.clone().unwrap_or_default(),
         })
     }
 }

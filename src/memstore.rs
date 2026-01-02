@@ -2,13 +2,66 @@ use kube::runtime::watcher::Event;
 use std::collections::{btree_map, BTreeMap};
 use std::ops::RangeBounds;
 
+#[macro_export]
+macro_rules! multimap {
+    ( $vis:vis $type:ident {
+        $(
+            $name:ident : $variant:ident($src_type:ty) => $dst_type:ty ,
+        )*
+    }) => {
+        #[derive(Default)]
+        $vis struct $type {
+            $(
+            $vis $name: $crate::memstore::Map<$src_type, $dst_type>,
+            )*
+        }
+
+        impl $type {
+            pub fn new() -> Self { Default::default() }
+
+            #[allow(unused)]
+            pub fn is_ready(&self) -> bool {
+                true $(
+                && self.$name.is_ready()
+                )*
+            }
+
+            /// ingest an event, returning true iff a map was updated
+            pub fn ingest(&mut self, event: $crate::kube_watch::Event) -> bool {
+                match event {
+                    $(
+                    $crate::kube_watch::Event::$variant(e) => {
+                        self.$name.ingest(&e);
+                        true
+                    }
+                    )*
+                    _ => false,
+                }
+            }
+
+            /// ingest pending events, waiting for them.
+            /// Returns None at the end of stream.
+            /// Returns Some(true) iff at least one map was updated.
+            pub async fn ingest_events(&mut self, rx: &mut $crate::kube_watch::EventReceiver) -> Option<bool> {
+                let mut updated = self.ingest(rx.recv().await?);
+
+                while let Ok(e) = rx.try_recv() {
+                    updated |= self.ingest(e);
+                }
+
+                Some(updated)
+            }
+        }
+    };
+}
+
 pub struct Value<F, T> {
     value: Option<T>,
-    map: fn(F) -> T,
+    map: fn(&F) -> T,
 }
 
 impl<F, T> Value<F, T> {
-    pub fn new(map: fn(F) -> T) -> Self {
+    pub fn new(map: fn(&F) -> T) -> Self {
         Self { value: None, map }
     }
 
@@ -20,7 +73,7 @@ impl<F, T> Value<F, T> {
         self.value.as_ref()
     }
 
-    pub fn ingest(&mut self, event: Event<F>) {
+    pub fn ingest(&mut self, event: &Event<F>) {
         // single values are not sensitive to Init/InitDone: one received, they are ready
         use Event::*;
         match event {
@@ -34,7 +87,7 @@ impl<F, T> Value<F, T> {
 pub trait KeyValueFrom<V>: Sized {
     type Key: Ord;
     fn key_from(v: &V) -> Option<Self::Key>;
-    fn value_from(v: V) -> Option<Self>;
+    fn value_from(v: &V) -> Option<Self>;
 }
 
 pub struct Map<F, T: KeyValueFrom<F>> {
@@ -51,15 +104,15 @@ where
         Self::default()
     }
 
-    pub fn map(&self) -> BTreeMap<T::Key, T> {
-        self.map.clone()
+    pub fn map(&self) -> &BTreeMap<T::Key, T> {
+        &self.map
     }
 
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 
-    pub fn ready_map(&self) -> Option<BTreeMap<T::Key, T>> {
+    pub fn ready_map(&self) -> Option<&BTreeMap<T::Key, T>> {
         self.ready.then(|| self.map())
     }
 
@@ -75,7 +128,7 @@ where
         self.map.range(bounds)
     }
 
-    pub fn ingest(&mut self, event: Event<F>) {
+    pub fn ingest(&mut self, event: &Event<F>) {
         use Event::*;
         match event {
             Init => {
@@ -83,18 +136,18 @@ where
                 self.ready = false
             }
             InitApply(v) => {
-                if let (Some(key), Some(value)) = (T::key_from(&v), T::value_from(v)) {
+                if let (Some(key), Some(value)) = (T::key_from(v), T::value_from(v)) {
                     self.map.insert(key, value);
                 };
             }
             InitDone => self.ready = true,
             Apply(v) => {
-                if let (Some(key), Some(value)) = (T::key_from(&v), T::value_from(v)) {
+                if let (Some(key), Some(value)) = (T::key_from(v), T::value_from(v)) {
                     self.map.insert(key, value);
                 }
             }
             Delete(v) => {
-                if let Some(key) = T::key_from(&v) {
+                if let Some(key) = T::key_from(v) {
                     self.map.remove(&key);
                 }
             }

@@ -30,12 +30,8 @@ impl std::fmt::Display for Entry {
     }
 }
 
-pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
+pub fn cluster_zone_from_state(state: &State) -> Domain {
     let ttl = 5;
-
-    if !(state.services.is_ready() && state.ep_slices.is_ready()) {
-        return None;
-    }
 
     let ns_dn = DomainName::unchecked_new("localhost.localdomain");
 
@@ -59,7 +55,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
 
     let svc_zone = domain.sub_or_create(Label::new("svc"));
 
-    for (key, svc) in state.services.iter() {
+    for (key, svc) in state.maps.services.iter() {
         let zone = svc_zone.sub_or_create(Label::new(&key.namespace));
         let zone = zone.sub_or_create(Label::new(&key.name));
 
@@ -91,7 +87,7 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
     }
 
     // add entries for slice endpoints with hostname
-    for (key, slice) in state.ep_slices.iter() {
+    for (key, slice) in state.maps.ep_slices.iter() {
         for ep in slice.endpoints.iter() {
             let Some(ref hostname) = ep.hostname else {
                 continue;
@@ -107,5 +103,5 @@ pub fn cluster_zone_from_state(state: &State) -> Option<Domain> {
         }
     }
 
-    Some(domain)
+    domain
 }

@@ -30,7 +30,7 @@ chain inet kube-proxy dispatch {
     nft.clear();
     let mut update = table.update(&mut nft);
     update.prepare()?;
-    assert_eq!(String::from_utf8_lossy(&update.nft), "");
+    assert_eq!(String::from_utf8_lossy(update.nft), "");
     update.ctr(CtrKind::Chain, "dispatch", |buf| {
         writeln!(buf, "  test rule")
     })?;

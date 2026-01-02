@@ -5,7 +5,7 @@ use log::{debug, error};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-use crate::actions;
+use crate::{actions, state::State, kube_watch::EventReceiver};
 use crate::dns::{self, data, packet};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -22,9 +22,9 @@ fn default_bind() -> String {
 }
 
 pub async fn watch(
-    _ctx: Arc<crate::Context>,
+    ctx: Arc<crate::Context>,
     cfg: Config,
-    mut watcher: crate::watcher::Watcher,
+    mut events: EventReceiver,
 ) -> eyre::Result<()> {
     let sock = UdpSocket::bind(cfg.bind).await?;
     actions::run_event(module_path!(), "on_listen", &cfg.on_listen).await?;
@@ -34,15 +34,18 @@ pub async fn watch(
 
     let mut root = data::Domain::new();
     let mut recv_buf = [0; 512];
+    let mut state = State::new(ctx.node_name.clone());
 
     loop {
         tokio::select!(
-            update = watcher.next(dns::cluster_zone_from_state) => {
-                let cluster_zone = update?;
+            updated = state.ingest_events(&mut events) => {
+                let Some(updated) = updated else {
+                    return Ok(())
+                };
+                if !updated || !state.is_ready() { continue; }
 
-                if let Some(zone) = cluster_zone {
-                    root.set(&cluster_domain, zone);
-                }
+                let cluster_zone = dns::cluster_zone_from_state(&state);
+                root.set(&cluster_domain, cluster_zone);
             },
             result = sock.readable() => {
                 if let Err(e) = result {
