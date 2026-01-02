@@ -1,4 +1,4 @@
-use log::error;
+use log::{error, warn};
 use std::collections::BTreeSet as Set;
 use std::sync::Arc;
 use tokio::{fs, time};
@@ -82,7 +82,9 @@ async fn update_node(ctx: &Arc<crate::Context>, labels: &Set<String>) -> eyre::R
 
 async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Set<String>> {
     let mut labels = Set::new();
-    let mut add = |kind, id: &str| labels.insert(hw_label(kind, id));
+    let mut add = |kind, id: &str| {
+        labels.insert(hw_label(kind, id));
+    };
 
     let mut dir = fs::read_dir("/sys/class/block").await?;
     while let Some(sys_dir) = dir.next_entry().await? {
@@ -117,16 +119,27 @@ async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Set<String>> {
 }
 
 async fn read_sub(dir: &fs::DirEntry, file: &str) -> std::io::Result<Option<String>> {
+    use nix::errno::Errno;
     use std::io::ErrorKind;
 
     let file = dir.path().join(file);
 
     match fs::read_to_string(&file).await {
+        // fs::read_to_string(&file).await {
         Ok(s) => Ok(Some(s)),
         Err(e) => match e.kind() {
             ErrorKind::NotFound => Ok(None),
             ErrorKind::NotADirectory => Ok(None),
-            _ => Err(e),
+            _ => match e.raw_os_error().map(Errno::from_raw) {
+                Some(Errno::ENXIO | Errno::EINVAL) => Ok(None),
+                _ => {
+                    warn!(
+                        "ignoring read error: {}: {e}",
+                        file.as_path().to_string_lossy()
+                    );
+                    Ok(None)
+                }
+            },
         },
     }
 }
