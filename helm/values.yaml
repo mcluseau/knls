@@ -55,10 +55,13 @@ unbound:
 
 hw_labels: true
 
+# values: null, nftables
+network_policy: null
+
 resources:
   knls:
     limits:
-      memory: 16Mi
+      memory: 32Mi
     requests:
       memory: 10Mi
       cpu: 10m

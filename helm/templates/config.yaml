@@ -47,6 +47,9 @@ data:
       disk_wwid: true
       part_uuid: true
 {{- end }}
+{{- if .Values.network_policy }}
+    network_policy: !nftables {}
+{{- end }}
 
   unbound.conf: |
     server:
