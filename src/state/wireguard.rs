@@ -1,5 +1,5 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use defguard_wireguard_rs::net::IpAddrMask;
+use cidr::{IpCidr, Ipv4Inet, Ipv6Inet};
 use eyre::format_err;
 use k8s_openapi::api::core::v1 as core;
 use log::warn;
@@ -41,7 +41,7 @@ pub struct Node {
     pub pubkey: Option<Key>,
     pub endpoint: Option<Endpoint>,
     pub endpoint_from: Option<Map<String, Endpoint>>,
-    pub pod_cidrs: Vec<IpAddrMask>,
+    pub pod_cidrs: Vec<IpCidr>,
 }
 impl Node {
     pub fn new() -> Self {
@@ -51,18 +51,27 @@ impl Node {
         }
     }
 
-    pub fn if_addr(&self) -> Option<String> {
-        // TODO first address in range
-        self.pod_cidrs.first().map(|c| c.to_string())
+    pub fn if_addr4(&self) -> Option<Ipv4Inet> {
+        (self.pod_cidrs.iter())
+            .filter_map(|c| match c {
+                IpCidr::V4(v) => Some(v),
+                _ => None,
+            })
+            .next()
+            .and_then(|c| c.first().next())
+    }
+    pub fn if_addr6(&self) -> Option<Ipv6Inet> {
+        (self.pod_cidrs.iter())
+            .filter_map(|c| match c {
+                IpCidr::V6(v) => Some(v),
+                _ => None,
+            })
+            .next()
+            .and_then(|c| c.first().next())
     }
 
-    pub fn get_endpoint_from(
-        &self,
-        zone: &String,
-        default_port: u16,
-    ) -> Option<std::net::SocketAddr> {
-        self.endpoint_from
-            .as_ref()
+    pub fn get_endpoint_from(&self, zone: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+        (self.endpoint_from.as_ref())
             .and_then(|eps| eps.get(zone))
             .or(self.endpoint.as_ref())
             .map(|ep| ep.to_addr_port(default_port))

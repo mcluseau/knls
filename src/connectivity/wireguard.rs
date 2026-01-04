@@ -1,9 +1,11 @@
+use cidr::{IpCidr, IpInet};
 use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
 use eyre::Result;
 use futures::TryStreamExt;
+use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, info, warn};
 use netlink_packet_route::{
-    address::AddressAttribute,
+    address::{AddressAttribute, AddressMessage},
     link::LinkAttribute::Mtu,
     route::{RouteAddress, RouteHeader},
 };
@@ -11,11 +13,10 @@ use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::fs;
-use k8s_openapi::api::{core::v1 as core};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::state::wireguard::{Key, decode_key, encode_key, Node};
-use crate::{actions, change, patch_params, kube_watch::EventReceiver};
+use crate::state::wireguard::{Key, Node, decode_key, encode_key};
+use crate::{actions, change, kube_watch::EventReceiver, patch_params};
 
 crate::multimap!(
     State{
@@ -53,11 +54,7 @@ mod defaults {
     }
 }
 
-pub async fn watch(
-    ctx: Arc<crate::Context>,
-    cfg: Config,
-    mut events: EventReceiver
-) -> Result<()> {
+pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
     let node_name = ctx.node_name.as_str();
     let kube = ctx.kube.clone();
 
@@ -81,6 +78,11 @@ pub async fn watch(
             .expect("at least one link should exist")
     };
     let link_id = link.header.index;
+
+    let if_addrs = IfAddrs {
+        id: link_id,
+        rtnl: rtnl.clone(),
+    };
 
     let private_key = get_private_key(&key_path).await?;
     let pubkey: PublicKey = (&StaticSecret::from(private_key)).into();
@@ -143,7 +145,9 @@ pub async fn watch(
     let mut state = State::new();
 
     loop {
-        let Some(updated) = state.ingest_events(&mut events).await else { return Ok(())};
+        let Some(updated) = state.ingest_events(&mut events).await else {
+            return Ok(());
+        };
         if !updated || !state.is_ready() {
             continue;
         }
@@ -153,41 +157,15 @@ pub async fn watch(
             continue;
         };
 
-        let vpn_ip = my_node.pod_cidrs.first().map(|cidr| match cidr.ip {
-            IpAddr::V4(ip) => IpAddr::V4(Ipv4Addr::from_bits(ip.to_bits() + 1)),
-            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from_bits(ip.to_bits() + 1)),
-        });
+        let vpn_ips: Vec<_> = [
+            my_node.if_addr4().map(IpInet::V4),
+            my_node.if_addr6().map(IpInet::V6),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
-        // interface IP
-        {
-            let mut found = false;
-            let mut addrs = (rtnl.address().get().set_link_index_filter(link_id)).execute();
-            while let Some(addr) = addrs.try_next().await? {
-                let Some(ip) = addr.attributes.iter().find_map(|attr| match attr {
-                    AddressAttribute::Address(ip) => Some(ip),
-                    _ => None,
-                }) else {
-                    continue;
-                };
-
-                if Some(ip) == vpn_ip.as_ref() {
-                    found = true;
-                } else {
-                    rtnl.address().del(addr).execute().await?;
-                }
-            }
-
-            if !found && let Some(ip) = vpn_ip {
-                let prefix_len = match ip {
-                    IpAddr::V4(_) => 32u8,
-                    IpAddr::V6(_) => 128u8,
-                };
-                rtnl.address()
-                    .add(link_id, ip, prefix_len)
-                    .execute()
-                    .await?;
-            }
-        }
+        if_addrs.sync(&vpn_ips).await?;
 
         // CNI config
         let cni_config = CniConfig {
@@ -196,19 +174,13 @@ pub async fn watch(
             r#type: "ptp",
             ipam: CniIpam {
                 r#type: "host-local",
-                ranges: vec![
-                    (my_node.pod_cidrs.iter())
-                        .map(|cidr| CniRange {
-                            subnet: cidr.to_string(),
-                        })
-                        .collect(),
-                ],
-                routes: vec![CniRoute {
-                    dst: "0.0.0.0/0".to_string(),
-                }],
+                ranges: vec![(my_node.pod_cidrs.iter()).map(CniRange::from).collect()],
+                routes: (vpn_ips.iter())
+                    .map(|inet| CniRoute::default_for(inet.family()))
+                    .collect(),
             },
             dns: CniDns {
-                nameservers: vpn_ip.iter().map(|ip| ip.to_string()).collect(),
+                nameservers: vpn_ips.iter().map(|ip| ip.to_string()).collect(),
             },
             mtu: (link.attributes.iter())
                 .find_map(|attr| match attr {
@@ -252,7 +224,7 @@ pub async fn watch(
 
         let listen_port = my_node.listen_port.unwrap_or(default_port);
         if current_listen_port != Some(listen_port) || current_pubkey != Some(pubkey) {
-            // TODO we read the whole interface config just to allow set_host to work,
+            // FIXME? we read the whole interface config just to allow set_host to work,
             // which is much more than what we want to update.
             let mut host = netlink::get_host(&ifname)?;
             host.listen_port = listen_port;
@@ -270,7 +242,9 @@ pub async fn watch(
 
             let peer = Peer {
                 endpoint: node.get_endpoint_from(&my_node.zone, default_port),
-                allowed_ips: node.pod_cidrs.clone(),
+                allowed_ips: (node.pod_cidrs.iter())
+                    .map(|cidr| IpAddrMask::new(cidr.first_address(), cidr.network_length()))
+                    .collect(),
             };
 
             if let Some(change) = peers.check(pubkey, &peer) {
@@ -316,13 +290,72 @@ pub async fn watch(
     }
 }
 
+struct IfAddrs {
+    id: u32,
+    rtnl: rtnetlink::Handle,
+}
+
+impl IfAddrs {
+    async fn list(&self) -> Result<Vec<(IpInet, AddressMessage)>> {
+        let mut addrs = Vec::new();
+        let mut link_addrs = (self.rtnl.address().get())
+            .set_link_index_filter(self.id)
+            .execute();
+
+        while let Some(link_addr) = link_addrs.try_next().await? {
+            let Some(addr) = link_addr.attributes.iter().find_map(|attr| match attr {
+                AddressAttribute::Address(ip) => Some(ip.clone()),
+                _ => None,
+            }) else {
+                continue;
+            };
+
+            let inet = IpInet::new(addr, link_addr.header.prefix_len)
+                .expect("kernel cidr should be valid");
+            addrs.push((inet, link_addr));
+        }
+
+        Ok(addrs)
+    }
+
+    async fn sync(&self, wanted: &[IpInet]) -> Result<()> {
+        let curr_inets = self.list().await?;
+
+        for (inet, addr_msg) in &curr_inets {
+            if !wanted.contains(inet) {
+                self.del(addr_msg.clone()).await?;
+            }
+        }
+
+        for inet in wanted {
+            if !curr_inets.iter().any(|(curr, _)| curr == inet) {
+                self.add(*inet).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn add(&self, inet: IpInet) -> Result<()> {
+        let (addr, len) = (inet.address(), inet.network_length());
+        Ok((self.rtnl.address())
+            .add(self.id, addr, len)
+            .execute()
+            .await?)
+    }
+
+    async fn del(&self, addr_msg: AddressMessage) -> Result<()> {
+        Ok(self.rtnl.address().del(addr_msg).execute().await?)
+    }
+}
+
 struct OifRoutes {
     oif: u32,
     default_hdr: RouteHeader,
     rtnl: rtnetlink::Handle,
 }
 impl OifRoutes {
-    async fn list(&self) -> eyre::Result<Vec<IpAddrMask>> {
+    async fn list(&self) -> eyre::Result<Vec<IpCidr>> {
         use rtnetlink::RouteMessageBuilder as B;
 
         let mut routes = Vec::new();
@@ -368,20 +401,21 @@ impl OifRoutes {
                     }
                 };
 
-                let dest = IpAddrMask::new(dest, route.header.destination_prefix_length);
+                let dest = IpCidr::new(dest, route.header.destination_prefix_length)
+                    .expect("kernel IpCidr should be valid");
                 routes.push(dest);
             }
         }
         Ok(routes)
     }
 
-    async fn add(&self, dest: &IpAddrMask) -> eyre::Result<()> {
+    async fn add(&self, dest: &IpCidr) -> eyre::Result<()> {
         let msg = self.dest_route_msg(dest);
         self.rtnl.route().add(msg).execute().await?;
         Ok(())
     }
 
-    async fn del(&self, dest: &IpAddrMask) -> eyre::Result<()> {
+    async fn del(&self, dest: &IpCidr) -> eyre::Result<()> {
         let msg = self.dest_route_msg(dest);
         self.rtnl.route().del(msg).execute().await?;
         Ok(())
@@ -400,15 +434,17 @@ impl OifRoutes {
             .build()
     }
 
-    fn dest_route_msg(&self, dest: &IpAddrMask) -> netlink_packet_route::route::RouteMessage {
+    fn dest_route_msg(&self, dest: &IpCidr) -> netlink_packet_route::route::RouteMessage {
         use rtnetlink::RouteMessageBuilder as B;
 
-        match dest.ip {
-            IpAddr::V4(ip) => {
-                self.route_msg(B::<Ipv4Addr>::new().destination_prefix(ip, dest.cidr))
+        let prefix_len = dest.network_length();
+
+        match dest.first_address() {
+            IpAddr::V4(addr) => {
+                self.route_msg(B::<Ipv4Addr>::new().destination_prefix(addr, prefix_len))
             }
-            IpAddr::V6(ip) => {
-                self.route_msg(B::<Ipv6Addr>::new().destination_prefix(ip, dest.cidr))
+            IpAddr::V6(addr) => {
+                self.route_msg(B::<Ipv6Addr>::new().destination_prefix(addr, prefix_len))
             }
         }
     }
@@ -478,8 +514,26 @@ struct CniRange {
     subnet: String,
 }
 
+impl From<&cidr::IpCidr> for CniRange {
+    fn from(cidr: &cidr::IpCidr) -> Self {
+        Self {
+            subnet: cidr.to_string(),
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CniRoute {
     dst: String,
+}
+
+impl CniRoute {
+    fn default_for(fam: cidr::Family) -> Self {
+        let cidr = cidr::IpCidr::new(fam.unspecified_address(), 0)
+            .expect("prefix len = 0 should be valid");
+        Self {
+            dst: cidr.to_string(),
+        }
+    }
 }
