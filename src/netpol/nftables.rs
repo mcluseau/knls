@@ -1,7 +1,7 @@
 use super::{EgressRule, IngressRule, Policy};
 use crate::{
     kube_watch::EventReceiver,
-    state::{keys, Namespace, Pod},
+    state::{Namespace, Pod, keys},
 };
 use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
 use eyre::Result;
@@ -332,11 +332,15 @@ impl<'t> NetpolHelper<'t> {
             });
 
             for (key, pod) in self.state.pods.iter() {
-                if let Some(ref ns_filter) = ns_filter && ns_filter.iter().all(|v| *v != &key.namespace) {
+                if let Some(ref ns_filter) = ns_filter
+                    && ns_filter.iter().all(|v| *v != &key.namespace)
+                {
                     continue;
                 }
 
-                if let Some(ref filter) = peer.pod_selector && !filter.matches_pod(key, pod) {
+                if let Some(ref filter) = peer.pod_selector
+                    && !filter.matches_pod(key, pod)
+                {
                     continue;
                 }
 

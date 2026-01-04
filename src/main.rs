@@ -1,12 +1,12 @@
 use clap::{Parser, ValueEnum};
 use eyre::format_err;
-use kube::{runtime::watcher, Client};
+use kube::{Client, runtime::watcher};
 use log::{error, info};
 use std::process::exit;
 use std::sync::Arc;
 use tokio::{
     select,
-    signal::unix::{signal, SignalKind},
+    signal::unix::{SignalKind, signal},
     sync::mpsc,
 };
 

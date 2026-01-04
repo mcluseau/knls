@@ -5,8 +5,8 @@ use log::{debug, error};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-use crate::{actions, state::State, kube_watch::EventReceiver};
 use crate::dns::{self, data, packet};
+use crate::{actions, kube_watch::EventReceiver, state::State};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {

@@ -2,7 +2,7 @@ use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::{
     core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
 };
-use kube::{api::Api, runtime::watcher, Client};
+use kube::{Client, api::Api, runtime::watcher};
 use log::{error, info};
 use std::sync::Arc;
 use tokio::sync::mpsc;

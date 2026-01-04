@@ -19,11 +19,11 @@ fn default_table() -> String {
     "kube-proxy".into()
 }
 
-use crate::{change,kube_watch};
 use crate::state::{
-    LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, keys, proxy,
-    State
+    LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, State, keys,
+    proxy,
 };
+use crate::{change, kube_watch};
 
 const MASQ_MARK: u32 = 1 << 14;
 
@@ -32,18 +32,28 @@ const SERVICE_NODEPORTS: &str = "service_nodeports";
 const NEED_MASQ_V4: &str = "need_masquerade";
 const NEED_MASQ_V6: &str = "need_masquerade6";
 
-pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: kube_watch::EventReceiver) -> Result<()> {
+pub async fn watch(
+    ctx: Arc<crate::Context>,
+    cfg: Config,
+    mut events: kube_watch::EventReceiver,
+) -> Result<()> {
     let mut table = TableTracker::new(format!("inet {}", cfg.table));
     let mut state = State::new(ctx.node_name.clone());
 
     loop {
         let Some(updated) = state.ingest_events(&mut events).await else {
-            return Ok(())
+            return Ok(());
         };
-        if !updated || !state.is_ready() { continue; }
+        if !updated || !state.is_ready() {
+            continue;
+        }
 
-        let Some(my_node) = state.my_node.get() else { continue; };
-        let Some(cfg) = proxy::from_state(&state, cfg.disable_nodeports) else { continue; };
+        let Some(my_node) = state.my_node.get() else {
+            continue;
+        };
+        let Some(cfg) = proxy::from_state(&state, cfg.disable_nodeports) else {
+            continue;
+        };
 
         if let Err(e) = update_table(&mut table, my_node, &cfg) {
             error!("partial update of table failed ({e}); doing a full update");
