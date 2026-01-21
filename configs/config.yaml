@@ -2,12 +2,15 @@
 proxy: !nftables {}
 
 connectivity: !wireguard
+  manual_node:
+    pod_cidrs:
+    - "192.168.242.0/28"
   on_create:
   - !nft_chain
-    table: knls,
-    chain: wireguard,
+    table: knls
+    chain: wireguard
     rules: |-
-      // ...
+      # ...
 
 dns: !internal
   on_listen:

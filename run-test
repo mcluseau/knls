@@ -1,13 +1,23 @@
 set -ex
 
 opts=
-opts="$opts --log=info,knls::netpol::nftables=debug"
-opts="$opts --config=/src/configs/netpol.yaml"
-#opts="$opts --connectivity=wireguard --wireguard-ifname=wgknls"
+
+case $1 in
+  netpol)
+    opts="$opts --log=info,knls::netpol::nftables=debug"
+    opts="$opts --config=/src/configs/netpol.yaml"
+    ;;
+
+  *)
+    opts="$opts --config=/src/configs/config.yaml"
+    ;;
+esac
 
 exec docker run --rm --name knls-test -t --cap-add net_admin \
     -v $KUBECONFIG:/root/.kube/config:ro \
     -v $PWD:/src:ro \
     -v $PWD/tmp/var-lib-knls:/var/lib/knls \
     -e NODE_NAME \
-    knls:test $opts
+    knls:test$opts
+#    --entrypoint ash \
+#    knls:test -c "while true; do knls $opts ; sleep 1; done"

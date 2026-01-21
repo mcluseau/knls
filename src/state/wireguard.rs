@@ -1,4 +1,4 @@
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use cidr::{IpCidr, Ipv4Inet, Ipv6Inet};
 use eyre::format_err;
 use k8s_openapi::api::core::v1 as core;
@@ -34,8 +34,9 @@ pub fn decode_key(s: &[u8]) -> eyre::Result<Key> {
     Ok(key)
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Node {
+    #[serde(default = "default_zone")]
     pub zone: String,
     pub listen_port: Option<u16>,
     pub pubkey: Option<Key>,
@@ -129,7 +130,7 @@ impl memstore::KeyValueFrom<core::Node> for Node {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Endpoint {
     pub address: IpAddr,
     pub port: Option<u16>,

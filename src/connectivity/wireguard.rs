@@ -1,6 +1,6 @@
 use cidr::{IpCidr, IpInet};
 use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
-use eyre::Result;
+use eyre::{Result, format_err};
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, info, warn};
@@ -40,6 +40,9 @@ pub struct Config {
 
     #[serde(default)]
     on_create: Vec<crate::actions::Action>,
+
+    #[serde(default)]
+    manual_node: Option<Node>,
 }
 
 mod defaults {
@@ -153,7 +156,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         }
 
         let nodes = state.nodes.map();
-        let Some(my_node) = nodes.get(node_name) else {
+        let Some(my_node) = cfg.manual_node.as_ref().or_else(|| nodes.get(node_name)) else {
             continue;
         };
 
@@ -190,35 +193,39 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                 .unwrap_or(1420),
         };
 
-        if prev_cni_config.as_ref() != Some(&cni_config) {
-            let value = serde_json::to_vec(&cni_config)?;
-            std::fs::write(&cni_config_path, value)?;
-            prev_cni_config = Some(cni_config);
-        }
+        if cfg.manual_node.is_none() {
+            if prev_cni_config.as_ref() != Some(&cni_config) {
+                let value = serde_json::to_vec(&cni_config)?;
+                std::fs::write(&cni_config_path, value).map_err(|e| {
+                    format_err!("failed to write CNI config ({cni_config_path}): {e}")
+                })?;
+                prev_cni_config = Some(cni_config);
+            }
 
-        // publish public key
-        if my_node.pubkey != Some(*pubkey.as_bytes()) {
-            info!("updating node's pubkey");
-            use crate::state::wireguard::ANN_PUBKEY;
-            let pubkey = wg::key::Key::new(*pubkey.as_bytes()).to_string();
-            let patch = json!(
-                {"metadata":{"annotations":{ ANN_PUBKEY: pubkey}}}
-            );
-
-            use k8s_openapi::api::core::v1::Node;
-            use kube::api::Patch;
-
-            let nodes = kube::api::Api::<Node>::all(kube.clone());
-            if let Err(e) = nodes
-                .patch(node_name, &patch_params(), &Patch::Strategic(&patch))
-                .await
-                && !warned_about_pubkey
-            {
-                let patch_str = serde_json::to_string(&patch).expect("patch should serialize");
-                error!(
-                    "failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}"
+            // publish public key
+            if my_node.pubkey != Some(*pubkey.as_bytes()) {
+                info!("updating node's pubkey");
+                use crate::state::wireguard::ANN_PUBKEY;
+                let pubkey = wg::key::Key::new(*pubkey.as_bytes()).to_string();
+                let patch = json!(
+                    {"metadata":{"annotations":{ ANN_PUBKEY: pubkey}}}
                 );
-                warned_about_pubkey = true;
+
+                use k8s_openapi::api::core::v1::Node;
+                use kube::api::Patch;
+
+                let nodes = kube::api::Api::<Node>::all(kube.clone());
+                if let Err(e) = nodes
+                    .patch(node_name, &patch_params(), &Patch::Strategic(&patch))
+                    .await
+                    && !warned_about_pubkey
+                {
+                    let patch_str = serde_json::to_string(&patch).expect("patch should serialize");
+                    error!(
+                        "failed to update node's pubkey: {e}\nkubectl patch node {node_name} -p {patch_str:?}"
+                    );
+                    warned_about_pubkey = true;
+                }
             }
         }
 
