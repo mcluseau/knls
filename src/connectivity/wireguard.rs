@@ -268,7 +268,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             }
 
             for route in &node.pod_cidrs {
-                if let Some(change) = routes.check(route.clone(), &()) {
+                if let Some(change) = routes.check(*route, &()) {
                     info!("adding route to {route}");
                     if let Err(e) = oif_routes.add(route).await {
                         error!("failed to add route to {route}: {e}");
@@ -311,7 +311,7 @@ impl IfAddrs {
 
         while let Some(link_addr) = link_addrs.try_next().await? {
             let Some(addr) = link_addr.attributes.iter().find_map(|attr| match attr {
-                AddressAttribute::Address(ip) => Some(ip.clone()),
+                AddressAttribute::Address(ip) => Some(*ip),
                 _ => None,
             }) else {
                 continue;
@@ -480,8 +480,8 @@ struct Peer {
     allowed_ips: Vec<wg::net::IpAddrMask>,
 }
 impl Peer {
-    fn into_wg_peer(self, pubkey: Key) -> wg::host::Peer {
-        wg::host::Peer {
+    fn into_wg_peer(self, pubkey: Key) -> wg::peer::Peer {
+        wg::peer::Peer {
             public_key: wg::key::Key::new(pubkey),
             endpoint: self.endpoint,
             allowed_ips: self.allowed_ips,
