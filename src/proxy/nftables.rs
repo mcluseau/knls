@@ -19,11 +19,15 @@ fn default_table() -> String {
     "kube-proxy".into()
 }
 
+use super::conntrack;
 use crate::state::{
     LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, State, keys,
     proxy,
 };
-use crate::{change, kube_watch};
+use crate::{
+    change,
+    kube_watch::{EventReceiver, ingest_events},
+};
 
 const MASQ_MARK: u32 = 1 << 14;
 
@@ -32,19 +36,27 @@ const SERVICE_NODEPORTS: &str = "service_nodeports";
 const NEED_MASQ_V4: &str = "need_masquerade";
 const NEED_MASQ_V6: &str = "need_masquerade6";
 
-pub async fn watch(
-    ctx: Arc<crate::Context>,
-    cfg: Config,
-    mut events: kube_watch::EventReceiver,
-) -> Result<()> {
+pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
     let mut table = TableTracker::new(format!("inet {}", cfg.table));
     let mut state = State::new(ctx.node_name.clone());
 
+    let mut ct_state = conntrack::State::new().await?;
+
     loop {
-        let Some(updated) = state.ingest_events(&mut events).await else {
-            return Ok(());
+        use std::ops::ControlFlow::*;
+        match ingest_events(&mut events, |e| {
+            let mut updated = false;
+            updated |= state.ingest(&e);
+            updated |= ct_state.ingest(&e);
+            updated
+        })
+        .await
+        {
+            Some(Break(_)) => break,
+            Some(Continue(_)) => continue,
+            None => {}
         };
-        if !updated || !state.is_ready() {
+        if !state.is_ready() {
             continue;
         }
 
@@ -67,10 +79,22 @@ pub async fn watch(
         }
 
         table.update_done();
+
+        if !ct_state.is_ready() {
+            debug!("ct not ready");
+            continue;
+        }
+        if let Err(e) = conntrack::cleanup(&ct_state).await {
+            error!("conntrack cleanup failed: {e}");
+        }
     }
+
+    Ok(())
 }
 
 fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::State) -> Result<()> {
+    debug!("updating table {}", table.table);
+
     let mut child = std::process::Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())

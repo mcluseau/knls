@@ -8,12 +8,11 @@ copy . .
 
 run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=rust-alpine-target,sharing=private,target=/app/target \
-  cargo build --locked --release && install -D target/release/knls /dist/bin/knls
-#  cargo install --path . --root /dist
+  cargo install --locked --path . --root /dist
 
 # ------------------------------------------------------------------------
 from alpine:3.23.3
 entrypoint ["knls"]
-run apk add --no-cache nftables wireguard-tools
+run apk add --no-cache nftables wireguard-tools conntrack-tools
 copy --from=build /dist/bin/ /bin/
 

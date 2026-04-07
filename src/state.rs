@@ -97,19 +97,17 @@ impl State {
             name: String::new(),
         };
 
-        use std::ops::Bound;
-
         (self.maps.ep_slices)
-            .range((Bound::Included(key_min), Bound::Unbounded))
+            .range(key_min..) // (Bound::Included(key_min), Bound::Unbounded))
             .take_while(|(k, _)| k.is_service(service_key))
             .map(|(_, v)| v)
     }
 
-    pub fn ingest(&mut self, event: kube_watch::Event) -> bool {
+    pub fn ingest(&mut self, event: &kube_watch::Event) -> bool {
         use kube_watch::Event::*;
         match event {
             MyNode(e) => {
-                self.my_node.ingest(&e);
+                self.my_node.ingest(e);
                 true
             }
             _ => self.maps.ingest(event),
@@ -121,10 +119,10 @@ impl State {
         &mut self,
         rx: &mut crate::kube_watch::EventReceiver,
     ) -> Option<bool> {
-        let mut updated = self.ingest(rx.recv().await?);
+        let mut updated = self.ingest(&rx.recv().await?);
 
         while let Ok(e) = rx.try_recv() {
-            updated |= self.ingest(e);
+            updated |= self.ingest(&e);
         }
 
         Some(updated)

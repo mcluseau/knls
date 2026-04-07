@@ -3,11 +3,14 @@ pub mod change;
 pub mod connectivity;
 pub mod dns;
 pub mod hw_labels;
+pub mod ips;
+pub mod keys;
 pub mod kube_watch;
 pub mod memstore;
 pub mod netpol;
 pub mod proxy;
 pub mod state;
+pub mod store;
 
 use kube::api::PatchParams;
 use std::sync::Arc;

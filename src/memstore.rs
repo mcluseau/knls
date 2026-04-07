@@ -27,11 +27,11 @@ macro_rules! multimap {
             }
 
             /// ingest an event, returning true iff a map was updated
-            pub fn ingest(&mut self, event: $crate::kube_watch::Event) -> bool {
+            pub fn ingest(&mut self, event: &$crate::kube_watch::Event) -> bool {
                 match event {
                     $(
                     $crate::kube_watch::Event::$variant(e) => {
-                        self.$name.ingest(&e);
+                        self.$name.ingest(e);
                         true
                     }
                     )*
@@ -43,10 +43,10 @@ macro_rules! multimap {
             /// Returns None at the end of stream.
             /// Returns Some(true) iff at least one map was updated.
             pub async fn ingest_events(&mut self, rx: &mut $crate::kube_watch::EventReceiver) -> Option<bool> {
-                let mut updated = self.ingest(rx.recv().await?);
+                let mut updated = self.ingest(&rx.recv().await?);
 
                 while let Ok(e) = rx.try_recv() {
-                    updated |= self.ingest(e);
+                    updated |= self.ingest(&e);
                 }
 
                 Some(updated)

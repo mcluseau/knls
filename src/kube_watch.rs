@@ -4,6 +4,7 @@ use k8s_openapi::api::{
 };
 use kube::{Client, api::Api, runtime::watcher};
 use log::{error, info};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -95,6 +96,22 @@ impl Config {
             ));
         }
     }
+}
+
+pub async fn ingest_events(
+    events: &mut EventReceiver,
+    mut ingest: impl FnMut(Event) -> bool,
+) -> Option<ControlFlow<()>> {
+    let Some(event) = events.recv().await else {
+        return Some(ControlFlow::Break(()));
+    };
+    let mut updated = ingest(event);
+
+    while let Ok(event) = events.try_recv() {
+        updated |= ingest(event);
+    }
+
+    (!updated).then_some(ControlFlow::Continue(()))
 }
 
 async fn watch_to_events<K>(
