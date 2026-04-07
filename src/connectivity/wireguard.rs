@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
     link::LinkAttribute::Mtu,
-    route::{RouteAddress, RouteHeader},
+    route::RouteHeader,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -131,14 +131,6 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         },
         rtnl: rtnl.clone(),
     };
-
-    for dest in oif_routes.list().await? {
-        debug!("existing route: {dest}");
-        if let Some(change) = routes.check(dest, &()) {
-            change.set(());
-        }
-    }
-    routes.update_done();
 
     // start watch
     let mut warned_about_pubkey = false;
@@ -362,63 +354,9 @@ struct OifRoutes {
     rtnl: rtnetlink::Handle,
 }
 impl OifRoutes {
-    async fn list(&self) -> eyre::Result<Vec<IpCidr>> {
-        use rtnetlink::RouteMessageBuilder as B;
-
-        let mut routes = Vec::new();
-
-        for route_filter in [
-            self.route_msg(B::<Ipv4Addr>::new()),
-            self.route_msg(B::<Ipv6Addr>::new()),
-        ]
-        .into_iter()
-        {
-            use netlink_packet_route::route::RouteAttribute;
-
-            let mut route_list = self.rtnl.route().get(route_filter).execute();
-            while let Some(route) = route_list.try_next().await? {
-                if route.header.table != self.default_hdr.table
-                    || route.header.protocol != self.default_hdr.protocol
-                    || route.header.scope != self.default_hdr.scope
-                    || route.header.kind != self.default_hdr.kind
-                {
-                    continue;
-                }
-
-                let mut oif = None;
-                let mut dest = None;
-
-                for attr in route.attributes {
-                    match attr {
-                        RouteAttribute::Oif(i) => oif = Some(i),
-                        RouteAttribute::Destination(d) => dest = Some(d),
-                        _ => {}
-                    }
-                }
-
-                if oif != Some(self.oif) {
-                    continue;
-                };
-
-                let dest = match dest {
-                    Some(RouteAddress::Inet(addr)) => IpAddr::V4(addr),
-                    Some(RouteAddress::Inet6(addr)) => IpAddr::V6(addr),
-                    _ => {
-                        continue;
-                    }
-                };
-
-                let dest = IpCidr::new(dest, route.header.destination_prefix_length)
-                    .expect("kernel IpCidr should be valid");
-                routes.push(dest);
-            }
-        }
-        Ok(routes)
-    }
-
     async fn add(&self, dest: &IpCidr) -> eyre::Result<()> {
         let msg = self.dest_route_msg(dest);
-        self.rtnl.route().add(msg).execute().await?;
+        self.rtnl.route().add(msg).replace().execute().await?;
         Ok(())
     }
 

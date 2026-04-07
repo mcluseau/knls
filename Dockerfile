@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-from rust:1.93.0-alpine3.23 as build
+from rust:1.94.1-alpine3.23 as build
 
 run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git
 
@@ -8,7 +8,7 @@ copy . .
 
 run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=rust-alpine-target,sharing=private,target=/app/target \
-  cargo build -r && install -D target/release/knls /dist/bin/knls
+  cargo build --locked --release && install -D target/release/knls /dist/bin/knls
 #  cargo install --path . --root /dist
 
 # ------------------------------------------------------------------------
