@@ -1,40 +1,17 @@
 use conntrack::{model::IpProto, Conntrack};
 use eyre::{format_err, Result};
-use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
+use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, warn};
-use std::collections::{BTreeSet, HashSet};
-use std::net::IpAddr;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
 use crate::{
     ips, keys,
-    kube_watch::{ingest_events, Event, EventReceiver},
+    kube_watch::Event,
     store::{HashIndex, Store},
 };
-
-pub async fn watch(mut events: EventReceiver) -> Result<()> {
-    let mut state = State::new().await?;
-
-    loop {
-        use std::ops::ControlFlow::*;
-        match ingest_events(&mut events, |e| state.ingest(&e)).await {
-            Some(Break(_)) => break,
-            Some(Continue(_)) => continue,
-            None => {}
-        };
-
-        if !state.is_ready() {
-            continue;
-        }
-
-        if let Err(e) = cleanup(&state).await {
-            error!("conntrack cleanup failed: {e}");
-        }
-    }
-
-    Ok(())
-}
 
 pub async fn cleanup(state: &State) -> Result<()> {
     let ct = state.ct.clone();
@@ -43,52 +20,25 @@ pub async fn cleanup(state: &State) -> Result<()> {
         .map_err(|e| format_err!("dump failed: {e}"))?;
 
     for flow in flows {
-        let Some(orig) = flow.origin.as_ref() else {
+        let Some(flow) = Flow::from_ct(flow) else {
             continue;
         };
-        let Some(orig_proto) = orig.proto.as_ref() else {
-            continue;
-        };
-        if orig_proto.number != Some(IpProto::Udp) {
-            continue; // UDP only
-        }
-        let Some(id) = flow.id else {
-            continue;
-        };
-        let Some(orig_dst) = orig.dst else {
-            continue;
-        };
-        let Some(orig_port) = orig_proto.dst_port else {
-            continue;
-        };
-        let Some(reply) = flow.reply else {
-            continue;
-        };
-        let Some(reply_proto) = reply.proto.as_ref() else {
-            continue;
-        };
-        let Some(ep_ip) = reply.src else {
-            continue;
-        };
-        let Some(ep_port) = reply_proto.src_port else {
-            continue;
-        };
+
+        let svc = flow.origin.dst;
+        let ep = flow.reply.src;
 
         let mut any_ip = false;
         let mut any_ep = false;
 
-        for svc_key in [
-            Target::IpPort(orig_port, orig_dst),
-            Target::NodePort(orig_port),
-        ]
-        .iter()
-        .filter_map(|target| state.svc_targets.get_rev(target))
-        .flatten()
+        for svc_key in [Target::IpPort(svc), Target::NodePort(svc.port())]
+            .iter()
+            .filter_map(|target| state.svc_targets.get_rev(target))
+            .flatten()
         {
             any_ip = true; // matches a service
 
             for (_, eps) in (state.svc_eps).range(svc_key.to_parent()..svc_key.to_parent().end()) {
-                any_ep |= eps.contains(&ep_ip);
+                any_ep |= eps.contains(&ep.ip());
             }
 
             if any_ep {
@@ -100,32 +50,12 @@ pub async fn cleanup(state: &State) -> Result<()> {
             continue;
         }
 
-        debug!("removing flow {id} mapped from {orig_dst}:{orig_port} to {ep_ip}:{ep_port}");
+        debug!("removing flow {id} mapped from {svc} to {ep}", id = flow.id);
         // TODO remove flows by id (but it's not available with the conntrack tool, and conntrack
         // lib only has dump)
 
         let mut cmd = tokio::process::Command::new("conntrack");
-
-        cmd.arg("-D")
-            .arg("--proto=udp")
-            .arg(format!("--orig-dst={orig_dst}"))
-            .arg(format!("--orig-port-dst={orig_port}"))
-            .arg(format!("--reply-src={ep_ip}"))
-            .arg(format!("--reply-port-src={ep_port}"));
-
-        // filter on every other field so basically selector == id
-        if let Some(v) = orig.src {
-            cmd.arg(format!("--orig-src={v}"));
-        }
-        if let Some(v) = orig_proto.src_port {
-            cmd.arg(format!("--orig-port-src={v}"));
-        }
-        if let Some(v) = reply.dst {
-            cmd.arg(format!("--reply-dst={v}"));
-        }
-        if let Some(v) = reply_proto.dst_port {
-            cmd.arg(format!("--reply-port-dst={v}"));
-        }
+        cmd.arg("-D").args(flow.match_args());
 
         match cmd.output().await {
             Err(e) => error!("conntrack command failed: {e}"),
@@ -143,10 +73,62 @@ pub async fn cleanup(state: &State) -> Result<()> {
     Ok(())
 }
 
+/// resolved conntrack Flow entry for our use
+struct Flow {
+    id: u32,
+    origin: IpTuple,
+    reply: IpTuple,
+}
+
+impl Flow {
+    fn from_ct(ct: conntrack::model::Flow) -> Option<Self> {
+        Some(Self {
+            id: ct.id?,
+            origin: IpTuple::from_ct(ct.origin?)?,
+            reply: IpTuple::from_ct(ct.reply?)?,
+        })
+    }
+
+    fn match_args(&self) -> impl Iterator<Item = String> {
+        ["--proto=udp".to_string()]
+            .into_iter()
+            .chain(self.origin.match_args("orig"))
+            .chain(self.reply.match_args("reply"))
+    }
+}
+
+struct IpTuple {
+    src: SocketAddr,
+    dst: SocketAddr,
+}
+
+impl IpTuple {
+    fn from_ct(ct: conntrack::model::IpTuple) -> Option<Self> {
+        let proto = ct.proto?;
+        if proto.number? != IpProto::Udp {
+            return None; // UDP only
+        }
+        Some(Self {
+            src: SocketAddr::new(ct.src?, proto.src_port?),
+            dst: SocketAddr::new(ct.dst?, proto.dst_port?),
+        })
+    }
+
+    fn match_args(&self, name: &str) -> impl Iterator<Item = String> {
+        [
+            format!("--{name}-src={}", self.src.ip()),
+            format!("--{name}-port-src={}", self.src.port()),
+            format!("--{name}-dst={}", self.dst.ip()),
+            format!("--{name}-port-dst={}", self.dst.port()),
+        ]
+        .into_iter()
+    }
+}
+
 pub struct State {
     ct: Arc<Conntrack>,
     svc_targets: HashIndex<core::Service, keys::Obj, Target>,
-    svc_eps: Store<keys::ByParent, EndpointIps>,
+    svc_eps: Store<keys::ByParent, ips::Endpoint>,
 }
 
 impl State {
@@ -178,43 +160,6 @@ impl State {
     }
 }
 
-#[derive(Default)]
-struct ServiceIps {
-    cluster: Vec<IpAddr>,
-    external: Vec<IpAddr>,
-    load_balancer: Vec<IpAddr>,
-}
-
-impl ServiceIps {
-    fn all(&self) -> impl Iterator<Item = IpAddr> {
-        [&self.cluster, &self.external, &self.load_balancer]
-            .into_iter()
-            .flatten()
-            .cloned()
-    }
-}
-
-impl From<&core::Service> for ServiceIps {
-    fn from(svc: &core::Service) -> Self {
-        let Some(spec) = svc.spec.as_ref() else {
-            return Self::default();
-        };
-
-        if !(spec.ports.iter().flatten()).any(|p| p.protocol.as_deref() == Some("UDP")) {
-            return Self::default(); // no UDP -> no IP to check
-        }
-
-        let lb = (svc.status.as_ref())
-            .and_then(|s| s.load_balancer.as_ref())
-            .and_then(|lb| lb.ingress.as_ref());
-        Self {
-            cluster: ips::parse_opt(spec.cluster_ips.as_ref()),
-            external: ips::parse_opt(spec.external_ips.as_ref()),
-            load_balancer: ips::parse_opt_with(lb, |ing| ing.ip.as_ref()),
-        }
-    }
-}
-
 fn svc_targets(svc: &core::Service) -> BTreeSet<Target> {
     let mut set = BTreeSet::new();
 
@@ -227,9 +172,13 @@ fn svc_targets(svc: &core::Service) -> BTreeSet<Target> {
         .map(|p| (p.port as u16, p.node_port.map(|p| p as u16)))
         .collect();
 
-    for ip in ServiceIps::from(svc).all() {
+    if ports.is_empty() {
+        return set;
+    }
+
+    for ip in ips::Service::from(svc).all() {
         for (port, _) in &ports {
-            set.insert(Target::IpPort(*port, ip));
+            set.insert(Target::ip(ip, *port));
         }
     }
 
@@ -243,28 +192,14 @@ fn svc_targets(svc: &core::Service) -> BTreeSet<Target> {
     set
 }
 
-struct EndpointIps {
-    ips: HashSet<IpAddr>,
-}
-
-impl EndpointIps {
-    fn contains(&self, ip: &IpAddr) -> bool {
-        self.ips.contains(ip)
-    }
-}
-
-impl From<&discovery::EndpointSlice> for EndpointIps {
-    fn from(eps: &discovery::EndpointSlice) -> EndpointIps {
-        Self {
-            ips: HashSet::from_iter(ips::parse_iter(
-                eps.endpoints.iter().flat_map(|ep| &ep.addresses),
-            )),
-        }
-    }
-}
-
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum Target {
-    IpPort(u16, IpAddr),
+    IpPort(SocketAddr),
     NodePort(u16),
+}
+
+impl Target {
+    fn ip(ip: IpAddr, port: u16) -> Self {
+        Self::IpPort(SocketAddr::new(ip, port))
+    }
 }
