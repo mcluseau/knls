@@ -43,19 +43,19 @@ pub async fn cleanup(state: &State) -> Result<()> {
         .map_err(|e| format_err!("dump failed: {e}"))?;
 
     for flow in flows {
-        let Some(id) = flow.id else {
-            continue;
-        };
         let Some(orig) = flow.origin.as_ref() else {
-            continue;
-        };
-        let Some(orig_dst) = orig.dst else {
             continue;
         };
         let Some(orig_proto) = orig.proto.as_ref() else {
             continue;
         };
-        let Some(proto) = orig_proto.number else {
+        if orig_proto.number != Some(IpProto::Udp) {
+            continue; // UDP only
+        }
+        let Some(id) = flow.id else {
+            continue;
+        };
+        let Some(orig_dst) = orig.dst else {
             continue;
         };
         let Some(orig_port) = orig_proto.dst_port else {
@@ -78,8 +78,8 @@ pub async fn cleanup(state: &State) -> Result<()> {
         let mut any_ep = false;
 
         for svc_key in [
-            Target::IpPort(proto, orig_port, orig_dst),
-            Target::NodePort(proto, orig_port),
+            Target::IpPort(orig_port, orig_dst),
+            Target::NodePort(orig_port),
         ]
         .iter()
         .filter_map(|target| state.svc_targets.get_rev(target))
@@ -100,13 +100,6 @@ pub async fn cleanup(state: &State) -> Result<()> {
             continue;
         }
 
-        let proto = match proto {
-            IpProto::Tcp => "tcp",
-            IpProto::Udp => "udp",
-            IpProto::Sctp => "sctp",
-            _ => unreachable!(),
-        };
-
         debug!("removing flow {id} mapped from {orig_dst}:{orig_port} to {ep_ip}:{ep_port}");
         // TODO remove flows by id (but it's not available with the conntrack tool, and conntrack
         // lib only has dump)
@@ -114,7 +107,7 @@ pub async fn cleanup(state: &State) -> Result<()> {
         let mut cmd = tokio::process::Command::new("conntrack");
 
         cmd.arg("-D")
-            .arg(format!("--proto={proto}"))
+            .arg("--proto=udp")
             .arg(format!("--orig-dst={orig_dst}"))
             .arg(format!("--orig-port-dst={orig_port}"))
             .arg(format!("--reply-src={ep_ip}"))
@@ -185,6 +178,7 @@ impl State {
     }
 }
 
+#[derive(Default)]
 struct ServiceIps {
     cluster: Vec<IpAddr>,
     external: Vec<IpAddr>,
@@ -202,13 +196,20 @@ impl ServiceIps {
 
 impl From<&core::Service> for ServiceIps {
     fn from(svc: &core::Service) -> Self {
-        let spec = svc.spec.as_ref();
+        let Some(spec) = svc.spec.as_ref() else {
+            return Self::default();
+        };
+
+        if !(spec.ports.iter().flatten()).any(|p| p.protocol.as_deref() == Some("UDP")) {
+            return Self::default(); // no UDP -> no IP to check
+        }
+
         let lb = (svc.status.as_ref())
             .and_then(|s| s.load_balancer.as_ref())
             .and_then(|lb| lb.ingress.as_ref());
         Self {
-            cluster: ips::parse_opt(spec.and_then(|s| s.cluster_ips.as_ref())),
-            external: ips::parse_opt(spec.and_then(|s| s.external_ips.as_ref())),
+            cluster: ips::parse_opt(spec.cluster_ips.as_ref()),
+            external: ips::parse_opt(spec.external_ips.as_ref()),
             load_balancer: ips::parse_opt_with(lb, |ing| ing.ip.as_ref()),
         }
     }
@@ -222,28 +223,21 @@ fn svc_targets(svc: &core::Service) -> BTreeSet<Target> {
     };
 
     let ports: Vec<_> = (spec.ports.iter().flatten())
-        .filter_map(|p| {
-            let proto = match p.protocol.as_deref()? {
-                "TCP" => IpProto::Tcp,
-                "UDP" => IpProto::Udp,
-                "SCTP" => IpProto::Sctp,
-                _ => return None,
-            };
-            Some((proto, p.port as u16, p.node_port.map(|p| p as u16)))
-        })
+        .filter(|p| p.protocol.as_deref() == Some("UDP")) // UDP only
+        .map(|p| (p.port as u16, p.node_port.map(|p| p as u16)))
         .collect();
 
     for ip in ServiceIps::from(svc).all() {
-        for (proto, port, _) in &ports {
-            set.insert(Target::IpPort(*proto, *port, ip));
+        for (port, _) in &ports {
+            set.insert(Target::IpPort(*port, ip));
         }
     }
 
-    for (proto, _, node_port) in &ports {
+    for (_, node_port) in &ports {
         let Some(node_port) = node_port else {
             continue;
         };
-        set.insert(Target::NodePort(*proto, *node_port));
+        set.insert(Target::NodePort(*node_port));
     }
 
     set
@@ -271,6 +265,6 @@ impl From<&discovery::EndpointSlice> for EndpointIps {
 
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum Target {
-    IpPort(IpProto, u16, IpAddr),
-    NodePort(IpProto, u16),
+    IpPort(u16, IpAddr),
+    NodePort(u16),
 }
