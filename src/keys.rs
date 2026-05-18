@@ -1,5 +1,6 @@
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::cmp::Ordering;
+use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Obj {
@@ -27,6 +28,12 @@ impl Obj {
     }
     pub fn into_parent(self) -> ByParent {
         ByParent::Parent(self)
+    }
+}
+
+impl fmt::Display for Obj {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.ns, self.name)
     }
 }
 

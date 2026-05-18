@@ -1,5 +1,5 @@
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
-use std::collections::{hash_set, HashSet};
+use std::collections::{HashSet, hash_set};
 use std::net::IpAddr;
 
 pub fn parse_iter<'t>(ips: impl Iterator<Item = &'t String>) -> impl Iterator<Item = IpAddr> {

@@ -1,9 +1,10 @@
-use base64::prelude::{BASE64_STANDARD, Engine as _};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use cidr::{IpCidr, Ipv4Inet, Ipv6Inet};
 use eyre::format_err;
 use k8s_openapi::api::core::v1 as core;
+use kube::ResourceExt;
 use log::warn;
-use std::collections::BTreeMap as Map;
+use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::{IpAddr, SocketAddr};
 
 use super::Labelled;
@@ -14,6 +15,12 @@ pub const ANN_PUBKEY: &str = "kwg-pubkey";
 pub const ANN_NET: &str = "kwg-net";
 pub const ANN_ENDPOINT: &str = "kwg-endpoint";
 pub const ANN_ENDPOINT_FROM: &str = "kwg-endpoint-from/";
+
+/// ...=1.2.3.4,1:2:3::4
+pub const ANN_EXT_IP: &str = "knls.eu/external-ips";
+/// IPv4: .../1.2.3.4
+/// IPv6: .../1-2-3--4
+pub const LABEL_EXT_IP: &str = "external-ip.knls.eu/";
 
 pub const ZONE_LABEL: &str = "topology.kubernetes.io/zone";
 
@@ -43,6 +50,7 @@ pub struct Node {
     pub endpoint: Option<Endpoint>,
     pub endpoint_from: Option<Map<String, Endpoint>>,
     pub pod_cidrs: Vec<IpCidr>,
+    pub external_ips: Set<IpAddr>,
 }
 impl Node {
     pub fn new() -> Self {
@@ -86,7 +94,7 @@ impl memstore::KeyValueFrom<core::Node> for Node {
     }
 
     fn value_from(n: &core::Node) -> Option<Self> {
-        let anns = n.metadata.annotations.as_ref()?;
+        let anns = n.annotations();
         let spec = n.spec.as_ref()?;
 
         let topo_zone = n.get_zone().cloned().unwrap_or_else(default_zone);
@@ -97,6 +105,13 @@ impl memstore::KeyValueFrom<core::Node> for Node {
             .and_then(|addr| addr.address.parse().ok());
 
         let listen_port = anns.get(ANN_LISTEN_PORT).and_then(|p| p.parse().ok());
+
+        let ext_ip_from_ann = (anns.get(ANN_EXT_IP).into_iter())
+            .flat_map(|ann| ann.split(','))
+            .map(|s| s.trim_ascii().to_string());
+        let ext_ip_from_labels = (n.labels().keys())
+            .filter_map(|k| k.strip_prefix(LABEL_EXT_IP))
+            .map(|s| s.replace('-', ":")); // ':' is invalid in path, use & map '-'
 
         Some(Self {
             zone: anns.get(ANN_NET).cloned().unwrap_or(topo_zone),
@@ -122,9 +137,13 @@ impl memstore::KeyValueFrom<core::Node> for Node {
                     })
                     .collect(),
             ),
-            pod_cidrs: (spec.pod_cidrs.iter())
-                .flatten()
+            pod_cidrs: (spec.pod_cidrs.iter().flatten())
                 .filter_map(|cidr| cidr.parse().ok())
+                .collect(),
+
+            external_ips: ext_ip_from_ann
+                .chain(ext_ip_from_labels)
+                .filter_map(|ip| ip.trim_ascii().parse().ok())
                 .collect(),
         })
     }

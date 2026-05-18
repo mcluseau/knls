@@ -3,6 +3,7 @@ use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
 use eyre::{Result, format_err};
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1 as core;
+use kube::ResourceExt;
 use log::{debug, error, info, warn};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
@@ -13,16 +14,53 @@ use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::state::wireguard::{Key, Node, decode_key, encode_key};
-use crate::{actions, change, kube_watch::EventReceiver, patch_params};
+use crate::{
+    actions, change, keys, kube_watch::EventReceiver, memstore::KeyValueFrom, patch_params,
+};
 
 crate::multimap!(
     State{
         nodes: Node(core::Node) => Node,
+        pods: Pod(core::Pod) => Pod,
     }
 );
+
+#[derive(Clone, Debug)]
+struct Pod {
+    ips: Vec<IpAddr>,
+    external_ipv4: Option<IpAddr>,
+    external_ipv6: Option<IpAddr>,
+}
+impl KeyValueFrom<core::Pod> for Pod {
+    type Key = keys::Obj;
+    fn key_from(v: &core::Pod) -> Option<Self::Key> {
+        Some(keys::Obj::from(v))
+    }
+    fn value_from(v: &core::Pod) -> Option<Self> {
+        // TODO document labels
+        let ip = |label| v.labels().get(label).and_then(|ip| ip.parse().ok());
+        let external_ipv4 = ip("knls.eu/external-ipv4");
+        let external_ipv6 = ip("knls.eu/external-ipv6");
+
+        if external_ipv4.is_none() && external_ipv6.is_none() {
+            return None;
+        }
+
+        let ips = (v.status.as_ref()?.pod_ips.as_ref()?.iter())
+            .filter_map(|ip| ip.ip.parse().ok())
+            .collect();
+
+        Some(Pod {
+            ips,
+            external_ipv4,
+            external_ipv6,
+        })
+    }
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -75,10 +113,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
     let link = {
         let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
-        links
-            .try_next()
-            .await?
-            .expect("at least one link should exist")
+        links.try_next().await?.expect("interface should exist")
     };
     let link_id = link.header.index;
 
@@ -286,6 +321,64 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             }
         }
         routes.update_done();
+
+        // handle pods with external IP
+        {
+            let my_ext_ips = &my_node.external_ips;
+
+            let mut chain = String::new();
+            chain.push_str("chain inet knls wireguard-external-ips {}\n");
+            chain.push_str("flush chain inet knls wireguard-external-ips\n");
+            chain.push_str("chain inet knls wireguard-external-ips {\n");
+            chain.push_str("  type nat hook postrouting priority srcnat; policy accept;\n");
+            for (k, pod) in state.pods.iter() {
+                if let Some(ref v4) = pod.external_ipv4
+                    && my_ext_ips.contains(v4)
+                {
+                    let ips = (pod.ips.iter())
+                        .filter(|ip| ip.is_ipv4())
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    chain.push_str(&format!(
+                        "  ip saddr {{{ips}}} snat to {v4} comment \"{k}\"\n"
+                    ));
+                }
+                if let Some(ref v6) = pod.external_ipv6
+                    && my_ext_ips.contains(v6)
+                {
+                    let ips = pod
+                        .ips
+                        .iter()
+                        .filter(|ip| ip.is_ipv6())
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    chain.push_str(&format!(
+                        "  ip6 saddr {{{ips}}} snat to {v6} comment {k:?}\n"
+                    ));
+                }
+            }
+            chain.push_str("}\n");
+
+            // FIXME duplicate of duplicate...
+            let mut nft = tokio::process::Command::new("nft")
+                .args(["-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+
+            let stdin = nft.stdin.as_mut().expect("stdin must exist");
+            stdin.write_all(chain.as_bytes()).await?;
+
+            let status = nft.wait().await?;
+            if !status.success() {
+                error!("nft failed");
+                for (i, line) in chain.lines().enumerate() {
+                    eprintln!("  {:3}: {line}", i + 1);
+                }
+                continue;
+            }
+        }
     }
 }
 
