@@ -1,0 +1,8 @@
+#! /bin/sh
+
+: ${tag:=$(git describe --abbrev=0)}
+v=${tag#v}
+
+sed -i -e "/^  tag:/s/: .*/: $tag/" helm/values.yaml
+sed -i -e '/^\(version\|appVersion\):/s/: .*/: "'"$v"'"/' helm/Chart.yaml
+
