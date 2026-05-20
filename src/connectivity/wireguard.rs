@@ -108,6 +108,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let (conn, rtnl, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
+    info!("creating interface {ifname}");
     netlink::create_interface(&ifname)?;
     actions::run_event(module_path!(), "on_create", &cfg.on_create).await?;
 
@@ -125,7 +126,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let private_key = get_private_key(&key_path).await?;
     let pubkey: PublicKey = (&StaticSecret::from(private_key)).into();
 
-    // load existing peers
+    info!("loading existing peers");
     let mut current_listen_port;
     let mut current_pubkey;
     let mut peers = change::Tracker::new();
@@ -149,7 +150,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         peers.update_done();
     }
 
-    // load existing routes
+    info!("loading existing routes");
     let mut routes = change::Tracker::new();
 
     let oif_routes = OifRoutes {
@@ -169,9 +170,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
     // start watch
     let mut warned_about_pubkey = false;
-
     let mut prev_cni_config = None;
-
     let mut state = State::new();
 
     loop {
@@ -328,8 +327,9 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
             let mut chain = String::new();
             chain.push_str("chain inet knls wireguard-external-ips {}\n");
-            chain.push_str("flush chain inet knls wireguard-external-ips\n");
+            chain.push_str("delete chain inet knls wireguard-external-ips\n");
             chain.push_str("chain inet knls wireguard-external-ips {\n");
+            // priority 100 = srcnat
             chain.push_str("  type nat hook postrouting priority srcnat; policy accept;\n");
             for (k, pod) in state.pods.iter() {
                 if let Some(ref v4) = pod.external_ipv4

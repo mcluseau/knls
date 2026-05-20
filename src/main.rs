@@ -78,6 +78,7 @@ async fn main() -> eyre::Result<()> {
     let config = tokio::fs::read(&cli.config)
         .await
         .map_err(|e| format_err!("read config failed: {}: {e}", cli.config))?;
+
     let config: Config =
         serde_yaml::from_slice(&config).map_err(|e| format_err!("parse config failed: {e}"))?;
 
@@ -210,8 +211,9 @@ impl<'t> Services<'t> {
         self.targets.push(tx);
 
         let task_name = format!("{service_name}:{flavor}");
-        let task = service.watch(self.ctx.clone(), rx);
 
-        self.tasks.spawn(async move { (task_name, task.await) });
+        let ctx = self.ctx.clone();
+        self.tasks
+            .spawn(async move { (task_name, service.watch(ctx, rx).await) });
     }
 }

@@ -74,7 +74,7 @@ impl<F, T> Value<F, T> {
     }
 
     pub fn ingest(&mut self, event: &Event<F>) {
-        // single values are not sensitive to Init/InitDone: one received, they are ready
+        // single values are not sensitive to Init/InitDone: once received, they are ready
         use Event::*;
         match event {
             Init | Delete(_) => self.value = None,

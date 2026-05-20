@@ -94,6 +94,18 @@ impl Config {
                 tx.clone(),
                 Event::Pod,
             ));
+        } else {
+            // no netpols, watch only my node's pods
+            let wc = watcher::Config {
+                field_selector: Some(format!("spec.nodeName={}", self.node_name)),
+                ..self.watcher_config.clone()
+            };
+            tokio::spawn(watch_to_events(
+                Api::all(self.client.clone()),
+                wc,
+                tx.clone(),
+                Event::Pod,
+            ));
         }
     }
 }
