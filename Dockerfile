@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------
-from rust:1.95.0-alpine3.23 as build
+from rust:1.97.1-alpine3.24 as build
 
-run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git
+run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git libmnl-dev libnftnl-dev
 
 workdir /app
 copy . .
@@ -11,7 +11,7 @@ run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry 
   cargo install --locked --path . --root /dist
 
 # ------------------------------------------------------------------------
-from alpine:3.23.4
+from alpine:3.24.1
 entrypoint ["knls"]
 run apk add --no-cache nftables wireguard-tools conntrack-tools
 copy --from=build /dist/bin/ /bin/

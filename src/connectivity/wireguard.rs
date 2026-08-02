@@ -1,15 +1,16 @@
 use cidr::{IpCidr, IpInet};
 use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
-use eyre::{Result, format_err};
+use eyre::{Result, eyre, format_err};
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1 as core;
 use kube::ResourceExt;
 use log::{debug, error, info, warn};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
-    link::LinkAttribute::Mtu,
+    link::{LinkAttribute::Mtu, LinkMessage},
     route::RouteHeader,
 };
+use nix::errno::Errno;
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::state::wireguard::{Key, Node, decode_key, encode_key};
+use crate::rtnl_exts::ErrorExt;
 use crate::{
     actions, change, keys, kube_watch::EventReceiver, memstore::KeyValueFrom, patch_params,
 };
@@ -63,36 +65,87 @@ impl KeyValueFrom<core::Pod> for Pod {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Config {
     /// Activate node connectivity through wireguard using this interface
-    #[serde(default = "defaults::ifname")]
     ifname: String,
-
     /// Wireguard private key file (will be created as needed).
-    #[serde(default = "defaults::key_path")]
     key_path: String,
-
     /// CNI config path
-    #[serde(default = "defaults::cni_config")]
     cni_config: String,
-
-    #[serde(default)]
+    /// Action to run when the link is created (ie: nft rules with iif/oif matches)
     on_create: Vec<crate::actions::Action>,
-
-    #[serde(default)]
+    /// Manually defined node (intended for testing)
     manual_node: Option<Node>,
+    /// Link MTU to set
+    mtu: Option<u16>,
 }
 
-mod defaults {
-    pub fn ifname() -> String {
-        "kwg".into()
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ifname: "kwg".into(),
+            key_path: "/var/lib/knls/wireguard.key".into(),
+            cni_config: "/etc/cni/net.d/10-knls.conf".into(),
+            on_create: Vec::new(),
+            manual_node: None,
+            mtu: None,
+        }
     }
-    pub fn key_path() -> String {
-        "/var/lib/knls/wireguard.key".into()
+}
+
+async fn setup_link(
+    rtnl: &rtnetlink::Handle,
+    ifname: &str,
+    mtu: Option<u16>,
+) -> Result<LinkMessage> {
+    use rtnetlink::LinkWireguard;
+
+    let link = if let Some(link) = get_link(rtnl, ifname).await? {
+        info!("link {ifname} exists");
+        link
+    } else {
+        info!("creating link {ifname}");
+        let mut builder = LinkWireguard::new(ifname);
+        if let Some(mtu) = mtu {
+            builder = builder.mtu(mtu.into());
+        }
+        rtnl.link().add(builder.up().build()).execute().await?;
+
+        get_link(rtnl, ifname)
+            .await?
+            .expect("link {ifname} should exist")
+    };
+
+    if let Some(mtu) = mtu && link_mtu(&link) != Some(mtu) {
+        info!("updating link {ifname} mtu to {mtu}");
+        netlink::set_mtu(ifname, mtu.into())?;
     }
-    pub fn cni_config() -> String {
-        "/etc/cni/net.d/10-knls.conf".into()
+
+    Ok(link)
+}
+
+async fn get_link(
+    rtnl: &rtnetlink::Handle,
+    ifname: impl Into<String>,
+) -> Result<Option<LinkMessage>> {
+    let ifname = ifname.into();
+    let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
+    match links.try_next().await {
+        Ok(link) => Ok(link),
+        Err(e) if e.is_errno(Errno::ENODEV) => {
+            Ok(None)
+        }
+        Err(e) => Err(eyre!("ip link get failed: {e}")),
     }
+}
+
+fn link_mtu(link: &LinkMessage) -> Option<u16> {
+ (link.attributes.iter())
+                .find_map(|attr| match attr {
+                    Mtu(mtu) => Some(*mtu as u16),
+                    _ => None,
+                })
 }
 
 pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
@@ -108,15 +161,10 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let (conn, rtnl, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
-    info!("creating interface {ifname}");
-    netlink::create_interface(&ifname)?;
-    actions::run_event(module_path!(), "on_create", &cfg.on_create).await?;
-
-    let link = {
-        let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
-        links.try_next().await?.expect("interface should exist")
-    };
+    let link = setup_link(&rtnl, &ifname, cfg.mtu).await?;
     let link_id = link.header.index;
+
+    actions::run_event(module_path!(), "on_create", &cfg.on_create).await?;
 
     let if_addrs = IfAddrs {
         id: link_id,

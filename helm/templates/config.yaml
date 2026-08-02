@@ -32,6 +32,9 @@ data:
     connectivity: !{{.Values.connectivity}}
 {{-   if eq .Values.connectivity "wireguard" }}{{ with .Values.wireguard}}
       ifname: {{.ifname |quote}}
+{{-     with .mtu}}
+      mtu: {{.}}
+{{-     end}}
       key_path: "/var/lib/knls/wireguard/{{.key}}"
       on_create:
       - !nft_chain

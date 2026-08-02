@@ -9,6 +9,7 @@ pub mod kube_watch;
 pub mod memstore;
 pub mod netpol;
 pub mod proxy;
+mod rtnl_exts;
 pub mod state;
 pub mod store;
 
