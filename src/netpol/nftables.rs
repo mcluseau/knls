@@ -18,7 +18,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use xxhash_rust::xxh3;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     /// nftables table's name
     #[serde(default = "default_table")]

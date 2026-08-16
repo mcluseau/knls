@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     /// nftables table's name
     #[serde(default = "default_table")]

@@ -7,7 +7,7 @@ use crate::patch_params;
 
 const LABEL_VALUE: &str = "present";
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HwLabels {
     #[serde(default)]
     disk_wwid: bool,

@@ -1,0 +1,96 @@
+- name: simple
+  cfg:
+    ipsets:
+      allowlist: !ips
+      - 192.168.42.84
+      - 10.0.0.0/8
+      - fd00::/8
+    chains:
+      filter_input: |
+        type filter hook input priority filter; policy drop;
+        ct state { established, related } accept;
+        ip  saddr @allowlist_ipv4 accept;
+        ip6 saddr @allowlist_ipv6 accept;
+        reject;
+  expect: |
+    table inet knls-firewall {}
+    delete table inet knls-firewall
+    table inet knls-firewall {}
+    set inet knls-firewall allowlist_ipv4 {
+      type ipv4_addr; flags interval; elements = {
+    192.168.42.84, 10.0.0.0/8
+      }
+    }
+    set inet knls-firewall allowlist_ipv6 {
+      type ipv6_addr; flags interval; elements = {
+    fd00::/8
+      }
+    }
+    table inet knls-firewall {
+      chain filter_input {
+    type filter hook input priority filter; policy drop;
+    ct state { established, related } accept;
+    ip  saddr @allowlist_ipv4 accept;
+    ip6 saddr @allowlist_ipv6 accept;
+    reject;
+      }
+    }
+
+- name: ips_and_country
+  cfg:
+    ipsets:
+      allowlist: !ips
+      - 192.168.42.84
+      - 10.0.0.0/8
+      - fd00::/8
+      country: !country "GD"
+    chains:
+      filter_input: |
+        type filter hook input priority filter; policy drop;
+        ct state { established, related } accept;
+        ip  saddr @allowlist_ipv4 accept;
+        ip6 saddr @allowlist_ipv6 accept;
+        ip  saddr @country_ipv4 accept;
+        ip6 saddr @country_ipv6 accept;
+        reject;
+  expect: |
+    table inet knls-firewall {}
+    delete table inet knls-firewall
+    table inet knls-firewall {}
+    set inet knls-firewall allowlist_ipv4 {
+      type ipv4_addr; flags interval; elements = {
+    192.168.42.84, 10.0.0.0/8
+      }
+    }
+    set inet knls-firewall allowlist_ipv6 {
+      type ipv6_addr; flags interval; elements = {
+    fd00::/8
+      }
+    }
+    set inet knls-firewall country_ipv4 {
+      type ipv4_addr; flags interval
+    }
+    set inet knls-firewall country_ipv6 {
+      type ipv6_addr; flags interval
+    }
+    table inet knls-firewall {
+      chain filter_input {
+    type filter hook input priority filter; policy drop;
+    ct state { established, related } accept;
+    ip  saddr @allowlist_ipv4 accept;
+    ip6 saddr @allowlist_ipv6 accept;
+    ip  saddr @country_ipv4 accept;
+    ip6 saddr @country_ipv6 accept;
+    reject;
+      }
+    }
+    set inet knls-firewall country_ipv4 {
+      type ipv4_addr; flags interval; elements = {
+    5.62.58.96/30, 23.128.4.0/24, 23.130.168.0/24
+      }
+    }
+    set inet knls-firewall country_ipv6 {
+      type ipv6_addr; flags interval; elements = {
+    2001:470:36:d0::/64, 2001:470:1f1b:423::/64, 2001:470:1f29:3dd::/64
+      }
+    }

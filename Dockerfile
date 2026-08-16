@@ -11,8 +11,17 @@ run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry 
   cargo install --locked --path . --root /dist
 
 # ------------------------------------------------------------------------
+from alpine:3.24.1 as assets
+run apk add --no-cache zstd
+workdir /assets
+
+copy country_ips.db.zst /
+run unzstd -o country_ips.db /country_ips.db.zst
+
+# ------------------------------------------------------------------------
 from alpine:3.24.1
 entrypoint ["knls"]
 run apk add --no-cache nftables wireguard-tools conntrack-tools
+copy --from=assets /assets/ /assets/
 copy --from=build /dist/bin/ /bin/
 

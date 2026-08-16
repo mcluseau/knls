@@ -1,12 +1,12 @@
 use clap::{Parser, ValueEnum};
-use eyre::format_err;
-use kube::{Client, runtime::watcher};
+use eyre::eyre;
+use kube::{runtime::watcher, Client};
 use log::{error, info};
 use std::process::exit;
 use std::sync::Arc;
 use tokio::{
     select,
-    signal::unix::{SignalKind, signal},
+    signal::unix::{signal, SignalKind},
     sync::mpsc,
 };
 
@@ -18,13 +18,6 @@ pub mod config;
 #[derive(Parser)]
 #[command(version, about, long_about = ABOUT)]
 struct Cli {
-    /// log filters (see https://docs.rs/env_logger/latest/env_logger/index.html#enabling-logging)
-    #[arg(long, default_value = "info", env = "KNLS_LOG")]
-    log: String,
-    /// log style (see https://docs.rs/env_logger/latest/env_logger/index.html#disabling-colors)
-    #[arg(long, default_value = "auto", env = "KNLS_LOG_STYLE")]
-    log_style: String,
-
     /// my node name (hint: {valueFrom: {fieldRef: { fieldPath: spec.nodeName }}})
     #[arg(
         long,
@@ -69,22 +62,22 @@ async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
     env_logger::builder()
-        .parse_filters(cli.log.as_str())
-        .parse_write_style(cli.log_style.as_str())
+        .parse_filters("info")
+        .parse_default_env()
         .format_timestamp_millis()
         .init();
 
     use config::*;
     let config = tokio::fs::read(&cli.config)
         .await
-        .map_err(|e| format_err!("read config failed: {}: {e}", cli.config))?;
+        .map_err(|e| eyre!("read config failed: {}: {e}", cli.config))?;
 
     let config: Config =
-        serde_yaml::from_slice(&config).map_err(|e| format_err!("parse config failed: {e}"))?;
+        serde_yaml::from_slice(&config).map_err(|e| eyre!("parse config failed: {e}"))?;
 
     let cluster_url = config
         .cluster_url()
-        .map_err(|e| format_err!("invalid cluster_url: {e}"))?;
+        .map_err(|e| eyre!("invalid cluster_url: {e}"))?;
 
     if cli.test_config {
         return Ok(());
@@ -115,6 +108,15 @@ async fn main() -> eyre::Result<()> {
     }
 
     info!("kubernetes cluster at {}", kube_cfg.cluster_url);
+
+    if !config.firewall.is_empty() {
+        info!("applying firewall rules");
+
+        let mut steps_rx = config.firewall.nft_steps().await?;
+        while let Some(step) = steps_rx.recv().await {
+            knls::nftables::apply_script(step).await?;
+        }
+    }
 
     let kube: Client = kube_cfg.try_into()?;
     let watcher_config = watcher::Config::default();

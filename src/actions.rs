@@ -1,7 +1,7 @@
-use log::{debug, info};
-use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
+use log::info;
 use tokio::process::Command;
+
+use crate::nftables;
 
 pub async fn run_event(target: &str, event: &str, actions: &[Action]) -> eyre::Result<()> {
     if actions.is_empty() {
@@ -22,7 +22,7 @@ pub async fn run(actions: &[Action]) -> std::result::Result<(), (usize, Error)> 
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Actions(Vec<Action>),
@@ -55,7 +55,9 @@ impl Action {
                 }
             }
             A::Nft(script) => {
-                exec_nft(script.clone()).await?;
+                nftables::apply_script(script)
+                    .await
+                    .map_err(Error::NftFailed)?;
             }
             A::NftChain {
                 table,
@@ -74,7 +76,9 @@ table inet {table} {{
 }}
                 "#
                 );
-                exec_nft(script).await?;
+                nftables::apply_script(script)
+                    .await
+                    .map_err(Error::NftFailed)?;
             }
         }
         Ok(())
@@ -92,28 +96,5 @@ pub enum Error {
     #[error("exec: exit code {0}")]
     ExecCommandFailed(i32),
     #[error("nft failed: {0}")]
-    NftFailed(std::io::Error),
-    #[error("nft: exit code {0}")]
-    NftCommandFailed(i32),
-}
-
-async fn exec_nft(script: String) -> Result {
-    debug!("nft script:\n{script}");
-
-    let mut cmd = Command::new("nft");
-    cmd.args(["-f", "-"]);
-    cmd.stdin(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(Error::NftFailed)?;
-
-    let mut nft_in = child.stdin.take().expect("stdin should exist");
-
-    tokio::spawn(async move { nft_in.write_all(script.as_bytes()).await });
-
-    let s = child.wait().await.map_err(Error::NftFailed)?;
-    if !s.success() {
-        return Err(Error::NftCommandFailed(s.code().unwrap_or(0)));
-    }
-
-    Ok(())
+    NftFailed(nftables::Error),
 }

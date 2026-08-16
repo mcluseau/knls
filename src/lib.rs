@@ -2,12 +2,15 @@ pub mod actions;
 pub mod change;
 pub mod connectivity;
 pub mod dns;
+pub mod firewall;
+pub mod geoip;
 pub mod hw_labels;
 pub mod ips;
 pub mod keys;
 pub mod kube_watch;
 pub mod memstore;
 pub mod netpol;
+pub mod nftables;
 pub mod proxy;
 mod rtnl_exts;
 pub mod state;
@@ -62,7 +65,7 @@ pub fn patch_params() -> PatchParams {
 #[macro_export]
 macro_rules! service {
     ($name:literal $type:ident { $( $flavor:literal $var:ident: $cfg:ty => $impl:expr , )+ }) => {
-        #[derive(Debug, serde::Deserialize, serde::Serialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
         pub enum $type {
             $(
             #[serde(rename = $flavor)]

@@ -18,8 +18,8 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::state::wireguard::{Key, Node, decode_key, encode_key};
 use crate::rtnl_exts::ErrorExt;
+use crate::state::wireguard::{Key, Node, decode_key, encode_key};
 use crate::{
     actions, change, keys, kube_watch::EventReceiver, memstore::KeyValueFrom, patch_params,
 };
@@ -64,7 +64,7 @@ impl KeyValueFrom<core::Pod> for Pod {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Activate node connectivity through wireguard using this interface
@@ -117,7 +117,9 @@ async fn setup_link(
             .expect("link {ifname} should exist")
     };
 
-    if let Some(mtu) = mtu && link_mtu(&link) != Some(mtu) {
+    if let Some(mtu) = mtu
+        && link_mtu(&link) != Some(mtu)
+    {
         info!("updating link {ifname} mtu to {mtu}");
         netlink::set_mtu(ifname, mtu.into())?;
     }
@@ -133,19 +135,16 @@ async fn get_link(
     let mut links = rtnl.link().get().match_name(ifname.clone()).execute();
     match links.try_next().await {
         Ok(link) => Ok(link),
-        Err(e) if e.is_errno(Errno::ENODEV) => {
-            Ok(None)
-        }
+        Err(e) if e.is_errno(Errno::ENODEV) => Ok(None),
         Err(e) => Err(eyre!("ip link get failed: {e}")),
     }
 }
 
 fn link_mtu(link: &LinkMessage) -> Option<u16> {
- (link.attributes.iter())
-                .find_map(|attr| match attr {
-                    Mtu(mtu) => Some(*mtu as u16),
-                    _ => None,
-                })
+    (link.attributes.iter()).find_map(|attr| match attr {
+        Mtu(mtu) => Some(*mtu as u16),
+        _ => None,
+    })
 }
 
 pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {

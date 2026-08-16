@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use crate::dns::{self, data, packet};
 use crate::{actions, kube_watch::EventReceiver, state::State};
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     cluster_domain: String,
     #[serde(default = "default_bind")]

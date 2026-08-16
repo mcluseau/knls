@@ -1,7 +1,8 @@
 use eyre::Result;
 use std::sync::Arc;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Config {
     /// Namespace to watch instead of the whole cluster.
     pub namespace: Option<String>,
@@ -13,8 +14,10 @@ pub struct Config {
     #[serde(default = "default_event_buffer")]
     pub event_buffer: usize,
 
-    #[serde(default)]
     pub on_start: Vec<knls::actions::Action>,
+
+    /// Firewall (nftables only)
+    pub firewall: knls::firewall::Firewall,
 
     /// Proxy service, responsible for handling v1/Service semantics on the node.
     pub proxy: Option<Proxy>,
@@ -62,3 +65,15 @@ knls::service!("dns" DNS {
 knls::service!("network policy" NetworkPolicy {
     "nftables" Nftables: netpol::nftables::Config => netpol::nftables::watch,
 });
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg: Config = serde_json::from_str("{}").expect("should parse empty object");
+
+        assert_eq!(cfg.event_buffer, default_event_buffer());
+    }
+}
