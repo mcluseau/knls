@@ -1,7 +1,7 @@
 
 image:
   repo: docker.io/mcluseau/knls
-  tag: v0.4.1
+  #tag: my-custom-tag
 
 hostNetwork: true
 nodeSelector: null
@@ -9,7 +9,7 @@ nodeSelector: null
 #extra_conf: |-
 #  on_start: ...
 #
-# a common requirement would be to masq pods' outgoing traffic; pod are usually connected with veth:
+# a common requirement would be to masq pods' outgoing traffic; pods are usually connected with veth:
 #  on_start:
 #  - !nft_chain
 #    table: knls

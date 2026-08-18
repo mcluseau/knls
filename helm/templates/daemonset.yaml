@@ -53,8 +53,10 @@ spec:
       - name: knls
         args:
         - --config=/config/knls.yaml
-        image: {{.Values.image.repo}}:{{.Values.image.tag}}
-        imagePullPolicy: {{ default "IfNotPresent" .Values.pullPolicy }}
+        image: {{.Values.image.repo}}:{{ default (printf "v%s" .Chart.AppVersion) .Values.image.tag }}
+{{- with .Values.pullPolicy }}
+        imagePullPolicy: {{ . }}
+{{- end }}
         securityContext:
           readOnlyRootFilesystem: true
           capabilities:
