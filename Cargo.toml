@@ -13,6 +13,7 @@ panic = "abort"
 unwrap_used = "deny"
 
 [dependencies]
+base32 = "0.5.1"
 base64 = "0.22.1"
 cidr = { version = "0.3.1", features = ["serde"] }
 clap = { version = "4.5.16", features = ["derive", "env"] }

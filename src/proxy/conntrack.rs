@@ -1,5 +1,5 @@
-use conntrack::{Conntrack, model::IpProto};
-use eyre::{Result, format_err};
+use conntrack::{model::IpProto, Conntrack};
+use eyre::{format_err, Result};
 use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, warn};
 use std::collections::BTreeSet;
@@ -61,11 +61,10 @@ pub async fn cleanup(state: &State) -> Result<()> {
             Err(e) => error!("conntrack command failed: {e}"),
             Ok(out) => {
                 if !out.status.success() {
-                    warn!(
-                        "conntrack -D failed, {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr)
-                    )
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stderr.contains(" 0 flow entries have been deleted") {
+                        warn!("conntrack -D failed, {}: {}", out.status, stderr)
+                    }
                 }
             }
         }

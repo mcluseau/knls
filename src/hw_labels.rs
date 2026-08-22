@@ -1,9 +1,13 @@
 use log::{error, warn};
-use std::collections::BTreeSet as Set;
+use std::collections::BTreeMap as Map;
 use std::sync::Arc;
 use tokio::{fs, time};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::patch_params;
+
+#[cfg(test)]
+mod test;
 
 const LABEL_VALUE: &str = "present";
 
@@ -45,6 +49,14 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: HwLabels) -> eyre::Result<()> 
 }
 
 fn hw_label(kind: &str, id: &str) -> String {
+    let id = if id.len() <= 63 {
+        id.to_string()
+    } else {
+        // id too long for a kube name segment
+        let h = xxh3_64(id.as_bytes()).to_le_bytes();
+        let suffix = base32::encode(base32::Alphabet::Z, &h);
+        format!("{}-{}", &id[..63 - 1 - 7], &suffix[..7])
+    };
     format!("{kind}.hw.knls.eu/{id}")
 }
 
@@ -52,7 +64,10 @@ fn is_hw_label(label: &str) -> bool {
     label.contains(".hw.knls.eu/")
 }
 
-async fn update_node(ctx: &Arc<crate::Context>, labels: &Set<String>) -> eyre::Result<()> {
+async fn update_node(
+    ctx: &Arc<crate::Context>,
+    labels: &Map<String, BlockInfo>,
+) -> eyre::Result<()> {
     use k8s_openapi::api::core::v1::Node;
     use kube::api::Patch;
     use kube::core::PartialObjectMetaExt;
@@ -62,15 +77,16 @@ async fn update_node(ctx: &Arc<crate::Context>, labels: &Set<String>) -> eyre::R
 
     let mut node = nodes.get_metadata(name).await?.metadata;
 
-    let mut node_labels = node.labels.unwrap_or_default();
+    let node_labels = node.labels.get_or_insert_default();
+    let node_annotations = node.annotations.get_or_insert_default();
 
     node_labels.retain(|k, _| !is_hw_label(k));
+    node_annotations.retain(|k, _| !is_hw_label(k));
 
-    for label in labels {
+    for (label, info) in labels {
         node_labels.insert(label.clone(), LABEL_VALUE.into());
+        node_annotations.insert(label.clone(), format!("{} {}", info.size, info.id));
     }
-
-    node.labels = Some(node_labels);
 
     node.managed_fields = None;
     let patch = Patch::Apply(node.into_request_partial::<Node>());
@@ -80,19 +96,33 @@ async fn update_node(ctx: &Arc<crate::Context>, labels: &Set<String>) -> eyre::R
     Ok(())
 }
 
-async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Set<String>> {
-    let mut labels = Set::new();
-    let mut add = |kind, id: &str| {
-        labels.insert(hw_label(kind, id));
+#[derive(PartialEq, Eq)]
+struct BlockInfo {
+    id: String,
+    size: String,
+}
+
+async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Map<String, BlockInfo>> {
+    let mut labels = Map::new();
+    let mut add = |kind, id: &str, size: u64| {
+        let info = BlockInfo {
+            id: id.into(),
+            size: human_size(size),
+        };
+        labels.insert(hw_label(kind, id), info);
     };
 
     let mut dir = fs::read_dir("/sys/class/block").await?;
     while let Some(sys_dir) = dir.next_entry().await? {
+        let size = (read_sub(&sys_dir, "size").await.ok().and_then(|s| s))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
         if cfg.disk_wwid {
             if let Some(wwid) = read_sub(&sys_dir, "wwid").await? {
-                add("disk-wwid", wwid.trim_ascii());
+                add("disk-wwid", wwid.trim_ascii(), size);
             } else if let Some(wwid) = read_sub(&sys_dir, "device/wwid").await? {
-                add("disk-wwid", wwid.trim_ascii());
+                add("disk-wwid", wwid.trim_ascii(), size);
             }
         }
 
@@ -110,7 +140,7 @@ async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Set<String>> {
                     continue;
                 };
 
-                add("part-uuid", partuuid);
+                add("part-uuid", partuuid, size);
             }
         }
     }
@@ -142,4 +172,19 @@ async fn read_sub(dir: &fs::DirEntry, file: &str) -> std::io::Result<Option<Stri
             },
         },
     }
+}
+
+fn human_size(s: u64) -> String {
+    for (unit, div) in [
+        ("Ti", 1 << 40),
+        ("Gi", 1 << 30),
+        ("Mi", 1 << 20),
+        ("Ki", 1 << 10),
+    ] {
+        let s = s / div;
+        if s >= 100 {
+            return format!("{s}{unit}");
+        }
+    }
+    s.to_string()
 }
