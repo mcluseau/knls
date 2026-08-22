@@ -114,11 +114,9 @@ async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Map<String, BlockInfo>>
 
     let mut dir = fs::read_dir("/sys/class/block").await?;
     while let Some(sys_dir) = dir.next_entry().await? {
-        let size = (read_sub(&sys_dir, "size").await.ok().and_then(|s| s))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-
         if cfg.disk_wwid {
+            let size = read_size(&sys_dir).await;
+
             if let Some(wwid) = read_sub(&sys_dir, "wwid").await? {
                 add("disk-wwid", wwid.trim_ascii(), size);
             } else if let Some(wwid) = read_sub(&sys_dir, "device/wwid").await? {
@@ -140,12 +138,20 @@ async fn my_hw_labels(cfg: &HwLabels) -> std::io::Result<Map<String, BlockInfo>>
                     continue;
                 };
 
+                let size = read_size(&sub_dir).await;
                 add("part-uuid", partuuid, size);
             }
         }
     }
 
     Ok(labels)
+}
+
+async fn read_size(dir: &fs::DirEntry) -> u64 {
+    (read_sub(dir, "size").await.ok().and_then(|s| s))
+        .and_then(|s| s.trim_ascii().parse::<u64>().ok())
+        .unwrap_or(0)
+        * 512
 }
 
 async fn read_sub(dir: &fs::DirEntry, file: &str) -> std::io::Result<Option<String>> {
