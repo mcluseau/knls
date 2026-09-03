@@ -13,9 +13,12 @@ run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry 
 # ------------------------------------------------------------------------
 from alpine:3.24.1 as assets
 run apk add --no-cache zstd
-workdir /assets
 
-copy country_ips.db.zst /
+run wget https://downloads.pingoo.io/geoip.mmdb.zst
+copy --from=build /dist/bin/index-geoip .
+run ./index-geoip
+
+workdir /assets
 run unzstd -o country_ips.db /country_ips.db.zst
 
 # ------------------------------------------------------------------------
