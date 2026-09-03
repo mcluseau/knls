@@ -378,7 +378,10 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             chain.push_str("chain inet knls wireguard-external-ips {\n");
             // priority 100 = srcnat
             chain.push_str("  type nat hook postrouting priority srcnat; policy accept;\n");
+            chain.push_str(&format!("  oif {ifname} return;\n"));
             for (k, pod) in state.pods.iter() {
+                let comment = format!("comment \"{k}\"");
+
                 if let Some(ref v4) = pod.external_ipv4
                     && my_ext_ips.contains(v4)
                 {
@@ -388,7 +391,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                         .collect::<Vec<_>>()
                         .join(",");
                     chain.push_str(&format!(
-                        "  ip saddr {{{ips}}} snat to {v4} comment \"{k}\"\n"
+                        "  ip saddr {{{ips}}} snat to {v4} {comment}\n"
                     ));
                 }
                 if let Some(ref v6) = pod.external_ipv6
@@ -402,7 +405,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                         .collect::<Vec<_>>()
                         .join(",");
                     chain.push_str(&format!(
-                        "  ip6 saddr {{{ips}}} snat to {v6} comment {k:?}\n"
+                        "  ip6 saddr {{{ips}}} snat to {v6} {comment}\n"
                     ));
                 }
             }
