@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::IpAddr;
 
-use crate::state::{LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget, keys};
+use crate::state::{keys, LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget};
 
 pub type State = Map<keys::Object, Service>;
 
@@ -17,12 +17,12 @@ pub fn from_state(state: &super::State, disable_nodeports: bool) -> Option<State
             continue;
         };
 
-        let internal_slices = state.slices(key, svc.internal_traffic.is_local()).collect();
+        let internal_slices = state.slices(key, svc.internal_traffic.is_local());
 
         let external_slices = if !svc.external_ips.is_empty()
             && svc.internal_traffic.is_local() != svc.external_traffic.is_local()
         {
-            Some(state.slices(key, svc.external_traffic.is_local()).collect())
+            Some(state.slices(key, svc.external_traffic.is_local()))
         } else {
             None // same as internal_endpoints
         };

@@ -44,47 +44,54 @@ impl State {
         &'a self,
         service_key: &'a keys::Object,
         local: bool,
-    ) -> Box<dyn Iterator<Item = LocalEndpointSlice> + 'a> {
-        if local {
+    ) -> Vec<LocalEndpointSlice> {
+        let mut slices = if local {
             self.local_slices(service_key)
         } else {
             self.zoned_slices(service_key)
+        };
+
+        // apply KEP-1672 ready vs serving rule
+        if slices.iter().any(|s| s.endpoints.iter().any(|ep| ep.ready)) {
+            // there a ready endpoint somewhere
+            for s in slices.iter_mut() {
+                s.endpoints.retain(|ep| ep.ready);
+            }
+        } else {
+            // no ready endpoint
+            for s in slices.iter_mut() {
+                s.endpoints.retain(|ep| ep.serving);
+            }
         }
+
+        slices.retain(|s| !s.endpoints.is_empty());
+        slices
     }
 
-    fn local_slices<'a>(
-        &'a self,
-        service_key: &'a keys::Object,
-    ) -> Box<dyn Iterator<Item = LocalEndpointSlice> + 'a> {
-        // couldn't use impl in fn endpoints
-        //) -> impl Iterator<Item = &'a Endpoint> {
-        Box::new(self.service_slices(service_key).filter_map(|slice| {
-            LocalEndpointSlice::from_slice(slice, &self.node_name, |ep| {
-                ep.is_local(&self.node_name)
+    fn local_slices<'a>(&'a self, service_key: &'a keys::Object) -> Vec<LocalEndpointSlice> {
+        self.service_slices(service_key)
+            .filter_map(|slice| {
+                LocalEndpointSlice::from_slice(slice, &self.node_name, |ep| {
+                    ep.is_local(&self.node_name)
+                })
             })
-        }))
+            .collect()
     }
 
-    fn zoned_slices<'a>(
-        &'a self,
-        service_key: &'a keys::Object,
-    ) -> Box<dyn Iterator<Item = LocalEndpointSlice> + 'a> {
-        // couldn't use impl in fn endpoints
-        //) -> impl Iterator<Item = &'a Endpoint> {
-        let my_node = self.my_node.get();
-        let has_node = my_node.is_some();
-        let zone = my_node.and_then(|n| n.zone.as_ref());
+    fn zoned_slices<'a>(&'a self, service_key: &'a keys::Object) -> Vec<LocalEndpointSlice> {
+        let Some(my_node) = self.my_node.get() else {
+            return vec![];
+        };
+        let zone = my_node.zone.as_ref();
 
-        let iter = self
-            .service_slices(service_key)
-            .take_while(move |_| has_node)
+        self.service_slices(service_key)
             .filter_map(move |slice| {
                 LocalEndpointSlice::from_slice(slice, &self.node_name, move |ep| match zone {
                     None => true,
                     Some(zone) => ep.is_for_zone(zone),
                 })
-            });
-        Box::new(iter)
+            })
+            .collect()
     }
 
     fn service_slices<'a>(
@@ -128,17 +135,22 @@ impl State {
         Some(updated)
     }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LocalEndpoint {
+    pub ready: bool,
+    pub serving: bool,
     pub node_local: bool,
     pub hostname: Option<String>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
 }
 impl LocalEndpoint {
-    fn from_endpoint(ep: &Endpoint, node_name: &String) -> Self {
+    fn from_endpoint(ep: &Endpoint, node_name: &str) -> Self {
         Self {
-            node_local: ep.node.as_ref() == Some(node_name),
+            ready: ep.ready,
+            serving: ep.serving,
+            node_local: ep.node.as_deref() == Some(node_name),
             hostname: ep.hostname.clone(),
             ipv4: ep.ipv4,
             ipv6: ep.ipv6,
@@ -166,14 +178,13 @@ pub struct LocalEndpointSlice {
     pub endpoints: Vec<LocalEndpoint>,
 }
 impl LocalEndpointSlice {
-    fn from_slice<F>(slice: &EndpointSlice, node_name: &String, mut filter: F) -> Option<Self>
+    fn from_slice<F>(slice: &EndpointSlice, node_name: &str, mut filter: F) -> Option<Self>
     where
         F: FnMut(&Endpoint) -> bool,
     {
-        let endpoints = slice
-            .endpoints
-            .iter()
+        let endpoints = (slice.endpoints.iter())
             .filter(|ep| filter(ep))
+            .map(|ep| LocalEndpoint::from_endpoint(ep, node_name))
             .collect::<Vec<_>>();
 
         if endpoints.is_empty() {
@@ -182,10 +193,7 @@ impl LocalEndpointSlice {
 
         Some(Self {
             target_ports: slice.target_ports.clone(),
-            endpoints: endpoints
-                .into_iter()
-                .map(|ep| LocalEndpoint::from_endpoint(ep, node_name))
-                .collect(),
+            endpoints: endpoints.into_iter().collect(),
         })
     }
 
@@ -497,6 +505,8 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]
 pub struct Endpoint {
+    ready: bool,
+    serving: bool,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
@@ -546,7 +556,13 @@ impl Endpoint {
             }
         }
 
+        let conds = (endpoint.conditions.as_ref()).unwrap_or(&DEFAULT_ENDPOINT_CONDITIONS);
+        let ready = conds.ready.unwrap_or(true); // see doc
+        let serving = conds.serving.unwrap_or(ready); // see doc
+
         Self {
+            ready,
+            serving,
             ipv4,
             ipv6,
             hostname: endpoint.hostname.clone(),
@@ -555,6 +571,12 @@ impl Endpoint {
         }
     }
 }
+
+static DEFAULT_ENDPOINT_CONDITIONS: discovery::EndpointConditions = discovery::EndpointConditions {
+    ready: None,
+    serving: None,
+    terminating: None,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Namespace {
