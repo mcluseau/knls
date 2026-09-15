@@ -614,6 +614,14 @@ impl memstore::KeyValueFrom<core::Pod> for Pod {
     }
 
     fn value_from(pod: &core::Pod) -> Option<Self> {
+        let status = pod.status.as_ref()?;
+
+        if matches!(status.phase.as_deref(), Some("Succeeded" | "Failed")) {
+            // pod is terminated and will not restart
+            // from our point of view (networking), it does not exist anymore
+            return None;
+        }
+
         let spec = pod.spec.as_ref()?;
         let node = spec.node_name.clone()?;
 

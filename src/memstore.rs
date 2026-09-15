@@ -1,5 +1,5 @@
 use kube::runtime::watcher::Event;
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{btree_map, BTreeMap};
 use std::ops::RangeBounds;
 
 #[macro_export]
@@ -142,8 +142,12 @@ where
             }
             InitDone => self.ready = true,
             Apply(v) => {
-                if let (Some(key), Some(value)) = (T::key_from(v), T::value_from(v)) {
-                    self.map.insert(key, value);
+                if let Some(key) = T::key_from(v) {
+                    if let Some(value) = T::value_from(v) {
+                        self.map.insert(key, value);
+                    } else {
+                        self.map.remove(&key);
+                    }
                 }
             }
             Delete(v) => {
