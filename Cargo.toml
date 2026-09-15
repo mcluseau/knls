@@ -1,6 +1,6 @@
 [package]
 name = "knls"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 
 [profile.release]
@@ -36,7 +36,7 @@ kube = { version = "3.0.1", features = ["aws-lc-rs", "runtime"] }
 log = "0.4.22"
 maxminddb = "0.30.0"
 netlink-packet-route = "0.28.0"
-nftnl = { git = "ssh://git@github.com/mcluseau/nftnl-rs.git", version = "0.9.4" }
+nftnl = { git = "https://github.com/mcluseau/nftnl-rs.git", branch = "main" }
 nix = "0.31.1"
 rtnetlink = "0.20.0"
 serde = { version = "1.0.208", features = ["derive", "rc"] }

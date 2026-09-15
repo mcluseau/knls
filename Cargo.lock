@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "knls"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "base32",
  "base64",
@@ -1690,7 +1690,7 @@ dependencies = [
 [[package]]
 name = "nftnl"
 version = "0.9.4"
-source = "git+ssh://git@github.com/mcluseau/nftnl-rs.git#301f1e8babe0f8f4143c3f7ac5074a0f7c693e3b"
+source = "git+https://github.com/mcluseau/nftnl-rs.git?branch=main#301f1e8babe0f8f4143c3f7ac5074a0f7c693e3b"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -1701,7 +1701,7 @@ dependencies = [
 [[package]]
 name = "nftnl-sys"
 version = "0.6.4"
-source = "git+ssh://git@github.com/mcluseau/nftnl-rs.git#301f1e8babe0f8f4143c3f7ac5074a0f7c693e3b"
+source = "git+https://github.com/mcluseau/nftnl-rs.git?branch=main#301f1e8babe0f8f4143c3f7ac5074a0f7c693e3b"
 dependencies = [
  "cfg-if",
  "libc",

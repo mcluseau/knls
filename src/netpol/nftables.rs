@@ -1,4 +1,4 @@
-use super::{ANN_REJECT, EgressRule, IngressRule, Policy};
+use super::{ANN_REJECT, ANN_EGRESS_REJECT, EgressRule, IngressRule, Policy};
 use crate::{
     kube_watch::EventReceiver,
     state::{Namespace, Pod, keys},
@@ -23,8 +23,10 @@ use xxhash_rust::xxh3;
 pub struct Config {
     /// nftables table's name
     table: String,
-    /// reject action
+    /// reject action (for ingress rules)
     reject: String,
+    /// reject action (for egress rules)
+    egress_reject: String,
 }
 
 impl Default for Config {
@@ -32,6 +34,7 @@ impl Default for Config {
         Self {
             table: "kube-netpol".into(),
             reject: "reject".into(),
+            egress_reject: "reject".into(),
         }
     }
 }
@@ -121,11 +124,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                 w!("    jump ingress_netpol_{np_ns}_{np_name};");
             }
             if recorded {
-                let reject = if let Some(reject) = pod.annotations.get(ANN_REJECT) {
-                    reject
-                } else {
-                    &cfg.reject
-                };
+                let reject = pod.annotations.get(ANN_REJECT).unwrap_or(&cfg.reject);
                 w!("    {reject};");
                 w!("  }}");
             }
@@ -149,7 +148,8 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                 w!("    jump egress_netpol_{np_ns}_{np_name};");
             }
             if recorded {
-                w!("    reject;");
+                let reject = pod.annotations.get(ANN_EGRESS_REJECT).unwrap_or(&cfg.egress_reject);
+                w!("    {reject};");
                 w!("  }}");
             }
         }

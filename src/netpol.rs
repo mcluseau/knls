@@ -11,6 +11,7 @@ use k8s_openapi::{
 };
 
 pub const ANN_REJECT: &str = "netpol.knls.eu/reject";
+pub const ANN_EGRESS_REJECT: &str = "netpol.knls.eu/egress-reject";
 
 #[derive(Clone)]
 pub struct Policy {
