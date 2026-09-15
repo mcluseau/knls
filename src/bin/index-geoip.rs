@@ -1,3 +1,4 @@
+/// Index the nice geoip DB from pingoo (https://pingoo.io/).
 use eyre::Result;
 use serde::{Deserialize, Deserializer};
 use std::{collections::BTreeMap as Map, fmt, fs, io::Cursor, str::FromStr};

@@ -10,6 +10,8 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::LabelSelector,
 };
 
+pub const ANN_REJECT: &str = "netpol.knls.eu/reject";
+
 #[derive(Clone)]
 pub struct Policy {
     namespace: String,

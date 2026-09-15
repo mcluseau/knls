@@ -390,9 +390,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                         .map(|ip| ip.to_string())
                         .collect::<Vec<_>>()
                         .join(",");
-                    chain.push_str(&format!(
-                        "  ip saddr {{{ips}}} snat to {v4} {comment}\n"
-                    ));
+                    chain.push_str(&format!("  ip saddr {{{ips}}} snat to {v4} {comment}\n"));
                 }
                 if let Some(ref v6) = pod.external_ipv6
                     && my_ext_ips.contains(v6)
@@ -404,9 +402,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                         .map(|ip| ip.to_string())
                         .collect::<Vec<_>>()
                         .join(",");
-                    chain.push_str(&format!(
-                        "  ip6 saddr {{{ips}}} snat to {v6} {comment}\n"
-                    ));
+                    chain.push_str(&format!("  ip6 saddr {{{ips}}} snat to {v6} {comment}\n"));
                 }
             }
             chain.push_str("}\n");

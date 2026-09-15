@@ -1,5 +1,5 @@
 use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
-use eyre::{bail, eyre, Result};
+use eyre::{Result, bail, eyre};
 use log::error;
 use std::{collections::BTreeMap as Map, fmt::Display, path::PathBuf};
 use tokio::sync::mpsc;

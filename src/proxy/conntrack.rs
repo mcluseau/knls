@@ -1,5 +1,5 @@
-use conntrack::{model::IpProto, Conntrack};
-use eyre::{format_err, Result};
+use conntrack::{Conntrack, model::IpProto};
+use eyre::{Result, format_err};
 use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, warn};
 use std::collections::BTreeSet;

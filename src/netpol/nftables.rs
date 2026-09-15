@@ -1,4 +1,4 @@
-use super::{EgressRule, IngressRule, Policy};
+use super::{ANN_REJECT, EgressRule, IngressRule, Policy};
 use crate::{
     kube_watch::EventReceiver,
     state::{Namespace, Pod, keys},
@@ -19,13 +19,21 @@ use std::sync::Arc;
 use xxhash_rust::xxh3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Config {
     /// nftables table's name
-    #[serde(default = "default_table")]
     table: String,
+    /// reject action
+    reject: String,
 }
-fn default_table() -> String {
-    "kube-netpol".into()
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            table: "kube-netpol".into(),
+            reject: "reject".into(),
+        }
+    }
 }
 
 crate::multimap!(
@@ -113,7 +121,12 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                 w!("    jump ingress_netpol_{np_ns}_{np_name};");
             }
             if recorded {
-                w!("    reject;");
+                let reject = if let Some(reject) = pod.annotations.get(ANN_REJECT) {
+                    reject
+                } else {
+                    &cfg.reject
+                };
+                w!("    {reject};");
                 w!("  }}");
             }
 

@@ -2,6 +2,7 @@ use cidr::IpCidr;
 use eyre::format_err;
 use itertools::Itertools;
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
+use kube::ResourceExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -599,6 +600,7 @@ impl memstore::KeyValueFrom<core::Namespace> for Namespace {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Pod {
     pub labels: Map<String, String>,
+    pub annotations: Map<String, String>,
     pub node: String,
     pub ipsv4: Vec<Ipv4Addr>,
     pub ipsv6: Vec<Ipv6Addr>,
@@ -630,11 +632,19 @@ impl memstore::KeyValueFrom<core::Pod> for Pod {
         ipsv6.shrink_to_fit();
 
         Some(Self {
-            labels: pod.metadata.labels.clone().unwrap_or_default(),
             node,
             ipsv4,
             ipsv6,
             host_network: spec.host_network.unwrap_or(false),
+            labels: pod.labels().clone(),
+            annotations: Map::from_iter(
+                (pod.annotations().iter())
+                    .filter(|(k, _)| {
+                        k.split_once('/')
+                            .is_some_and(|(h, _)| h.ends_with(".knls.eu"))
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            ),
         })
     }
 }

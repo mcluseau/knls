@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::IpAddr;
 
-use crate::state::{keys, LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget};
+use crate::state::{LocalEndpoint, LocalEndpointSlice, ProtoPort, ServiceTarget, keys};
 
 pub type State = Map<keys::Object, Service>;
 
