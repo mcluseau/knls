@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "knls"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "base32",
  "base64 0.23.1",
