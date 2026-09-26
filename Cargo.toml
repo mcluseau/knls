@@ -17,7 +17,6 @@ base32 = "0.5.1"
 base64 = "0.23.1"
 cidr = { version = "0.3.2", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-conntrack = "0.1.5"
 constcat = "0.6.1"
 defguard_wireguard_rs = { version = "0.9.0", path = "./wireguard-rs" }
 diff = "0.1.13"
@@ -35,7 +34,10 @@ k8s-openapi = { version = "0.28.0", features = ["earliest"] }
 kube = { version = "4.2.0", features = ["aws-lc-rs", "runtime"] }
 log = "0.4.34"
 maxminddb = "0.32.0"
+netlink-packet-core = "0.9.0"
+netlink-packet-netfilter = "0.4.0"
 netlink-packet-route = "0.33.0"
+netlink-proto = "0.13.0"
 nftnl = { git = "https://github.com/mcluseau/nftnl-rs.git", branch = "main" }
 nix = "0.31.3"
 rtnetlink = "0.23.0"

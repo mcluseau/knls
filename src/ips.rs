@@ -1,6 +1,9 @@
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
-use std::collections::{HashSet, hash_set};
-use std::net::IpAddr;
+use std::{
+    collections::{hash_set, HashSet},
+    fmt,
+    net::IpAddr,
+};
 
 pub fn parse_iter<'t>(ips: impl Iterator<Item = &'t String>) -> impl Iterator<Item = IpAddr> {
     ips.filter_map(|s| s.parse::<IpAddr>().ok())
@@ -82,5 +85,18 @@ impl<'t> IntoIterator for &'t Endpoint {
     type IntoIter = hash_set::Iter<'t, IpAddr>;
     fn into_iter(self) -> hash_set::Iter<'t, IpAddr> {
         self.ips.iter()
+    }
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        f.write_str("(")?;
+        for (i, ip) in self.ips.iter().enumerate() {
+            if i != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{ip}")?;
+        }
+        f.write_str(")")
     }
 }

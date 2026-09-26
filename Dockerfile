@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-from rust:1.97.1-alpine3.24 as build
+from rust:1.98.1-alpine3.24 as build
 
 run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git libmnl-dev libnftnl-dev
 
@@ -24,7 +24,7 @@ run unzstd -o country_ips.db /country_ips.db.zst
 # ------------------------------------------------------------------------
 from alpine:3.24.1
 entrypoint ["knls"]
-run apk add --no-cache nftables wireguard-tools conntrack-tools
+run apk add --no-cache nftables wireguard-tools
 copy --from=assets /assets/ /assets/
 copy --from=build /dist/bin/ /bin/
 
