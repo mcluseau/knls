@@ -1,20 +1,19 @@
-use eyre::{format_err, Result};
+use eyre::{Result, format_err};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1 as core;
 use log::{debug, error, trace};
 use netlink_packet_core::{
-    DefaultNla, NetlinkHeader, NetlinkMessage, NetlinkPayload, Nla, NLA_TYPE_MASK, NLM_F_ACK,
-    NLM_F_DUMP, NLM_F_REQUEST,
+    DefaultNla, NLA_TYPE_MASK, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    NetlinkPayload, Nla,
 };
 use netlink_packet_netfilter::{
-    conntrack::{ConntrackAttribute, ConntrackMessage, IPTuple, ProtoTuple, Protocol, Tuple},
     NetfilterHeader, NetfilterMessage, NetfilterMessageInner, NetfilterProtoFamily,
+    conntrack::{ConntrackAttribute, ConntrackMessage, IPTuple, ProtoTuple, Protocol, Tuple},
 };
 use netlink_packet_route::address::AddressAttribute;
 use netlink_proto::{
-    new_connection,
-    sys::{protocols::NETLINK_NETFILTER, SocketAddr as NetlinkSocketAddr},
-    ConnectionHandle,
+    ConnectionHandle, new_connection,
+    sys::{SocketAddr as NetlinkSocketAddr, protocols::NETLINK_NETFILTER},
 };
 use nix::errno::Errno;
 use std::{
@@ -26,6 +25,7 @@ use std::{
 use crate::{
     ips, keys,
     kube_watch::Event,
+    netlink,
     rtnl_exts::ErrorExt,
     store::{HashIndex, Store},
 };
@@ -310,55 +310,25 @@ impl State {
     ///
     /// Errors are only logged.
     async fn delete(&self, flows: Vec<Flow>) {
-        // Each delete is a separate top-level message, so the ~64 KiB
-        // per-attribute (nlattr.nla_len is u16) and per-message limits that
-        // constrain bulk payloads (e.g. nft set elements) do not apply. The
-        // only limit is the datagram size: netlink_sendmsg fails with EMSGSIZE
-        // past `sk_sndbuf - 32` (default ~208 KiB), and that error kills the
-        // whole netlink connection. 64 KiB keeps a wide margin while still
-        // packing many flows. Messages are sized exactly via `buffer_len`
-        // (~80 B IPv4, ~104 B IPv6).
-        const BATCH_BYTES: usize = 64 * 1024;
+        let mut responses = netlink::send_batched(
+            &self.handle,
+            self.kernel,
+            flows.into_iter().map(Flow::into_delete),
+        );
 
-        let mut batch = Vec::new();
-        let mut bytes = 0;
-
-        for flow in flows {
-            let msg = flow.into_delete();
-            let len = msg.buffer_len();
-
-            if !batch.is_empty() && bytes + len > BATCH_BYTES {
-                self.send_delete_batch(std::mem::take(&mut batch)).await;
-                bytes = 0;
-            }
-
-            bytes += len;
-            batch.push(msg);
-        }
-
-        if !batch.is_empty() {
-            self.send_delete_batch(batch).await;
-        }
-    }
-
-    async fn send_delete_batch(&self, msgs: Vec<NetlinkMessage<NetfilterMessage>>) {
-        let mut responses = match self.handle.request_batch(msgs, self.kernel) {
-            Ok(responses) => responses,
-            Err(e) => {
-                error!("failed to send conntrack delete batch: {e}");
-                return;
-            }
-        };
-
-        while let Some(message) = responses.next().await {
-            let NetlinkPayload::Error(err) = message.payload else {
+        while let Some(response) = responses.next().await {
+            let Ok(message) =
+                response.inspect_err(|e| error!("conntrack delete send error: {e:?}"))
+            else {
                 continue;
             };
-            // ACKs and flows already gone (ENOENT) are not errors
-            if err.code.is_none() || err.is_errno(Errno::ENOENT) {
-                continue;
+
+            if let NetlinkPayload::Error(err) = message.payload
+                && err.code.is_some()
+                && !err.is_errno(Errno::ENOENT)
+            {
+                debug!("conntrack delete error: {err:?}");
             }
-            debug!("conntrack delete error: {err:?}");
         }
     }
 

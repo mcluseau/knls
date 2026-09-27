@@ -9,6 +9,7 @@ pub mod ips;
 pub mod keys;
 pub mod kube_watch;
 pub mod memstore;
+pub mod netlink;
 pub mod netpol;
 pub mod nftables;
 pub mod proxy;
