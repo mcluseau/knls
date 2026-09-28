@@ -1,3 +1,5 @@
+pub mod set;
+
 use log::debug;
 use std::{io::Cursor, process::Stdio};
 use tokio::{io, io::AsyncRead, process::Command};

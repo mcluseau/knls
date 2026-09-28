@@ -1,5 +1,6 @@
+use eyre::{Result, bail};
 use futures::{Stream, StreamExt, stream};
-use netlink_packet_core::{NetlinkMessage, NetlinkSerializable};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NetlinkSerializable};
 use netlink_proto::{ConnectionHandle, Error, sys::SocketAddr};
 use std::fmt::Debug;
 
@@ -11,7 +12,7 @@ use std::fmt::Debug;
 /// `net.core.wmem_default` (~208 KiB), so 128 KiB keeps a wide margin. A single
 /// message always fits: ours are bounded well below that (the largest, an nft
 /// set element, is capped by the 16-bit `nlattr.nla_len`).
-const BATCH_BYTES: usize = 128 * 1024;
+pub(crate) const BATCH_BYTES: usize = 128 * 1024;
 
 /// Iterator splitting messages into datagrams bounded by their cumulative
 /// serialized size.
@@ -92,6 +93,46 @@ where
             Err(e) => stream::once(async move { Err(e) }).boxed(),
         }
     })
+}
+
+/// Send whole transactions (each one single datagram), yielding the first error.
+///
+/// A transaction is a `Vec` of messages delivered in a single datagram: netlink
+/// rejects a datagram larger than `sk_sndbuf - 32`, and nfnetlink processes a
+/// batch (begin..end) from that single datagram, so transactions cannot span
+/// datagrams. Callers must therefore keep each transaction under
+/// [`BATCH_BYTES`].
+///
+/// Unlike [`send_batched`], only the first error is reported and the remaining
+/// transactions are sent regardless.
+pub async fn send_transactions<T>(
+    handle: &ConnectionHandle<T>,
+    dest: SocketAddr,
+    txs: impl IntoIterator<Item = Vec<NetlinkMessage<T>>>,
+) -> Result<()>
+where
+    T: Debug + NetlinkSerializable + Send,
+{
+    for tx in txs {
+        if tx.is_empty() {
+            continue;
+        }
+
+        let mut responses = match handle.request_batch(tx, dest) {
+            Ok(responses) => responses,
+            // `Error<T>` is only Debug when `T` is, which is not guaranteed here
+            Err(_) => bail!("failed to send netlink transaction"),
+        };
+        while let Some(message) = responses.next().await {
+            if let NetlinkPayload::Error(err) = message.payload
+                && err.code.is_some()
+            {
+                bail!("netlink error: {err:?}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
