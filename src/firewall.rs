@@ -1,10 +1,21 @@
-use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
-use eyre::{Result, bail, eyre};
-use log::error;
-use std::{collections::BTreeMap as Map, fmt::Display, path::PathBuf};
-use tokio::sync::mpsc;
+use cidr::IpCidr;
+use eyre::{bail, eyre, Result};
+use netlink_packet_netfilter::NetfilterMessage;
+use netlink_proto::{
+    new_connection,
+    sys::{protocols::NETLINK_NETFILTER, SocketAddr as NetlinkSocketAddr},
+};
+use std::{
+    collections::BTreeMap as Map,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+};
 
-use crate::geoip;
+use crate::{
+    geoip,
+    netlink::send_transactions,
+    nftables::{self, set, table},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -38,229 +49,178 @@ impl Firewall {
         self.ipsets.is_empty() && self.chains.is_empty()
     }
 
-    pub async fn to_nft(&self) -> Result<String> {
-        let mut out = String::new();
-
-        let mut rx = self.nft_steps().await?;
-        while let Some(part) = rx.recv().await {
-            out.push_str(&part);
-        }
-
-        Ok(out) // we could _unchecked
+    async fn open_db(&self) -> Result<geoip::Db> {
+        geoip::Db::open(&self.country_ips)
+            .await
+            .map_err(|e| eyre!("geoip DB open failed: {}: {e}", self.country_ips.display()))
     }
 
-    pub async fn nft_steps(&self) -> Result<mpsc::Receiver<String>> {
-        let (tx, rx) = mpsc::channel(1);
+    pub async fn apply(&self) -> Result<()> {
+        let (conn, handle, _) = new_connection::<NetfilterMessage>(NETLINK_NETFILTER)?;
+        tokio::spawn(conn);
+        let kernel = NetlinkSocketAddr::new(0, 0);
 
-        // step 1: rebuild the table without country sets (they can be big)
-        // non-country sets are better in the atomic part, they cna be critical for access
+        let mut id_seq = 0u32;
+        let mut next_id = || {
+            id_seq += 1;
+            id_seq
+        };
 
-        let mut out = String::new();
+        // step 1: recreate the table and define/fill the regular sets in one
+        // atomic batch. Country sets are only created here (empty); their
+        // elements can be huge and are filled in step 3.
 
-        macro_rules! w {
-            ($s:expr) => {
-                out.push_str($s)
-            };
-        }
+        let mut msgs = vec![];
+        msgs.extend(table::recreate(&self.table));
 
-        let table = format!("inet {}", self.table);
-        w!(&format!(
-            "table {table} {{}}\ndelete table {table}\ntable {table} {{}}\n"
-        ));
-
-        let mut country_ips = None;
+        let mut deferred = vec![];
 
         for (name, ipset) in &self.ipsets {
+            let v4 = set::IntervalSet::<Ipv4Addr>::new(
+                self.table.clone(),
+                format!("{name}_ipv4"),
+                next_id(),
+            );
+            let v6 = set::IntervalSet::<Ipv6Addr>::new(
+                self.table.clone(),
+                format!("{name}_ipv6"),
+                next_id(),
+            );
+
+            msgs.extend([v4.create(), v4.flush()]);
+            msgs.extend([v6.create(), v6.flush()]);
+
             match ipset {
                 IpSet::Ips(ips) => {
-                    nft_ipset(
-                        &mut out,
-                        &table,
-                        name,
-                        ips.iter().filter_map(|c| match c {
-                            IpCidr::V4(c) => Some(*c),
-                            _ => None,
-                        }),
-                        ips.iter().filter_map(|c| match c {
-                            IpCidr::V6(c) => Some(*c),
-                            _ => None,
-                        }),
-                    );
+                    msgs.extend(v4.fill(ips.iter().filter_map(|c| match c {
+                        IpCidr::V4(c) => Some(c.first_address()..=c.last_address()),
+                        _ => None,
+                    })));
+                    msgs.extend(v6.fill(ips.iter().filter_map(|c| match c {
+                        IpCidr::V6(c) => Some(c.first_address()..=c.last_address()),
+                        _ => None,
+                    })));
                 }
                 IpSet::Country(code) => {
-                    if country_ips.is_none() {
-                        let path = self.country_ips.clone();
-                        let db = (geoip::Db::open(&path).await)
-                            .map_err(|e| eyre!("geoip DB open failed: {}: {e}", path.display()))?;
-                        country_ips = Some(db);
-                    }
-                    // safe because of 2 lines up
-                    let db = unsafe { country_ips.as_mut().unwrap_unchecked() };
-
-                    if !db.has_country(code.as_bytes()) {
-                        bail!("no country with code {code}");
-                    }
-
-                    nft_ipset(
-                        &mut out,
-                        &table,
-                        name,
-                        std::iter::empty(),
-                        std::iter::empty(),
-                    );
+                    deferred.push((code, v4, v6));
                 }
             }
         }
 
-        w!(&format!("table {table} {{\n"));
+        send_transactions(&handle, kernel, set::transactions(msgs.into_iter())).await?;
+
+        // step 2: create the user chains. The sets referenced by `@name` were
+        // created in step 1.
+
+        let mut script = String::new();
+        script.push_str(&format!("table inet {} {{\n", self.table));
         for (name, rules) in &self.chains {
-            w!(&format!("  chain {name} {{\n"));
-            w!(rules);
-            w!("  }\n");
+            script.push_str(&format!("  chain {name} {{\n"));
+            script.push_str(rules);
+            script.push_str("  }\n");
+        }
+        script.push_str("}\n");
+
+        nftables::apply_script(script)
+            .await
+            .map_err(|e| eyre!("applying chains failed: {e}"))?;
+
+        // step 3: fill the country sets, chunked by the fill iterator.
+
+        if deferred.is_empty() {
+            return Ok(());
         }
 
-        w!("}\n");
+        let mut db = self.open_db().await?;
 
-        tx.try_send(out).expect("shouldn't block");
+        for (code, v4, v6) in deferred {
+            let Some(ipset) = db.lookup(code.as_bytes()).await? else {
+                bail!("no country with code {code}");
+            };
 
-        let ipsets = self.ipsets.clone();
+            let msgs = v4
+                .fill((ipset.ipv4.iter()).map(|c| c.first_address()..=c.last_address()))
+                .chain(v6.fill((ipset.ipv6.iter()).map(|c| c.first_address()..=c.last_address())));
 
-        // step 2: async generate country ipsets chunks
-        tokio::spawn(async move {
-            let mut out = String::new();
-            for (name, ipset) in ipsets {
-                let IpSet::Country(code) = ipset else {
-                    continue;
-                };
+            send_transactions(&handle, kernel, set::transactions(msgs)).await?;
+        }
 
-                let db = country_ips.as_mut().expect("DB should be open");
-
-                let Ok(Some(ipset)) = db
-                    .lookup(code.as_bytes())
-                    .await
-                    .inspect_err(|e| error!("failed to read country ipset for {code}: {e}"))
-                else {
-                    continue;
-                };
-
-                for chunk in ipset.ipv4.chunks(500) {
-                    nft_set_ipv4(&mut out, &table, &name, chunk.iter().copied());
-                    if tx.send(out.clone()).await.is_err() {
-                        return; // discarded
-                    }
-                    out.clear();
-                }
-
-                for chunk in ipset.ipv6.chunks(500) {
-                    nft_set_ipv6(&mut out, &table, &name, chunk.iter().copied());
-                    if tx.send(out.clone()).await.is_err() {
-                        return; // discarded
-                    }
-                    out.clear();
-                }
-            }
-        });
-
-        Ok(rx)
+        Ok(())
     }
-}
-
-fn nft_ipset(
-    out: &mut String,
-    table: &str,
-    name: impl Display,
-    ipsv4: impl Iterator<Item = Ipv4Cidr>,
-    ipsv6: impl Iterator<Item = Ipv6Cidr>,
-) {
-    nft_set(out, table, format!("{name}_ipv4"), "ipv4_addr", ipsv4);
-    nft_set(out, table, format!("{name}_ipv6"), "ipv6_addr", ipsv6);
-}
-
-fn nft_set_ipv4(
-    out: &mut String,
-    table: &str,
-    name: impl Display,
-    ips: impl Iterator<Item = Ipv4Cidr>,
-) {
-    nft_set(out, table, format!("{name}_ipv4"), "ipv4_addr", ips);
-}
-
-fn nft_set_ipv6(
-    out: &mut String,
-    table: &str,
-    name: impl Display,
-    ips: impl Iterator<Item = Ipv6Cidr>,
-) {
-    nft_set(out, table, format!("{name}_ipv6"), "ipv6_addr", ips);
-}
-
-fn nft_set(
-    out: &mut String,
-    table: &str,
-    name: impl Display,
-    type_: impl Display,
-    elements: impl Iterator<Item = impl Display>,
-) {
-    macro_rules! w {
-        ($s:expr) => {
-            out.push_str($s)
-        };
-    }
-
-    w!(&format!(
-        "set {table} {name} {{\n  type {type_}; flags interval"
-    ));
-    let mut open = false;
-    for (i, e) in elements.enumerate() {
-        let prefix = if i == 0 {
-            open = true;
-            "; elements = {\n"
-        } else if i % 10 == 0 {
-            ",\n"
-        } else {
-            ", "
-        };
-        w!(&format!("{prefix}{e}"));
-    }
-    if open {
-        w!("\n  }")
-    };
-    w!("\n}\n");
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::process::Command;
 
+    /// Source of the expected post-apply state, as dumped by `nft list table`.
+    #[derive(serde::Deserialize)]
+    struct Test {
+        name: String,
+        cfg: Firewall,
+        expect: String,
+    }
+
+    fn tests() -> Vec<Test> {
+        serde_yaml::from_str(include_str!("firewall/tests.yaml")).expect("bad tests file")
+    }
+
+    /// The kernel state of `table`, as text.
+    fn dump(table: &str) -> String {
+        let out = Command::new("nft")
+            .args(["list", "table", "inet", table])
+            .output()
+            .expect("nft should run");
+        assert!(
+            out.status.success(),
+            "nft list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("nft output should be UTF-8")
+    }
+
+    /// Collapse all whitespace, so line wrapping and indentation don't matter.
+    fn normalize(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// End-to-end test: applies each case to the real kernel and compares the
+    /// resulting table (sets, elements and chains) against the expected dump.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
     #[tokio::test]
     async fn tests_from_yaml() {
-        #[derive(serde::Deserialize)]
-        struct Test {
-            name: String,
-            cfg: Firewall,
-            expect: String,
-        }
-
-        let tests: Vec<Test> = serde_yaml::from_str(include_str!("firewall/tests.yaml")) //
-            .expect("bad tests file");
-
-        for mut test in tests {
+        for mut test in tests() {
             test.cfg.country_ips = "test_assets/country_ips.db".into();
 
-            let nft_script = test.cfg.to_nft().await.expect("to_nft failed");
+            test.cfg.apply().await.expect("apply failed");
 
-            if test.expect != nft_script {
+            let actual = normalize(&dump(&test.cfg.table));
+            let expect = normalize(&test.expect);
+            if actual != expect {
                 use diff::Result::*;
                 println!("diff on test {}", test.name);
-                for diff in diff::lines(&test.expect, &nft_script) {
+                for diff in diff::lines(&expect, &actual) {
                     match diff {
                         Left(l) => println!("-{l}"),
                         Both(l, _) => println!(" {l}"),
                         Right(r) => println!("+{r}"),
                     }
                 }
-                panic!("assertion failed");
+                panic!("assertion failed for test {}", test.name);
             }
+        }
+    }
+
+    #[test]
+    fn tests_file_is_valid() {
+        // ensure the yaml parses and every case has an expectation, without
+        // needing a kernel
+        for test in tests() {
+            assert!(!test.name.is_empty());
+            assert!(!test.expect.trim().is_empty());
         }
     }
 }

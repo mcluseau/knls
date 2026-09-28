@@ -1,8 +1,13 @@
 pub mod set;
+pub mod table;
 
 use log::debug;
+use netlink_packet_core::NetlinkMessage;
+use netlink_packet_netfilter::NetfilterMessage;
 use std::{io::Cursor, process::Stdio};
 use tokio::{io, io::AsyncRead, process::Command};
+
+pub type Message = NetlinkMessage<NetfilterMessage>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

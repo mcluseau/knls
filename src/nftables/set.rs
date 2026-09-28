@@ -1,23 +1,35 @@
-use eyre::Result;
 use netlink_packet_core::{
-    Emitable, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    Emitable, NetlinkHeader, NetlinkMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST,
 };
 use netlink_packet_netfilter::{
-    NetfilterHeader, NetfilterMessage, NetfilterProtoFamily, NetfilterSubsystem,
     nftables::{
         ListAttribute, NfTablesMessage, SetAttribute, SetDescription, SetElementAttribute,
         SetElementList, SetElementMessage, SetFlags, SetMessage, Verdict as NlVerdict,
     },
     none::ControlMessage,
+    NetfilterHeader, NetfilterMessage, NetfilterProtoFamily, NetfilterSubsystem,
 };
-use netlink_proto::{ConnectionHandle, sys::SocketAddr};
 use std::{
     marker::PhantomData,
     net::{Ipv4Addr, Ipv6Addr},
     ops::RangeInclusive,
 };
 
+use super::Message;
 use crate::netlink::BATCH_BYTES;
+
+/// A named set of single keys.
+pub type SimpleSet<T> = Set<T>;
+
+/// A named set of intervals over keys of type `T`. `fill` takes inclusive
+/// `RangeInclusive<T>`.
+pub type IntervalSet<T> = Set<RangeInclusive<T>>;
+
+/// A named map from key type `K` to data type `D`.
+pub type MapSet<K, D> = Set<MapElem<K, D>>;
+
+/// A named map from key type `K` to verdicts of value type `V`.
+pub type VerdictMapSet<K> = Set<VerdictElem<K>>;
 
 /// Maximum size of the `NFTA_SET_ELEM_LIST_ELEMENTS` attribute payload.
 ///
@@ -61,16 +73,6 @@ impl Verdict {
         }
     }
 }
-
-/// A named set of single keys.
-pub type SimpleSet<'a, T> = Set<'a, T>;
-
-/// A named set of intervals over keys of type `T`. `fill` takes inclusive
-/// `RangeInclusive<T>`.
-pub type IntervalSet<'a, T> = Set<'a, RangeInclusive<T>>;
-
-/// A named map from key type `K` to data type `D`.
-pub type MapSet<'a, K, D> = Set<'a, MapElem<K, D>>;
 
 /// The map value payload of an element.
 #[doc(hidden)]
@@ -391,9 +393,6 @@ impl<K: Data, D: Data> Elem for MapElem<K, D> {
     }
 }
 
-/// A named map from key type `K` to verdicts of value type `V`.
-pub type VerdictMapSet<'a, K> = Set<'a, VerdictElem<K>>;
-
 /// A verdict map element: a key mapping to a [`Verdict`].
 pub struct VerdictElem<K>(pub K, pub Verdict);
 
@@ -434,67 +433,50 @@ fn increment_be(bytes: &mut [u8]) {
 }
 
 /// A named nftables set inside an `inet` table.
-pub struct Set<'a, T> {
-    handle: &'a ConnectionHandle<NetfilterMessage>,
-    kernel: SocketAddr,
+pub struct Set<T> {
     table: String,
     name: String,
+    id: u32,
     _marker: PhantomData<T>,
 }
 
-impl<'a, T> Set<'a, T>
+impl<'a, T> Set<T>
 where
     T: Elem,
 {
-    pub fn new(
-        handle: &'a ConnectionHandle<NetfilterMessage>,
-        kernel: SocketAddr,
-        table: impl Into<String>,
-        name: impl Into<String>,
-    ) -> Self {
+    pub fn new(table: impl Into<String>, name: impl Into<String>, id: u32) -> Self {
         Self {
-            handle,
-            kernel,
             table: table.into(),
             name: name.into(),
+            id,
             _marker: PhantomData,
         }
     }
 
-    /// Create the set if it does not exist (idempotent).
-    pub async fn create(&self) -> Result<()> {
-        let tx = transaction(vec![new_set_msg::<T>(&self.table, &self.name)]);
-        crate::netlink::send_transactions(self.handle, self.kernel, [tx]).await
+    pub fn create(&self) -> Message {
+        new_set_msg::<T>(&self.table, &self.name, self.id)
     }
 
-    /// Remove every element from the set.
-    pub async fn flush(&self) -> Result<()> {
-        let tx = transaction(vec![flush_msg(&self.table, &self.name)]);
-        crate::netlink::send_transactions(self.handle, self.kernel, [tx]).await
+    pub fn flush(&self) -> Message {
+        flush_msg(&self.table, &self.name)
     }
 
     /// Add (or update) every given element.
-    pub async fn fill(&self, items: impl IntoIterator<Item = T>) -> Result<()> {
-        let txs = transactions(fill_msgs::<T>(&self.table, &self.name, items));
-        crate::netlink::send_transactions(self.handle, self.kernel, txs).await
+    pub fn fill<I: Iterator<Item = T>>(&self, items: I) -> impl Iterator<Item = Message> {
+        fill_msgs::<T, I>(&self.table, &self.name, items)
     }
 
-    /// Create the set, flush it and fill it.
-    pub async fn create_flush_fill(&self, items: impl IntoIterator<Item = T>) -> Result<()> {
-        let head = transaction(vec![
-            new_set_msg::<T>(&self.table, &self.name),
-            flush_msg(&self.table, &self.name),
-        ]);
-        let txs = std::iter::once(head).chain(transactions(fill_msgs::<T>(
-            &self.table,
-            &self.name,
-            items,
-        )));
-        crate::netlink::send_transactions(self.handle, self.kernel, txs).await
+    pub fn create_flush_fill<I: Iterator<Item = T>>(
+        &self,
+        items: I,
+    ) -> impl Iterator<Item = Message> {
+        std::iter::once(self.create())
+            .chain(std::iter::once(self.flush()))
+            .chain(fill_msgs(&self.table, &self.name, items))
     }
 }
 
-fn new_set_msg<T>(table: &str, name: &str) -> NetlinkMessage<NetfilterMessage>
+fn new_set_msg<T>(table: &str, name: &str, id: u32) -> Message
 where
     T: Elem,
 {
@@ -505,7 +487,7 @@ where
         SetAttribute::Table(table.to_string()),
         SetAttribute::Name(name.to_string()),
         // the kernel requires an id even for named sets
-        SetAttribute::Id(1),
+        SetAttribute::Id(id),
     ];
     attributes.extend(T::set_attributes());
     if !T::SET_FLAGS.is_empty() {
@@ -517,7 +499,7 @@ where
     NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
 }
 
-fn flush_msg(table: &str, name: &str) -> NetlinkMessage<NetfilterMessage> {
+fn flush_msg(table: &str, name: &str) -> Message {
     let mut header = NetlinkHeader::default();
     header.flags = NLM_F_REQUEST | NLM_F_ACK;
 
@@ -532,21 +514,17 @@ fn flush_msg(table: &str, name: &str) -> NetlinkMessage<NetfilterMessage> {
     NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
 }
 
-fn fill_msgs<'a, T>(
-    table: &'a str,
-    name: &'a str,
-    items: impl IntoIterator<Item = T> + 'a,
-) -> impl Iterator<Item = NetlinkMessage<NetfilterMessage>> + 'a
+fn fill_msgs<'a, T, I>(table: impl Into<String>, name: impl Into<String>, items: I) -> FillMsgs<I>
 where
-    T: Elem + 'a,
+    T: Elem,
+    I: Iterator<Item = T>,
 {
-    FillMsgs::<T, _> {
-        table,
-        name,
-        items: items.into_iter(),
+    FillMsgs::<I> {
+        table: table.into(),
+        name: name.into(),
+        items,
         buf: Vec::new(),
         bytes: 0,
-        _marker: PhantomData,
     }
 }
 
@@ -556,21 +534,20 @@ where
 /// serialized size tracked in `bytes`; the allocation is recycled from one
 /// message to the next. An item's elements (an interval's start and end) are
 /// appended as a unit, so they never split across messages.
-struct FillMsgs<'a, T, I> {
-    table: &'a str,
-    name: &'a str,
+struct FillMsgs<I> {
+    table: String,
+    name: String,
     items: I,
     buf: Vec<ListAttribute<SetElementAttribute>>,
     bytes: usize,
-    _marker: PhantomData<T>,
 }
 
-impl<T, I> Iterator for FillMsgs<'_, T, I>
+impl<T, I> Iterator for FillMsgs<I>
 where
     T: Elem,
     I: Iterator<Item = T>,
 {
-    type Item = NetlinkMessage<NetfilterMessage>;
+    type Item = Message;
 
     fn next(&mut self) -> Option<Self::Item> {
         for item in self.items.by_ref() {
@@ -587,7 +564,7 @@ where
                 let overflow = self.buf.split_off(before);
                 let elems = std::mem::replace(&mut self.buf, overflow);
                 self.bytes = added;
-                return Some(elem_msg(self.table, self.name, elems));
+                return Some(elem_msg(&self.table, &self.name, elems));
             }
 
             self.bytes += added;
@@ -597,8 +574,8 @@ where
         if !self.buf.is_empty() {
             self.bytes = 0;
             return Some(elem_msg(
-                self.table,
-                self.name,
+                &self.table,
+                &self.name,
                 std::mem::take(&mut self.buf),
             ));
         }
@@ -628,10 +605,8 @@ fn elem_msg(
 }
 
 /// Wrap `msgs` into a single nfnetlink transaction (batch begin..end).
-fn transaction(
-    msgs: Vec<NetlinkMessage<NetfilterMessage>>,
-) -> Vec<NetlinkMessage<NetfilterMessage>> {
-    let mut tx = Vec::with_capacity(msgs.len() + 2);
+fn transaction<I: Iterator<Item = Message>>(msgs: I) -> Vec<Message> {
+    let mut tx = Vec::with_capacity(msgs.size_hint().0 + 2);
     tx.push(batch_msg(true));
     tx.extend(msgs);
     tx.push(batch_msg(false));
@@ -639,24 +614,22 @@ fn transaction(
 }
 
 /// Split messages into transactions, each fitting in a single datagram.
-fn transactions(
-    msgs: impl IntoIterator<Item = NetlinkMessage<NetfilterMessage>>,
-) -> Transactions<impl Iterator<Item = NetlinkMessage<NetfilterMessage>>> {
+pub(crate) fn transactions<I: Iterator<Item = Message>>(msgs: I) -> Transactions<I> {
     Transactions {
-        msgs: msgs.into_iter(),
+        msgs: msgs.into(),
         cur: Vec::new(),
         bytes: 0,
     }
 }
 
-struct Transactions<I> {
+pub(crate) struct Transactions<I> {
     msgs: I,
-    cur: Vec<NetlinkMessage<NetfilterMessage>>,
+    cur: Vec<Message>,
     bytes: usize,
 }
 
-impl<I: Iterator<Item = NetlinkMessage<NetfilterMessage>>> Iterator for Transactions<I> {
-    type Item = Vec<NetlinkMessage<NetfilterMessage>>;
+impl<I: Iterator<Item = Message>> Iterator for Transactions<I> {
+    type Item = Vec<Message>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // account for the batch begin/end messages added by `transaction`
@@ -668,7 +641,9 @@ impl<I: Iterator<Item = NetlinkMessage<NetfilterMessage>>> Iterator for Transact
             let len = msg.buffer_len();
 
             if !self.cur.is_empty() && self.bytes + len > BATCH_BYTES {
-                return Some(transaction(std::mem::replace(&mut self.cur, vec![msg])));
+                return Some(transaction(
+                    std::mem::replace(&mut self.cur, vec![msg]).into_iter(),
+                ));
             }
 
             self.bytes += len;
@@ -676,7 +651,7 @@ impl<I: Iterator<Item = NetlinkMessage<NetfilterMessage>>> Iterator for Transact
         }
 
         // messages exhausted: emit the remaining transaction, if any
-        (!self.cur.is_empty()).then(|| transaction(std::mem::take(&mut self.cur)))
+        (!self.cur.is_empty()).then(|| transaction(std::mem::take(&mut self.cur).into_iter()))
     }
 }
 
@@ -700,7 +675,7 @@ fn batch_msg(begin: bool) -> NetlinkMessage<NetfilterMessage> {
     NetlinkMessage::new(header, NetfilterMessage::new(nft, control).into())
 }
 
-fn nft_header() -> NetfilterHeader {
+pub(crate) fn nft_header() -> NetfilterHeader {
     NetfilterHeader::new(NetfilterProtoFamily::Inet, 0, 0)
 }
 
@@ -709,8 +684,8 @@ mod tests {
     use super::*;
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
-        NetfilterMessageInner,
         nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
+        NetfilterMessageInner,
     };
 
     /// `(key, flags, is_open)` for every element produced by `items`.
@@ -765,7 +740,7 @@ mod tests {
     where
         T: Elem,
     {
-        let msg = new_set_msg::<T>("t", "s");
+        let msg = new_set_msg::<T>("t", "s", 1);
         let NetlinkPayload::InnerMessage(NetfilterMessage {
             inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(m)),
             ..
@@ -861,11 +836,9 @@ mod tests {
             })
             .expect("a concat descriptor");
         // the `NFT_SET_CONCAT` flag is set
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat)))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat))));
 
         let lens: Vec<u32> = concat
             .iter()
@@ -889,11 +862,9 @@ mod tests {
     #[test]
     fn interval_set_has_interval_flag() {
         let attrs = new_set_attrs::<RangeInclusive<Ipv4Addr>>();
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval)));
         // key type/len come from the underlying address
         assert_eq!(
             get_u32(&attrs, |a| match a {
@@ -971,11 +942,9 @@ mod tests {
             }),
             Some(2)
         );
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
     }
 
     #[test]
@@ -1018,11 +987,9 @@ mod tests {
         );
         // verdicts carry no DataLen
         assert!(!attrs.iter().any(|a| matches!(a, SetAttribute::DataLen(_))));
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
     }
 
     /// The nested verdict attributes of the first element produced.

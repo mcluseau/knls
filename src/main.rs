@@ -111,11 +111,7 @@ async fn main() -> eyre::Result<()> {
 
     if !config.firewall.is_empty() {
         info!("applying firewall rules");
-
-        let mut steps_rx = config.firewall.nft_steps().await?;
-        while let Some(step) = steps_rx.recv().await {
-            knls::nftables::apply_script(step).await?;
-        }
+        config.firewall.apply().await?;
     }
 
     let kube: Client = kube_cfg.try_into()?;
