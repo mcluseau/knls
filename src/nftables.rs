@@ -1,9 +1,10 @@
 pub mod set;
 pub mod table;
 
+use eyre::Result;
 use log::debug;
 use netlink_packet_core::NetlinkMessage;
-use netlink_packet_netfilter::NetfilterMessage;
+use netlink_packet_netfilter::{NetfilterHeader, NetfilterMessage, NetfilterProtoFamily};
 use std::{io::Cursor, process::Stdio};
 use tokio::{io, io::AsyncRead, process::Command};
 
@@ -43,4 +44,8 @@ where
     }
 
     Ok(())
+}
+
+fn nft_header() -> NetfilterHeader {
+    NetfilterHeader::new(NetfilterProtoFamily::Inet, 0, 0)
 }

@@ -4,7 +4,7 @@ use netlink_packet_netfilter::{
     nftables::{NfTablesMessage, TableAttribute, TableMessage},
 };
 
-use super::set::nft_header;
+use super::nft_header;
 
 /// The messages recreating (and thus emptying) an `inet` table.
 ///

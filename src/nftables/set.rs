@@ -1,13 +1,12 @@
 use netlink_packet_core::{
-    Emitable, NetlinkHeader, NetlinkMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST,
+    Emitable, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
 };
 use netlink_packet_netfilter::{
+    NetfilterMessage,
     nftables::{
         ListAttribute, NfTablesMessage, SetAttribute, SetDescription, SetElementAttribute,
         SetElementList, SetElementMessage, SetFlags, SetMessage, Verdict as NlVerdict,
     },
-    none::ControlMessage,
-    NetfilterHeader, NetfilterMessage, NetfilterProtoFamily, NetfilterSubsystem,
 };
 use std::{
     marker::PhantomData,
@@ -15,8 +14,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use super::Message;
-use crate::netlink::BATCH_BYTES;
+use super::{Message, nft_header};
 
 /// A named set of single keys.
 pub type SimpleSet<T> = Set<T>;
@@ -584,11 +582,7 @@ where
     }
 }
 
-fn elem_msg(
-    table: &str,
-    name: &str,
-    elements: Vec<ListAttribute<SetElementAttribute>>,
-) -> NetlinkMessage<NetfilterMessage> {
+fn elem_msg(table: &str, name: &str, elements: Vec<ListAttribute<SetElementAttribute>>) -> Message {
     let mut header = NetlinkHeader::default();
     // No NLM_F_EXCL: adding an existing element updates it.
     header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
@@ -604,88 +598,13 @@ fn elem_msg(
     NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
 }
 
-/// Wrap `msgs` into a single nfnetlink transaction (batch begin..end).
-fn transaction<I: Iterator<Item = Message>>(msgs: I) -> Vec<Message> {
-    let mut tx = Vec::with_capacity(msgs.size_hint().0 + 2);
-    tx.push(batch_msg(true));
-    tx.extend(msgs);
-    tx.push(batch_msg(false));
-    tx
-}
-
-/// Split messages into transactions, each fitting in a single datagram.
-pub(crate) fn transactions<I: Iterator<Item = Message>>(msgs: I) -> Transactions<I> {
-    Transactions {
-        msgs: msgs.into(),
-        cur: Vec::new(),
-        bytes: 0,
-    }
-}
-
-pub(crate) struct Transactions<I> {
-    msgs: I,
-    cur: Vec<Message>,
-    bytes: usize,
-}
-
-impl<I: Iterator<Item = Message>> Iterator for Transactions<I> {
-    type Item = Vec<Message>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // account for the batch begin/end messages added by `transaction`
-        if self.cur.is_empty() {
-            self.bytes = batch_msg(true).buffer_len() + batch_msg(false).buffer_len();
-        }
-
-        for msg in self.msgs.by_ref() {
-            let len = msg.buffer_len();
-
-            if !self.cur.is_empty() && self.bytes + len > BATCH_BYTES {
-                return Some(transaction(
-                    std::mem::replace(&mut self.cur, vec![msg]).into_iter(),
-                ));
-            }
-
-            self.bytes += len;
-            self.cur.push(msg);
-        }
-
-        // messages exhausted: emit the remaining transaction, if any
-        (!self.cur.is_empty()).then(|| transaction(std::mem::take(&mut self.cur).into_iter()))
-    }
-}
-
-fn batch_msg(begin: bool) -> NetlinkMessage<NetfilterMessage> {
-    let mut header = NetlinkHeader::default();
-    header.flags = NLM_F_REQUEST | NLM_F_ACK;
-
-    // the res_id carries the nfnetlink subsystem for batch control messages
-    let nft = NetfilterHeader::new(
-        NetfilterProtoFamily::Unspec,
-        0,
-        u8::from(NetfilterSubsystem::NfTables) as u16,
-    );
-
-    let control = if begin {
-        ControlMessage::BatchBegin
-    } else {
-        ControlMessage::BatchEnd
-    };
-
-    NetlinkMessage::new(header, NetfilterMessage::new(nft, control).into())
-}
-
-pub(crate) fn nft_header() -> NetfilterHeader {
-    NetfilterHeader::new(NetfilterProtoFamily::Inet, 0, 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
-        nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
         NetfilterMessageInner,
+        nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
     };
 
     /// `(key, flags, is_open)` for every element produced by `items`.
@@ -694,7 +613,7 @@ mod tests {
         T: Elem,
     {
         let mut out = Vec::new();
-        for msg in fill_msgs::<T>("t", "s", items) {
+        for msg in fill_msgs::<T, _>("t", "s", items.into_iter()) {
             let NetlinkPayload::InnerMessage(NetfilterMessage {
                 inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSetElement(m)),
                 ..
@@ -836,9 +755,11 @@ mod tests {
             })
             .expect("a concat descriptor");
         // the `NFT_SET_CONCAT` flag is set
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat))));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat)))
+        );
 
         let lens: Vec<u32> = concat
             .iter()
@@ -862,9 +783,11 @@ mod tests {
     #[test]
     fn interval_set_has_interval_flag() {
         let attrs = new_set_attrs::<RangeInclusive<Ipv4Addr>>();
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval))
+        );
         // key type/len come from the underlying address
         assert_eq!(
             get_u32(&attrs, |a| match a {
@@ -942,9 +865,11 @@ mod tests {
             }),
             Some(2)
         );
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
+        );
     }
 
     #[test]
@@ -987,9 +912,11 @@ mod tests {
         );
         // verdicts carry no DataLen
         assert!(!attrs.iter().any(|a| matches!(a, SetAttribute::DataLen(_))));
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
+        );
     }
 
     /// The nested verdict attributes of the first element produced.
@@ -1087,9 +1014,12 @@ mod tests {
 
     #[test]
     fn empty_fill_has_no_messages() {
-        assert_eq!(fill_msgs::<Ipv4Addr>("t", "s", Vec::new()).count(), 0);
         assert_eq!(
-            fill_msgs::<RangeInclusive<Ipv4Addr>>("t", "s", Vec::new()).count(),
+            fill_msgs::<Ipv4Addr, _>("t", "s", Vec::new().into_iter()).count(),
+            0
+        );
+        assert_eq!(
+            fill_msgs::<RangeInclusive<Ipv4Addr>, _>("t", "s", Vec::new().into_iter()).count(),
             0
         );
     }
@@ -1102,7 +1032,8 @@ mod tests {
     fn fill_splits_at_16_bits() {
         // enough v4 elements that the `NFTA_SET_ELEM_LIST_ELEMENTS` nest must
         // be split across several messages
-        let msgs: Vec<_> = fill_msgs::<Ipv4Addr>("t", "s", v4_keys(10_000)).collect();
+        let msgs: Vec<_> =
+            fill_msgs::<Ipv4Addr, _>("t", "s", v4_keys(10_000).into_iter()).collect();
         assert!(msgs.len() >= 2, "expected multiple element messages");
 
         let total: usize = msgs
@@ -1132,7 +1063,7 @@ mod tests {
             let base = i << 8;
             Ipv4Addr::from(base)..=Ipv4Addr::from(base | 0x7f)
         });
-        let msgs: Vec<_> = fill_msgs::<RangeInclusive<Ipv4Addr>>("t", "s", ranges).collect();
+        let msgs: Vec<_> = fill_msgs::<RangeInclusive<Ipv4Addr>, _>("t", "s", ranges).collect();
 
         for msg in &msgs {
             let NetlinkPayload::InnerMessage(NetfilterMessage {
@@ -1172,40 +1103,11 @@ mod tests {
     }
 
     #[test]
-    fn transactions_are_bounded_and_wrapped() {
-        let msgs = fill_msgs::<Ipv4Addr>("t", "s", v4_keys(50_000));
-        let txs: Vec<_> = transactions(msgs).collect();
-        assert!(txs.len() >= 2, "expected multiple transactions");
-
-        for tx in &txs {
-            let total: usize = tx.iter().map(|m| m.buffer_len()).sum();
-            assert!(total <= BATCH_BYTES, "transaction exceeds BATCH_BYTES");
-
-            assert!(is_control(&tx[0], true));
-            assert!(is_control(&tx[tx.len() - 1], false));
-        }
-    }
-
-    fn is_control(msg: &NetlinkMessage<NetfilterMessage>, begin: bool) -> bool {
-        let NetlinkPayload::InnerMessage(NetfilterMessage {
-            inner: NetfilterMessageInner::None(c),
-            ..
-        }) = &msg.payload
-        else {
-            return false;
-        };
-
-        matches!(
-            (c, begin),
-            (ControlMessage::BatchBegin, true) | (ControlMessage::BatchEnd, false)
-        )
-    }
-
-    #[test]
     fn element_message_roundtrips() {
-        let mut msg = fill_msgs::<Ipv4Addr>("tbl", "set", [Ipv4Addr::new(10, 0, 0, 1)])
-            .next()
-            .expect("one message");
+        let mut msg =
+            fill_msgs::<Ipv4Addr, _>("tbl", "set", [Ipv4Addr::new(10, 0, 0, 1)].into_iter())
+                .next()
+                .expect("one message");
         msg.finalize();
 
         let mut buf = vec![0; msg.buffer_len()];

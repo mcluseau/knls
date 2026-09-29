@@ -1,10 +1,5 @@
 use cidr::IpCidr;
-use eyre::{bail, eyre, Result};
-use netlink_packet_netfilter::NetfilterMessage;
-use netlink_proto::{
-    new_connection,
-    sys::{protocols::NETLINK_NETFILTER, SocketAddr as NetlinkSocketAddr},
-};
+use eyre::{Result, bail, eyre};
 use std::{
     collections::BTreeMap as Map,
     net::{Ipv4Addr, Ipv6Addr},
@@ -13,7 +8,7 @@ use std::{
 
 use crate::{
     geoip,
-    netlink::send_transactions,
+    netlink::netfilter::{self, NetlinkExt as _},
     nftables::{self, set, table},
 };
 
@@ -56,9 +51,7 @@ impl Firewall {
     }
 
     pub async fn apply(&self) -> Result<()> {
-        let (conn, handle, _) = new_connection::<NetfilterMessage>(NETLINK_NETFILTER)?;
-        tokio::spawn(conn);
-        let kernel = NetlinkSocketAddr::new(0, 0);
+        let nl = netfilter::new_link()?;
 
         let mut id_seq = 0u32;
         let mut next_id = || {
@@ -107,7 +100,7 @@ impl Firewall {
             }
         }
 
-        send_transactions(&handle, kernel, set::transactions(msgs.into_iter())).await?;
+        nl.send_as_transactions(msgs.into_iter()).await?;
 
         // step 2: create the user chains. The sets referenced by `@name` were
         // created in step 1.
@@ -142,7 +135,7 @@ impl Firewall {
                 .fill((ipset.ipv4.iter()).map(|c| c.first_address()..=c.last_address()))
                 .chain(v6.fill((ipset.ipv6.iter()).map(|c| c.first_address()..=c.last_address())));
 
-            send_transactions(&handle, kernel, set::transactions(msgs)).await?;
+            nl.send_as_transactions(msgs).await?;
         }
 
         Ok(())

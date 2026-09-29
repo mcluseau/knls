@@ -1,6 +1,6 @@
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use std::{
-    collections::{hash_set, HashSet},
+    collections::{HashSet, hash_set},
     fmt,
     net::IpAddr,
 };

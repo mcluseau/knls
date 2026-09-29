@@ -11,10 +11,6 @@ use netlink_packet_netfilter::{
     conntrack::{ConntrackAttribute, ConntrackMessage, IPTuple, ProtoTuple, Protocol, Tuple},
 };
 use netlink_packet_route::address::AddressAttribute;
-use netlink_proto::{
-    ConnectionHandle, new_connection,
-    sys::{SocketAddr as NetlinkSocketAddr, protocols::NETLINK_NETFILTER},
-};
 use nix::errno::Errno;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,7 +21,7 @@ use std::{
 use crate::{
     ips, keys,
     kube_watch::Event,
-    netlink,
+    netlink::{Netlink, netfilter},
     rtnl_exts::ErrorExt,
     store::{HashIndex, Store},
 };
@@ -226,8 +222,7 @@ impl IpTuple {
 }
 
 pub struct State {
-    handle: ConnectionHandle<NetfilterMessage>,
-    kernel: NetlinkSocketAddr,
+    nl: Netlink<NetfilterMessage>,
     rtnl: rtnetlink::Handle,
     svc_targets: HashIndex<core::Service, keys::Obj, Target>,
     svc_eps: Store<keys::ByParent, ips::Endpoint>,
@@ -235,15 +230,13 @@ pub struct State {
 
 impl State {
     pub async fn new() -> Result<Self> {
-        let (conn, handle, _) = new_connection::<NetfilterMessage>(NETLINK_NETFILTER)?;
-        tokio::spawn(conn);
+        let nl = netfilter::new_link()?;
 
         let (rtnl_conn, rtnl, _) = rtnetlink::new_connection()?;
         tokio::spawn(rtnl_conn);
 
         Ok(Self {
-            handle,
-            kernel: NetlinkSocketAddr::new(0, 0),
+            nl,
             rtnl,
             svc_targets: HashIndex::new(svc_targets),
             svc_eps: Store::new(),
@@ -279,7 +272,7 @@ impl State {
             .into(),
         );
 
-        let mut responses = self.handle.request(msg, self.kernel)?;
+        let mut responses = self.nl.handle().request(msg, self.nl.dest())?;
         let mut flows = Vec::new();
 
         while let Some(message) = responses.next().await {
@@ -310,11 +303,9 @@ impl State {
     ///
     /// Errors are only logged.
     async fn delete(&self, flows: Vec<Flow>) {
-        let mut responses = netlink::send_batched(
-            &self.handle,
-            self.kernel,
-            flows.into_iter().map(Flow::into_delete),
-        );
+        let mut responses = self
+            .nl
+            .send_batched(flows.into_iter().map(Flow::into_delete));
 
         while let Some(response) = responses.next().await {
             let Ok(message) =

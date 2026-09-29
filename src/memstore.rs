@@ -1,5 +1,5 @@
 use kube::runtime::watcher::Event;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{BTreeMap, btree_map};
 use std::ops::RangeBounds;
 
 #[macro_export]
