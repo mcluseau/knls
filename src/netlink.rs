@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::io;
 
 pub mod netfilter;
+pub mod wireguard;
 
 /// Safety margin subtracted from `sk_sndbuf`: the kernel's own accounting
 /// (`sk_sndbuf - 32` in `netlink_sendmsg`) plus a small headroom.

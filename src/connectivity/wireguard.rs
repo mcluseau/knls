@@ -1,5 +1,4 @@
 use cidr::{IpCidr, IpInet};
-use defguard_wireguard_rs::{self as wg, net::IpAddrMask, netlink};
 use eyre::{Result, eyre, format_err};
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1 as core;
@@ -18,6 +17,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::netlink::wireguard::{self as nlwg, Peer as WgPeer};
 use crate::rtnl_exts::ErrorExt;
 use crate::state::wireguard::{Key, Node, decode_key, encode_key};
 use crate::{
@@ -121,10 +121,20 @@ async fn setup_link(
         && link_mtu(&link) != Some(mtu)
     {
         info!("updating link {ifname} mtu to {mtu}");
-        netlink::set_mtu(ifname, mtu.into())?;
+        set_mtu(rtnl, link.header.index, mtu.into()).await?;
     }
 
     Ok(link)
+}
+
+/// Update the MTU of the link with the given index.
+async fn set_mtu(rtnl: &rtnetlink::Handle, index: u32, mtu: u32) -> Result<()> {
+    use rtnetlink::LinkUnspec;
+    rtnl.link()
+        .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+        .execute()
+        .await?;
+    Ok(())
 }
 
 async fn get_link(
@@ -173,19 +183,21 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let private_key = get_private_key(&key_path).await?;
     let pubkey: PublicKey = (&StaticSecret::from(private_key)).into();
 
+    let wg = nlwg::Wireguard::new().await?;
+
     info!("loading existing peers");
     let mut current_listen_port;
     let mut current_pubkey;
     let mut peers = change::Tracker::new();
 
     {
-        let host = netlink::get_host(&ifname)?;
+        let host = wg.get(&ifname).await?;
         current_listen_port = Some(host.listen_port);
-        current_pubkey = host.private_key.map(|k| PublicKey::from(k.as_array()));
+        current_pubkey = host.private_key.map(PublicKey::from);
 
-        for (key, raw_peer) in host.peers {
-            debug!("existing peer: {key}");
-            let key = Key::from(key.as_array());
+        for raw_peer in host.peers {
+            let key = raw_peer.public_key;
+            debug!("existing peer: {}", encode_key(&key));
             let peer = Peer {
                 endpoint: raw_peer.endpoint,
                 allowed_ips: raw_peer.allowed_ips,
@@ -279,7 +291,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             if my_node.pubkey != Some(*pubkey.as_bytes()) {
                 info!("updating node's pubkey");
                 use crate::state::wireguard::ANN_PUBKEY;
-                let pubkey = wg::key::Key::new(*pubkey.as_bytes()).to_string();
+                let pubkey = encode_key(pubkey.as_bytes());
                 let patch = json!(
                     {"metadata":{"annotations":{ ANN_PUBKEY: pubkey}}}
                 );
@@ -304,12 +316,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
         let listen_port = my_node.listen_port.unwrap_or(default_port);
         if current_listen_port != Some(listen_port) || current_pubkey != Some(pubkey) {
-            // FIXME? we read the whole interface config just to allow set_host to work,
-            // which is much more than what we want to update.
-            let mut host = netlink::get_host(&ifname)?;
-            host.listen_port = listen_port;
-            host.private_key = Some(wg::key::Key::new(private_key));
-            netlink::set_host(&ifname, &host)?;
+            wg.set_device(&ifname, listen_port, private_key).await?;
 
             current_listen_port = Some(listen_port);
             current_pubkey = Some(pubkey);
@@ -322,9 +329,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
             let peer = Peer {
                 endpoint: node.get_endpoint_from(&my_node.zone, default_port),
-                allowed_ips: (node.pod_cidrs.iter())
-                    .map(|cidr| IpAddrMask::new(cidr.first_address(), cidr.network_length()))
-                    .collect(),
+                allowed_ips: node.pod_cidrs.clone(),
             };
 
             if let Some(change) = peers.check(pubkey, &peer) {
@@ -336,7 +341,15 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                         info!("updating peer {name}");
                     }
                 };
-                netlink::set_peer(&ifname, &peer.clone().into_wg_peer(pubkey))?;
+                wg.set_peer(
+                    &ifname,
+                    &WgPeer {
+                        public_key: pubkey,
+                        endpoint: peer.endpoint,
+                        allowed_ips: peer.allowed_ips.clone(),
+                    },
+                )
+                .await?;
                 change.set(peer);
             }
 
@@ -353,9 +366,8 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         }
 
         for removed_peer in peers.deleted() {
-            let pubkey = &wg::key::Key::new(*removed_peer);
-            info!("deleting peer {pubkey}");
-            netlink::delete_peer(&ifname, pubkey)?;
+            info!("deleting peer {}", encode_key(removed_peer));
+            wg.del_peer(&ifname, *removed_peer).await?;
         }
         peers.update_done();
 
@@ -554,17 +566,7 @@ async fn create_private_key(key_path: &String) -> Result<Key> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Peer {
     endpoint: Option<std::net::SocketAddr>,
-    allowed_ips: Vec<wg::net::IpAddrMask>,
-}
-impl Peer {
-    fn into_wg_peer(self, pubkey: Key) -> wg::peer::Peer {
-        wg::peer::Peer {
-            public_key: wg::key::Key::new(pubkey),
-            endpoint: self.endpoint,
-            allowed_ips: self.allowed_ips,
-            ..Default::default()
-        }
-    }
+    allowed_ips: Vec<IpCidr>,
 }
 
 #[derive(Eq, PartialEq, serde::Serialize)]
