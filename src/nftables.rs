@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod set;
 pub mod table;
 
