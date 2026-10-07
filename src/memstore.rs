@@ -1,4 +1,4 @@
-use kube::runtime::watcher::Event;
+use crate::kube_watch::Change;
 use std::collections::{BTreeMap, btree_map};
 use std::ops::RangeBounds;
 
@@ -73,9 +73,9 @@ impl<F, T> Value<F, T> {
         self.value.as_ref()
     }
 
-    pub fn ingest(&mut self, event: &Event<F>) {
+    pub fn ingest(&mut self, event: &Change<F>) {
         // single values are not sensitive to Init/InitDone: once received, they are ready
-        use Event::*;
+        use Change::*;
         match event {
             Init | Delete(_) => self.value = None,
             InitApply(v) | Apply(v) => self.value = Some((self.map)(v)),
@@ -128,8 +128,8 @@ where
         self.map.range(bounds)
     }
 
-    pub fn ingest(&mut self, event: &Event<F>) {
-        use Event::*;
+    pub fn ingest(&mut self, event: &Change<F>) {
+        use Change::*;
         match event {
             Init => {
                 self.map.clear();

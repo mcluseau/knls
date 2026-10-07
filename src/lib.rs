@@ -14,6 +14,7 @@ pub mod netpol;
 pub mod nftables;
 pub mod proxy;
 mod rtnl_exts;
+pub mod selector;
 pub mod state;
 pub mod store;
 

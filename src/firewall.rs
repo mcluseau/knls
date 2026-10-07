@@ -1,5 +1,5 @@
 use cidr::IpCidr;
-use eyre::{bail, eyre, Result};
+use eyre::{Result, bail, eyre};
 use std::{
     collections::BTreeMap as Map,
     net::{Ipv4Addr, Ipv6Addr},

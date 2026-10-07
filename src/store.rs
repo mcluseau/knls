@@ -1,5 +1,5 @@
+use crate::kube_watch::Change;
 use core::ops::RangeBounds;
-use kube::runtime::watcher::Event;
 use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map, hash_map::Entry};
 use std::hash::Hash;
 
@@ -27,12 +27,12 @@ impl<K: Ord, V> Store<K, V> {
     }
 
     /// ingest a watcher event
-    pub fn ingest<T>(&mut self, event: &Event<T>)
+    pub fn ingest<T>(&mut self, event: &Change<T>)
     where
         for<'t> &'t T: Into<K>,
         for<'t> &'t T: Into<V>,
     {
-        use Event::*;
+        use Change::*;
         match event {
             Init => {
                 self.ready = false;
@@ -41,10 +41,10 @@ impl<K: Ord, V> Store<K, V> {
                 self.ready = true;
             }
             InitApply(o) | Apply(o) => {
-                self.map.insert(o.into(), o.into());
+                self.map.insert(o.as_ref().into(), o.as_ref().into());
             }
             Delete(o) => {
-                self.map.remove(&o.into());
+                self.map.remove(&o.as_ref().into());
             }
         }
     }
@@ -122,8 +122,8 @@ where
     }
 
     /// ingest a watcher event
-    pub fn ingest(&mut self, event: &Event<T>) {
-        use Event::*;
+    pub fn ingest(&mut self, event: &Change<T>) {
+        use Change::*;
         match event {
             Init => {
                 self.ready = false;
@@ -132,10 +132,10 @@ where
                 self.ready = true;
             }
             InitApply(o) | Apply(o) => {
-                self.insert(o.into(), (self.get_values)(o));
+                self.insert(o.as_ref().into(), (self.get_values)(o));
             }
             Delete(o) => {
-                self.remove(&o.into());
+                self.remove(&o.as_ref().into());
             }
         }
     }

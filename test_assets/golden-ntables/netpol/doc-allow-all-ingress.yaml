@@ -1,0 +1,43 @@
+- !ingest
+  - stream: Namespace
+    event: !init_apply
+      metadata: { name: default }
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: a, namespace: default, labels: { role: db } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: allow-all-ingress, namespace: default }
+      spec:
+        podSelector: {}
+        ingress:
+          - {}
+        policyTypes: [Ingress]
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_default_a }
+    }
+
+    chain ingress_pod_default_a {
+    	jump ingress_netpol_default_allow-all-ingress
+    	reject
+    }
+
+    chain ingress_netpol_default_allow-all-ingress {
+    	accept
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr vmap @pods_ingress
+    }

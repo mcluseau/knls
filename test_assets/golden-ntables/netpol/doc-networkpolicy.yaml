@@ -1,0 +1,89 @@
+- !ingest
+  - stream: Namespace
+    event: !init_apply
+      metadata: { name: default }
+  - stream: Namespace
+    event: !init_apply
+      metadata: { name: myproject, labels: { project: myproject } }
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: db, namespace: default, labels: { role: db } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: frontend, namespace: default, labels: { role: frontend } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.2 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: other, namespace: myproject, labels: { role: client } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.3 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: test-network-policy, namespace: default }
+      spec:
+        podSelector: { matchLabels: { role: db } }
+        policyTypes: [Ingress, Egress]
+        ingress:
+          - from:
+              - ipBlock: { cidr: 172.17.0.0/16, except: [172.17.1.0/24] }
+              - namespaceSelector: { matchLabels: { project: myproject } }
+              - podSelector: { matchLabels: { role: frontend } }
+            ports:
+              - protocol: TCP
+                port: 6379
+        egress:
+          - to:
+              - ipBlock: { cidr: 10.0.0.0/24 }
+            ports:
+              - protocol: TCP
+                port: 5978
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    set np_default_test-network-policy_i_1_pods_v4 {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_default_db }
+    }
+
+    map pods_egress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto egress_pod_default_db }
+    }
+
+    chain ingress_pod_default_db {
+    	jump ingress_netpol_default_test-network-policy
+    	reject
+    }
+
+    chain egress_pod_default_db {
+    	jump egress_netpol_default_test-network-policy
+    	reject
+    }
+
+    chain ingress_netpol_default_test-network-policy {
+    	meta l4proto . th dport { tcp . 6379 } ip saddr 172.17.0.0/16 ip saddr != { 172.17.1.0/24 } accept
+    	meta l4proto . th dport { tcp . 6379 } ip saddr @np_default_test-network-policy_i_1_pods_v4 accept
+    }
+
+    chain egress_netpol_default_test-network-policy {
+    	meta l4proto . th dport { tcp . 5978 } ip daddr 10.0.0.0/24 accept
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr vmap @pods_ingress
+    	ip saddr vmap @pods_egress
+    }

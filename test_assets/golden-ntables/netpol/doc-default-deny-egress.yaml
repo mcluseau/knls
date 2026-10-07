@@ -1,0 +1,40 @@
+- !ingest
+  - stream: Namespace
+    event: !init_apply
+      metadata: { name: default }
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: a, namespace: default, labels: { role: db } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: default-deny-egress, namespace: default }
+      spec:
+        podSelector: {}
+        policyTypes: [Egress]
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    map pods_egress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto egress_pod_default_a }
+    }
+
+    chain egress_pod_default_a {
+    	jump egress_netpol_default_default-deny-egress
+    	reject
+    }
+
+    chain egress_netpol_default_default-deny-egress {
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip saddr vmap @pods_egress
+    }

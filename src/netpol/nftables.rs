@@ -1,25 +1,23 @@
-use super::{ANN_EGRESS_REJECT, ANN_REJECT, EgressRule, IngressRule, Policy};
+use super::{ANN_EGRESS_REJECT, ANN_REJECT, Peer, Policy, PolicyPort, PolicyRule, RejectAction};
 use crate::{
     kube_watch::EventReceiver,
     netlink::netfilter::{self, NetlinkExt as _},
     nftables::{
-        self, Message, set,
+        Message,
+        chain::{self, Chain, Rule},
+        rules,
+        rules::{Dir, Expr, Family, Reject},
+        set,
         set::{Verdict, VerdictElem},
         table,
     },
-    state::{Namespace, Pod, keys},
+    state::{Namespace, Pod},
 };
 use cidr::IpCidr;
 use eyre::Result;
-use k8s_openapi::{
-    api::core::v1 as core,
-    api::networking::v1::{self as networking, NetworkPolicyPeer, NetworkPolicyPort},
-    apimachinery::pkg::apis::meta::v1::LabelSelector,
-    apimachinery::pkg::util::intstr::IntOrString,
-};
+use k8s_openapi::{api::core::v1 as core, api::networking::v1 as networking};
 use log::error;
-use std::collections::{BTreeMap as Map, BTreeSet as Set};
-use std::fmt::Write;
+use std::collections::BTreeSet as Set;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -31,17 +29,17 @@ pub struct Config {
     /// nftables table's name
     table: String,
     /// reject action (for ingress rules)
-    reject: String,
+    reject: RejectAction,
     /// reject action (for egress rules)
-    egress_reject: String,
+    egress_reject: RejectAction,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             table: "kube-netpol".into(),
-            reject: "reject".into(),
-            egress_reject: "reject".into(),
+            reject: RejectAction::Reject,
+            egress_reject: RejectAction::Reject,
         }
     }
 }
@@ -80,234 +78,449 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         }
         prev = h;
 
-        log::debug!("applying nft netpol script:\n{}", rendered.script);
-
-        if let Err(e) = apply(&nl, &cfg.table, rendered).await {
+        // Everything in one atomic batch: the message order satisfies every
+        // reference (sets before the rules using them, chains before the vmap
+        // elements that `goto` them).
+        if let Err(e) = nl.send_as_transactions(rendered.messages.into_iter()).await {
             error!("netpol update failed: {e}");
         }
     }
 }
 
-/// Applies a rendered netpol table to `table`.
-///
-/// Order matters: sets/maps must exist before the rules referencing them, and
-/// the map elements (`goto <chain>`) before those chains are populated by the
-/// script.
-async fn apply(
-    nl: &crate::netlink::Netlink<netlink_packet_netfilter::NetfilterMessage>,
-    table_name: &str,
-    rendered: Rendered,
-) -> Result<()> {
-    nl.send_as_transactions(table::recreate(table_name).into_iter())
-        .await?;
-    nl.send_as_transactions(rendered.peers.into_iter()).await?;
-    nl.send_as_transactions(rendered.vmap_create.into_iter())
-        .await?;
-
-    nftables::apply_script(rendered.script)
-        .await
-        .map_err(|e| eyre::eyre!("applying netpol chains failed: {e}"))?;
-
-    nl.send_as_transactions(rendered.vmap_fill.into_iter())
-        .await?;
-    Ok(())
-}
-
-/// The rendered netpol table: the chain/rule script and the netlink messages
-/// for the named sets and verdict maps.
+/// The rendered netpol table: the netlink messages to apply.
 struct Rendered {
-    script: String,
-    peers: Vec<Message>,
-    vmap_create: Vec<Message>,
-    vmap_fill: Vec<Message>,
+    messages: Vec<Message>,
 }
 
 impl Rendered {
     /// The full-content hash, so an element-only change is not missed.
     fn hash(&self) -> u128 {
         let mut hasher = xxh3::Xxh3::new();
-        hasher.update(self.script.as_bytes());
-        for group in [&self.peers, &self.vmap_create, &self.vmap_fill] {
-            for msg in group {
-                let mut msg = msg.clone();
-                msg.finalize();
-                let mut buf = vec![0u8; msg.buffer_len()];
-                msg.serialize(&mut buf);
-                hasher.update(&buf);
-            }
+        for msg in &self.messages {
+            let mut msg = msg.clone();
+            msg.finalize();
+            let mut buf = vec![0u8; msg.buffer_len()];
+            msg.serialize(&mut buf);
+            hasher.update(&buf);
         }
         hasher.digest128()
     }
 }
 
-/// Renders the netpol table for `state`: the chain/rule script plus the named
-/// peer sets and pod verdict maps to push over netlink.
+/// Renders the netpol table for `state` as netlink messages.
 fn render(state: &State, cfg: &Config, node_name: &str) -> Rendered {
-    let mut script = String::new();
-    let mut sets = NamedSets::new(&cfg.table);
+    let mut b = Builder::new(cfg);
 
-    macro_rules! w {
-        ($($tt:tt)*) => {
-            script.write_fmt(format_args!($($tt)*)).unwrap();
-            script.push('\n');
-        };
-    }
-
-    w!("table inet {} {{", cfg.table);
-
-    let mut used_netpols = Set::new();
-
-    for (pod_key, pod) in state.pods.iter() {
-        if pod.host_network {
-            continue; // no filtering on host-network pods
-        }
-        if pod.node != node_name {
-            continue;
-        };
-
-        let (ns, name) = pod_key.as_str();
-
-        let netpols: Vec<_> = (state.netpols.iter())
-            .filter(|(_, np)| np.matches_pod(pod_key, pod))
-            .collect();
-
-        if netpols.is_empty() {
-            continue; // no netpols apply to the pod, don't filter its traffic
-        }
-
-        for (k, _) in &netpols {
-            used_netpols.insert((k.namespace.as_str(), k.name.as_str()));
-        }
-
-        let mut recorded = false;
-        for (np_ns, np_name) in (netpols.iter())
-            .filter(|(_, np)| np.is_ingress)
-            .map(|(k, _)| k.as_str())
-        {
-            if !recorded {
-                recorded = true;
-                let chain = format!("ingress_pod_{ns}_{name}");
-                for ip in &pod.ipsv4 {
-                    sets.pods_ingress.items.push((*ip, chain.clone()));
-                }
-                for ip in &pod.ipsv6 {
-                    sets.pods_ingress6.items.push((*ip, chain.clone()));
-                }
-                w!("  chain {chain} {{");
-            }
-            w!("    jump ingress_netpol_{np_ns}_{np_name};");
-        }
-        if recorded {
-            let reject = pod.annotations.get(ANN_REJECT).unwrap_or(&cfg.reject);
-            w!("    {reject};");
-            w!("  }}");
-        }
-
-        let mut recorded = false;
-        for (np_ns, np_name) in (netpols.iter())
-            .filter(|(_, np)| np.is_egress)
-            .map(|(k, _)| k.as_str())
-        {
-            if !recorded {
-                recorded = true;
-                let chain = format!("egress_pod_{ns}_{name}");
-                for ip in &pod.ipsv4 {
-                    sets.pods_egress.items.push((*ip, chain.clone()));
-                }
-                for ip in &pod.ipsv6 {
-                    sets.pods_egress6.items.push((*ip, chain.clone()));
-                }
-                w!("  chain {chain} {{");
-            }
-            w!("    jump egress_netpol_{np_ns}_{np_name};");
-        }
-        if recorded {
-            let reject = pod
-                .annotations
-                .get(ANN_EGRESS_REJECT)
-                .unwrap_or(&cfg.egress_reject);
-            w!("    {reject};");
-            w!("  }}");
-        }
-    }
-
-    {
-        let mut helper = NetpolHelper {
-            state,
-            sets: &mut sets,
-            prefix: String::new(),
-            idx: 0,
-        };
-
-        for (np_key, np) in state.netpols.iter() {
-            let (ns, name) = np_key.as_str();
-            if !used_netpols.contains(&(ns, name)) {
-                continue;
-            }
-
-            if np.is_ingress {
-                helper.begin(format!("np_{ns}_{name}_i"));
-                w!("  chain ingress_netpol_{ns}_{name} {{");
-                for rule in &np.ingress {
-                    let r = helper.ingress_rules(rule);
-                    w!("{r}");
-                }
-                w!("  }}");
-            }
-
-            if np.is_egress {
-                helper.begin(format!("np_{ns}_{name}_e"));
-                w!("  chain egress_netpol_{ns}_{name} {{");
-                for rule in &np.egress {
-                    let r = helper.egress_rules(rule);
-                    w!("{r}");
-                }
-                w!("  }}");
-            }
-        }
-    }
-
-    w!("  chain pods_filter {{");
-    w!("    type filter hook forward priority 0; policy accept;");
-    if !sets.pods_ingress.is_empty() {
-        w!("    ip daddr vmap @pods_ingress;");
-    }
-    if !sets.pods_egress.is_empty() {
-        w!("    ip saddr vmap @pods_egress;");
-    }
-    if !sets.pods_ingress6.is_empty() {
-        w!("    ip6 daddr vmap @pods_ingress6;");
-    }
-    if !sets.pods_egress6.is_empty() {
-        w!("    ip6 saddr vmap @pods_egress6;");
-    }
-    w!("  }}");
-
-    w!("}}");
+    b.pod_chains(state, node_name);
+    b.netpol_chains(state);
+    b.base_chain();
 
     Rendered {
-        peers: sets.peer_messages(),
-        vmap_create: sets.vmap_create_messages(),
-        vmap_fill: sets.vmap_fill_messages(),
-        script,
+        messages: b.into_messages(),
     }
 }
 
-/// The named peer sets and pod verdict maps a netpol table references.
-///
-/// Rules are generated as text referencing sets by `@name`; their contents are
-/// collected here and pushed to the kernel over netlink.
+/// A chain plus whether it is a base chain (needs the hook on creation).
+struct BuiltChain<'t> {
+    chain: Chain<'t>,
+    base: bool,
+}
+
+/// Accumulates the sets, maps and chains of one netpol table.
+struct Builder<'t> {
+    cfg: &'t Config,
+    sets: NamedSets,
+    chains: Vec<BuiltChain<'t>>,
+}
+
+impl<'t> Builder<'t> {
+    fn new(cfg: &'t Config) -> Self {
+        Self {
+            cfg,
+            sets: NamedSets::new(&cfg.table),
+            chains: Vec::new(),
+        }
+    }
+
+    /// Adds a regular chain and returns it for filling.
+    fn chain(&mut self, name: String) -> &mut Chain<'t> {
+        self.chains.push(BuiltChain {
+            chain: Chain::new(self.cfg.table.as_str(), name),
+            base: false,
+        });
+        &mut self.chains.last_mut().expect("just pushed").chain
+    }
+
+    fn pod_chains(&mut self, state: &State, node_name: &str) {
+        for (pod_key, pod) in state.pods.iter() {
+            if pod.host_network {
+                continue; // no filtering on host-network pods
+            }
+            if pod.node != node_name {
+                continue;
+            };
+
+            let (ns, name) = pod_key.as_str();
+
+            let netpols: Vec<_> = (state.netpols.iter())
+                .filter(|(_, np)| np.matches_pod(pod_key, pod))
+                .collect();
+
+            if netpols.is_empty() {
+                continue; // no netpols apply to the pod, don't filter its traffic
+            }
+
+            let ingress: Vec<_> = (netpols.iter())
+                .filter(|(_, np)| np.is_ingress())
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if !ingress.is_empty() {
+                let chain_name = format!("ingress_pod_{ns}_{name}");
+                for ip in &pod.ipsv4 {
+                    self.sets.pods_ingress.items.push((*ip, chain_name.clone()));
+                }
+                for ip in &pod.ipsv6 {
+                    self.sets
+                        .pods_ingress6
+                        .items
+                        .push((*ip, chain_name.clone()));
+                }
+
+                let mut rules: Vec<Rule> = ingress
+                    .iter()
+                    .map(|(np_ns, np_name)| {
+                        vec![rules::jump(format!("ingress_netpol_{np_ns}_{np_name}"))]
+                    })
+                    .collect();
+                rules.push(action_rule(pod, ANN_REJECT, self.cfg.reject));
+                self.chain(chain_name).extend(rules);
+            }
+
+            let egress: Vec<_> = (netpols.iter())
+                .filter(|(_, np)| np.is_egress())
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if !egress.is_empty() {
+                let chain_name = format!("egress_pod_{ns}_{name}");
+                for ip in &pod.ipsv4 {
+                    self.sets.pods_egress.items.push((*ip, chain_name.clone()));
+                }
+                for ip in &pod.ipsv6 {
+                    self.sets.pods_egress6.items.push((*ip, chain_name.clone()));
+                }
+
+                let mut rules: Vec<Rule> = egress
+                    .iter()
+                    .map(|(np_ns, np_name)| {
+                        vec![rules::jump(format!("egress_netpol_{np_ns}_{np_name}"))]
+                    })
+                    .collect();
+                rules.push(action_rule(pod, ANN_EGRESS_REJECT, self.cfg.egress_reject));
+                self.chain(chain_name).extend(rules);
+            }
+        }
+    }
+
+    fn netpol_chains(&mut self, state: &State) {
+        // Only netpols matching a pod on this node are materialized.
+        let mut used = Set::new();
+        for (pod_key, pod) in state.pods.iter() {
+            for (k, np) in state.netpols.iter() {
+                if np.matches_pod(pod_key, pod) {
+                    used.insert(k.as_str());
+                }
+            }
+        }
+
+        for (np_key, np) in state.netpols.iter() {
+            let (ns, name) = np_key.as_str();
+            if !used.contains(&(ns, name)) {
+                continue;
+            }
+
+            if np.is_ingress() {
+                let chain = format!("ingress_netpol_{ns}_{name}");
+                let mut helper = Helper {
+                    state,
+                    sets: &mut self.sets,
+                    prefix: format!("np_{ns}_{name}_i"),
+                    idx: 0,
+                };
+                let rules: Vec<Rule> = np
+                    .ingress()
+                    .iter()
+                    .flat_map(|rule| helper.rule(rule, Dir::Src))
+                    .collect();
+                self.chain(chain).extend(rules);
+            }
+
+            if np.is_egress() {
+                let chain = format!("egress_netpol_{ns}_{name}");
+                let mut helper = Helper {
+                    state,
+                    sets: &mut self.sets,
+                    prefix: format!("np_{ns}_{name}_e"),
+                    idx: 0,
+                };
+                let rules: Vec<Rule> = np
+                    .egress()
+                    .iter()
+                    .flat_map(|rule| helper.rule(rule, Dir::Dst))
+                    .collect();
+                self.chain(chain).extend(rules);
+            }
+        }
+    }
+
+    fn base_chain(&mut self) {
+        let pods_ingress = &self.sets.pods_ingress;
+        let pods_ingress6 = &self.sets.pods_ingress6;
+        let pods_egress = &self.sets.pods_egress;
+        let pods_egress6 = &self.sets.pods_egress6;
+
+        let mut chain = Chain::new(self.cfg.table.as_str(), "pods_filter");
+
+        let maps: [(Family, Dir, &PodMap<Ipv4Addr>); 2] = [
+            (Family::V4, Dir::Dst, pods_ingress),
+            (Family::V4, Dir::Src, pods_egress),
+        ];
+        for (family, dir, map) in maps {
+            if !map.is_empty() {
+                chain.extend(std::iter::once(rules::ip_vmap(family, dir, &map.name)));
+            }
+        }
+        let maps6: [(Family, Dir, &PodMap<Ipv6Addr>); 2] = [
+            (Family::V6, Dir::Dst, pods_ingress6),
+            (Family::V6, Dir::Src, pods_egress6),
+        ];
+        for (family, dir, map) in maps6 {
+            if !map.is_empty() {
+                chain.extend(std::iter::once(rules::ip_vmap(family, dir, &map.name)));
+            }
+        }
+
+        self.chains.push(BuiltChain { chain, base: true });
+    }
+
+    fn into_messages(self) -> Vec<Message> {
+        let Self { sets, chains, .. } = self;
+
+        let mut out = Vec::new();
+
+        // 1. table + sets/maps, all before any rule references them.
+        out.extend(table::recreate(&sets.table));
+        out.extend(sets.set_messages());
+
+        // 2. chains (base gets its hook), then their rules.
+        for c in &chains {
+            out.push(if c.base {
+                c.chain
+                    .create_base(chain::InetHookNumber::Forward, 0, chain::ACCEPT)
+            } else {
+                c.chain.create()
+            });
+        }
+        for c in &chains {
+            out.extend(c.chain.fill());
+        }
+
+        // 3. vmap elements, now that the chains they `goto` exist.
+        out.extend(sets.vmap_fill_messages());
+
+        out
+    }
+}
+
+/// The rule a pod chain applies when no netpol rule matched.
+fn action_rule(pod: &Pod, annotation: &str, default: RejectAction) -> Rule {
+    let action = pod
+        .annotations
+        .get(annotation)
+        .map(|v| RejectAction::from_annotation(v))
+        .unwrap_or(default);
+    match action {
+        RejectAction::Drop => vec![rules::drop()],
+        RejectAction::Reject => vec![Reject::default().into()],
+    }
+}
+
+/// Builds the rules of one netpol rule, registering its named sets.
+struct Helper<'t> {
+    state: &'t State,
+    sets: &'t mut NamedSets,
+    prefix: String,
+    idx: u32,
+}
+
+impl Helper<'_> {
+    /// Builds the rules of one netpol rule: one rule per peer clause, all
+    /// `accept`. Each generated rule gets its own anonymous port set (the
+    /// kernel binds an anonymous set to a single rule).
+    fn rule(&mut self, rule: &PolicyRule, dir: Dir) -> Vec<Rule> {
+        self.idx += 1;
+
+        let peer_clauses = self.peers(dir, rule.peers());
+
+        let mut out = Vec::new();
+        for clause in &peer_clauses {
+            for mut pred in self.port_preds(rule.ports()) {
+                pred.extend(clause.iter().cloned());
+                pred.push(rules::accept());
+                out.push(pred);
+            }
+        }
+        out
+    }
+
+    /// One predicate per port alternative; no ports (or none specified) matches
+    /// all, as an empty predicate.
+    ///
+    /// The specific port/range alternatives become a fresh anonymous
+    /// `inet_proto . inet_service` concat set (printed inline by nft). An
+    /// alternative without a port is a full `0-65535` range so it can join the
+    /// same set, rather than a separate protocol-only predicate.
+    fn port_preds(&mut self, ports: &[PolicyPort]) -> Vec<Vec<Expr>> {
+        if ports.is_empty() {
+            return vec![Vec::new()];
+        }
+
+        let mut ranges: Vec<RangeInclusive<(u8, u16)>> = Vec::with_capacity(ports.len());
+
+        for port in ports {
+            let proto = port.proto().ip_proto();
+            match port.port() {
+                // any port: the full range
+                None => ranges.push((proto, 0)..=(proto, u16::MAX)),
+                Some(port) => {
+                    ranges.push((proto, port.start().to_owned())..=(proto, port.end().to_owned()));
+                }
+            }
+        }
+
+        let name = self.sets.push_anon_ports(ranges);
+        vec![rules::l4proto_dport_set(&name)]
+    }
+
+    /// One clause per peer (OR'd by the caller); none specified matches all.
+    fn peers(&mut self, dir: Dir, peers: &[Peer]) -> Vec<Vec<Expr>> {
+        if peers.is_empty() {
+            return vec![Vec::new()];
+        }
+
+        let mut clauses = Vec::new();
+        let mut ipsv4: Set<Ipv4Addr> = Set::new();
+        let mut ipsv6: Set<Ipv6Addr> = Set::new();
+
+        for peer in peers {
+            match peer {
+                Peer::IpBlock { cidr, except } => {
+                    // match the block's prefix inline, then exclude the `except`
+                    // ranges via an anonymous interval set (`!= { … }`)
+                    let mut clause = ip_prefix_clause(cidr, dir);
+                    clause.extend(self.except_clause(except, dir));
+                    clauses.push(clause);
+                }
+                Peer::Selector { namespace, pod } => {
+                    let ns_filter: Option<Set<&str>> = namespace.as_ref().map(|sel| {
+                        (self.state.nses.iter())
+                            .filter(|(_, ns)| sel.matches(&ns.labels))
+                            .map(|(ns, _)| ns.as_str())
+                            .collect()
+                    });
+
+                    for (key, pod_state) in self.state.pods.iter() {
+                        if let Some(ref ns_filter) = ns_filter
+                            && !ns_filter.contains(key.namespace.as_str())
+                        {
+                            continue;
+                        }
+
+                        if let Some(filter) = pod
+                            && !filter.matches(&pod_state.labels)
+                        {
+                            continue;
+                        }
+
+                        ipsv4.extend(&pod_state.ipsv4);
+                        ipsv6.extend(&pod_state.ipsv6);
+                    }
+                }
+            }
+        }
+
+        if !ipsv4.is_empty() {
+            let name = format!("{}_{}_pods_v4", self.prefix, self.idx);
+            self.sets
+                .push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
+            clauses.push(rules::ip_set(Family::V4, dir, &name, false));
+        }
+        if !ipsv6.is_empty() {
+            let name = format!("{}_{}_pods_v6", self.prefix, self.idx);
+            self.sets
+                .push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
+            clauses.push(rules::ip_set(Family::V6, dir, &name, false));
+        }
+
+        if clauses.is_empty() {
+            vec![Vec::new()] // everything filtered out: match all, safest
+        } else {
+            clauses
+        }
+    }
+
+    /// The exclusion clause for an `ipBlock`'s `except` list: an anonymous
+    /// interval set of the excepted ranges, looked up inverted (`!= { … }`).
+    ///
+    /// `except` all share one address family in practice; a mixed list yields
+    /// one clause per family (each its own set).
+    fn except_clause(&mut self, except: &[IpCidr], dir: Dir) -> Vec<Expr> {
+        let v4: Vec<_> = except
+            .iter()
+            .filter_map(|c| match c {
+                IpCidr::V4(c) => Some(c.first_address()..=c.last_address()),
+                _ => None,
+            })
+            .collect();
+        let v6: Vec<_> = except
+            .iter()
+            .filter_map(|c| match c {
+                IpCidr::V6(c) => Some(c.first_address()..=c.last_address()),
+                _ => None,
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        if !v4.is_empty() {
+            let name = self.sets.push_anon_v4(v4);
+            out.extend(rules::ip_set(Family::V4, dir, &name, true));
+        }
+        if !v6.is_empty() {
+            let name = self.sets.push_anon_v6(v6);
+            out.extend(rules::ip_set(Family::V6, dir, &name, true));
+        }
+        out
+    }
+}
+
+/// The named peer sets, anonymous port/except sets and verdict maps a netpol
+/// table references.
 struct NamedSets {
     table: String,
     next_id: u32,
-    interval_v4: Vec<NamedSet<RangeInclusive<Ipv4Addr>>>,
-    interval_v6: Vec<NamedSet<RangeInclusive<Ipv6Addr>>>,
+    anon_ports: Vec<NamedSet<RangeInclusive<(u8, u16)>>>,
+    anon_v4: Vec<NamedSet<RangeInclusive<Ipv4Addr>>>,
+    anon_v6: Vec<NamedSet<RangeInclusive<Ipv6Addr>>>,
     simple_v4: Vec<NamedSet<Ipv4Addr>>,
     simple_v6: Vec<NamedSet<Ipv6Addr>>,
     pods_ingress: PodMap<Ipv4Addr>,
     pods_ingress6: PodMap<Ipv6Addr>,
     pods_egress: PodMap<Ipv4Addr>,
     pods_egress6: PodMap<Ipv6Addr>,
+}
+
+/// Sorts inclusive ranges by their endpoints (`RangeInclusive` isn't `Ord`).
+fn sort_ranges<T: Ord>(ranges: &mut [RangeInclusive<T>]) {
+    ranges.sort_by(|a, b| a.start().cmp(b.start()).then_with(|| a.end().cmp(b.end())));
 }
 
 struct NamedSet<T> {
@@ -333,8 +546,9 @@ impl NamedSets {
         let mut sets = Self {
             table: table.into(),
             next_id: 0,
-            interval_v4: Vec::new(),
-            interval_v6: Vec::new(),
+            anon_ports: Vec::new(),
+            anon_v4: Vec::new(),
+            anon_v6: Vec::new(),
             simple_v4: Vec::new(),
             simple_v6: Vec::new(),
             pods_ingress: PodMap {
@@ -370,35 +584,79 @@ impl NamedSets {
         self.next_id
     }
 
-    fn push_interval_v4(&mut self, name: String, items: Vec<RangeInclusive<Ipv4Addr>>) {
+    /// Registers a fresh anonymous port set, returning its name.
+    ///
+    /// The kernel binds an anonymous set to a single rule, so one is created per
+    /// rule that constrains ports; nft prints it inline (`{ tcp . 80, … }`).
+    fn push_anon_ports(&mut self, mut items: Vec<RangeInclusive<(u8, u16)>>) -> String {
         let id = self.next_id();
-        self.interval_v4.push(NamedSet { id, name, items });
+        sort_ranges(&mut items);
+        let name = format!("__set{id}");
+        self.anon_ports.push(NamedSet {
+            id,
+            name: name.clone(),
+            items,
+        });
+        name
     }
-    fn push_interval_v6(&mut self, name: String, items: Vec<RangeInclusive<Ipv6Addr>>) {
+    fn push_simple_v4(&mut self, name: String, mut items: Vec<Ipv4Addr>) {
         let id = self.next_id();
-        self.interval_v6.push(NamedSet { id, name, items });
-    }
-    fn push_simple_v4(&mut self, name: String, items: Vec<Ipv4Addr>) {
-        let id = self.next_id();
+        items.sort();
+        items.dedup();
         self.simple_v4.push(NamedSet { id, name, items });
     }
-    fn push_simple_v6(&mut self, name: String, items: Vec<Ipv6Addr>) {
+    fn push_simple_v6(&mut self, name: String, mut items: Vec<Ipv6Addr>) {
         let id = self.next_id();
+        items.sort();
+        items.dedup();
         self.simple_v6.push(NamedSet { id, name, items });
     }
 
-    /// Create + fill the peer sets (they have no dependencies).
-    fn peer_messages(&self) -> Vec<Message> {
+    /// Registers a fresh anonymous IPv4 interval set (an `ipBlock`'s `except`
+    /// list), returning its name. nft prints it inline (`!= { … }`).
+    fn push_anon_v4(&mut self, mut items: Vec<RangeInclusive<Ipv4Addr>>) -> String {
+        let id = self.next_id();
+        sort_ranges(&mut items);
+        let name = format!("__set{id}");
+        self.anon_v4.push(NamedSet {
+            id,
+            name: name.clone(),
+            items,
+        });
+        name
+    }
+
+    /// Registers a fresh anonymous IPv6 interval set (an `ipBlock`'s `except`
+    /// list), returning its name.
+    fn push_anon_v6(&mut self, mut items: Vec<RangeInclusive<Ipv6Addr>>) -> String {
+        let id = self.next_id();
+        sort_ranges(&mut items);
+        let name = format!("__set{id}");
+        self.anon_v6.push(NamedSet {
+            id,
+            name: name.clone(),
+            items,
+        });
+        name
+    }
+
+    /// Create + fill every named peer/port set, and create the pod maps.
+    fn set_messages(&self) -> Vec<Message> {
         let mut out = Vec::new();
 
-        for s in &self.interval_v4 {
-            let set = set::Set::<RangeInclusive<Ipv4Addr>>::new(&self.table, &s.name, s.id);
-            out.push(set.create(None));
+        for s in &self.anon_ports {
+            let set = set::Set::<RangeInclusive<(u8, u16)>>::new(&self.table, &s.name, s.id);
+            out.push(set.create_anonymous());
             out.extend(set.fill(s.items.iter().cloned()));
         }
-        for s in &self.interval_v6 {
+        for s in &self.anon_v4 {
+            let set = set::Set::<RangeInclusive<Ipv4Addr>>::new(&self.table, &s.name, s.id);
+            out.push(set.create_anonymous());
+            out.extend(set.fill(s.items.iter().cloned()));
+        }
+        for s in &self.anon_v6 {
             let set = set::Set::<RangeInclusive<Ipv6Addr>>::new(&self.table, &s.name, s.id);
-            out.push(set.create(None));
+            out.push(set.create_anonymous());
             out.extend(set.fill(s.items.iter().cloned()));
         }
         for s in &self.simple_v4 {
@@ -411,629 +669,525 @@ impl NamedSets {
             out.push(set.create(None));
             out.extend(set.fill(s.items.iter().copied()));
         }
+        for map in [&self.pods_ingress, &self.pods_egress] {
+            if !map.is_empty() {
+                out.push(map.create_message(&self.table));
+            }
+        }
+        for map in [&self.pods_ingress6, &self.pods_egress6] {
+            if !map.is_empty() {
+                out.push(map.create_message(&self.table));
+            }
+        }
 
-        out
-    }
-
-    /// Create the pod verdict maps (empty).
-    fn vmap_create_messages(&self) -> Vec<Message> {
-        let mut out = Vec::new();
-        if !self.pods_ingress.is_empty() {
-            out.push(vmap::<Ipv4Addr>(&self.table, &self.pods_ingress).create(None));
-        }
-        if !self.pods_ingress6.is_empty() {
-            out.push(vmap::<Ipv6Addr>(&self.table, &self.pods_ingress6).create(None));
-        }
-        if !self.pods_egress.is_empty() {
-            out.push(vmap::<Ipv4Addr>(&self.table, &self.pods_egress).create(None));
-        }
-        if !self.pods_egress6.is_empty() {
-            out.push(vmap::<Ipv6Addr>(&self.table, &self.pods_egress6).create(None));
-        }
         out
     }
 
     /// Fill the pod verdict maps (requires the target chains to exist).
     fn vmap_fill_messages(&self) -> Vec<Message> {
         let mut out = Vec::new();
-        if !self.pods_ingress.is_empty() {
-            out.extend(
-                vmap::<Ipv4Addr>(&self.table, &self.pods_ingress).fill(
-                    self.pods_ingress
-                        .items
-                        .iter()
-                        .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
-                ),
-            );
-        }
-        if !self.pods_ingress6.is_empty() {
-            out.extend(
-                vmap::<Ipv6Addr>(&self.table, &self.pods_ingress6).fill(
-                    self.pods_ingress6
-                        .items
-                        .iter()
-                        .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
-                ),
-            );
-        }
-        if !self.pods_egress.is_empty() {
-            out.extend(
-                vmap::<Ipv4Addr>(&self.table, &self.pods_egress).fill(
-                    self.pods_egress
-                        .items
-                        .iter()
-                        .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
-                ),
-            );
-        }
-        if !self.pods_egress6.is_empty() {
-            out.extend(
-                vmap::<Ipv6Addr>(&self.table, &self.pods_egress6).fill(
-                    self.pods_egress6
-                        .items
-                        .iter()
-                        .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
-                ),
-            );
-        }
+        out.extend(self.pods_ingress.fill_messages(&self.table));
+        out.extend(self.pods_ingress6.fill_messages(&self.table));
+        out.extend(self.pods_egress.fill_messages(&self.table));
+        out.extend(self.pods_egress6.fill_messages(&self.table));
         out
     }
 }
 
-/// A [`VerdictMapSet`](set::VerdictMapSet) handle for a pod map.
-fn vmap<'t, A: set::Data>(table: &'t str, map: &'t PodMap<A>) -> set::VerdictMapSet<'t, A> {
-    set::Set::new(table, &map.name, map.id)
-}
-
-
-struct NetpolHelper<'t> {
-    state: &'t State,
-    sets: &'t mut NamedSets,
-    prefix: String,
-    idx: u32,
-}
-
-impl NetpolHelper<'_> {
-    fn begin(&mut self, prefix: String) {
-        self.prefix = prefix;
-        self.idx = 0;
+impl<A: set::Data + Copy> PodMap<A> {
+    fn create_message(&self, table: &str) -> Message {
+        set::Set::<VerdictElem<A>>::new(table, &self.name, self.id).create(None)
     }
 
-    fn ingress_rules(&mut self, rule: &IngressRule) -> String {
-        let ports = self.ports(&rule.ports);
-        self.rules(&ports, &rule.from, "saddr")
-    }
-
-    fn egress_rules(&mut self, rule: &EgressRule) -> String {
-        let ports = self.ports(&rule.ports);
-        self.rules(&ports, &rule.to, "daddr")
-    }
-
-    fn rules(
-        &mut self,
-        ports: &str,
-        peers: &Option<Vec<NetworkPolicyPeer>>,
-        addr_type: &str,
-    ) -> String {
-        self.idx += 1;
-        let clauses = self.peers(addr_type, peers);
-
-        let mut rules = String::new();
-        for clause in clauses {
-            rules.push_str(&format!("    {ports}{clause}accept;\n"));
+    fn fill_messages(&self, table: &str) -> Vec<Message> {
+        if self.items.is_empty() {
+            return Vec::new();
         }
-        rules
-    }
-
-    fn ports(&self, ports: &Option<Vec<NetworkPolicyPort>>) -> String {
-        let mut rule = String::new();
-
-        let Some(ports) = ports.as_ref() else {
-            return rule;
-        };
-        if ports.is_empty() {
-            return rule;
-        }
-
-        rule.push_str("meta l4proto . th dport {");
-        for port in ports {
-            let proto = port.protocol.as_deref().unwrap_or("TCP").to_lowercase();
-            let port_range = match (port.port.as_ref(), port.end_port) {
-                (None, _) => "0-0xffff",
-                (Some(IntOrString::String(_)), _) => {
-                    error!("named ports are not supported here");
-                    continue;
-                }
-                (Some(IntOrString::Int(port)), None) => &format!("{port}"),
-                (Some(IntOrString::Int(port)), Some(end)) => &format!("{port}-{end}"),
-            };
-            rule.push_str(&format!("{proto} . {port_range}, "));
-        }
-        rule.push_str("} ");
-
-        rule
-    }
-
-    /// Registers named sets for `peers` and returns the match clauses
-    /// referencing them (one clause per rule to emit).
-    fn peers(&mut self, addr_type: &str, peers: &Option<Vec<NetworkPolicyPeer>>) -> Vec<String> {
-        let Some(peers) = peers.as_ref() else {
-            return vec![String::new()]; // unspecified = match all
-        };
-        if peers.is_empty() {
-            return vec![String::new()]; // empty = match all
-        }
-
-        let mut clauses = Vec::new();
-        let mut ipsv4: Set<Ipv4Addr> = Set::new();
-        let mut ipsv6: Set<Ipv6Addr> = Set::new();
-        let mut block_n = 0u32;
-
-        for peer in peers {
-            if let Some(ref ip_block) = peer.ip_block {
-                let Ok(cidr) = (ip_block.cidr.parse::<IpCidr>())
-                    .inspect_err(|e| error!("invalid ip block (ignored): {}: {e}", ip_block.cidr))
-                else {
-                    continue;
-                };
-                let except = ip_block.except.as_deref().unwrap_or(&[]);
-                block_n += 1;
-
-                match cidr {
-                    IpCidr::V4(cidr) => {
-                        let Some(ib) = IpBlock::new(cidr, except) else {
-                            continue;
-                        };
-                        let name = format!("{np}_{n}_b{block_n}_v4", np = self.prefix, n = self.idx);
-                        let mut clause = format!("ip {addr_type} @{name} ");
-                        let range = ib.cidr.first_address()..=ib.cidr.last_address();
-                        if !ib.except.is_empty() {
-                            let exc_name = format!("{name}_exc");
-                            let ranges = ib
-                                .except
-                                .iter()
-                                .map(|c| c.first_address()..=c.last_address())
-                                .collect();
-                            self.sets.push_interval_v4(exc_name.clone(), ranges);
-                            clause.push_str(&format!("ip {addr_type} != @{exc_name} "));
-                        }
-                        self.sets.push_interval_v4(name, vec![range]);
-                        clauses.push(clause);
-                    }
-                    IpCidr::V6(cidr) => {
-                        let Some(ib) = IpBlock::new(cidr, except) else {
-                            continue;
-                        };
-                        let name = format!("{np}_{n}_b{block_n}_v6", np = self.prefix, n = self.idx);
-                        let mut clause = format!("ip6 {addr_type} @{name} ");
-                        let range = ib.cidr.first_address()..=ib.cidr.last_address();
-                        if !ib.except.is_empty() {
-                            let exc_name = format!("{name}_exc");
-                            let ranges = ib
-                                .except
-                                .iter()
-                                .map(|c| c.first_address()..=c.last_address())
-                                .collect();
-                            self.sets.push_interval_v6(exc_name.clone(), ranges);
-                            clause.push_str(&format!("ip6 {addr_type} != @{exc_name} "));
-                        }
-                        self.sets.push_interval_v6(name, vec![range]);
-                        clauses.push(clause);
-                    }
-                }
-                continue;
-            }
-
-            let ns_filter: Option<Vec<_>> = peer.namespace_selector.as_ref().map(|ns_sel| {
-                (self.state.nses.iter())
-                    .filter(|(_, ns)| ns_sel.matches_labels(&ns.labels))
-                    .map(|(ns, _)| ns)
-                    .collect()
-            });
-
-            for (key, pod) in self.state.pods.iter() {
-                if let Some(ref ns_filter) = ns_filter
-                    && ns_filter.iter().all(|v| *v != &key.namespace)
-                {
-                    continue;
-                }
-
-                if let Some(ref filter) = peer.pod_selector
-                    && !filter.matches_pod(key, pod)
-                {
-                    continue;
-                }
-
-                ipsv4.extend(&pod.ipsv4);
-                ipsv6.extend(&pod.ipsv6);
-            }
-        }
-
-        if !ipsv4.is_empty() {
-            let name = format!("{}_{}_pods_v4", self.prefix, self.idx);
-            self.sets
-                .push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
-            clauses.push(format!("ip {addr_type} @{name} "));
-        }
-        if !ipsv6.is_empty() {
-            let name = format!("{}_{}_pods_v6", self.prefix, self.idx);
-            self.sets
-                .push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
-            clauses.push(format!("ip6 {addr_type} @{name} "));
-        }
-
-        clauses
+        set::Set::<VerdictElem<A>>::new(table, &self.name, self.id)
+            .fill(
+                self.items
+                    .iter()
+                    .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
+            )
+            .collect()
     }
 }
 
-struct IpBlock<T> {
-    cidr: T,
-    except: Vec<T>,
-}
-
-impl<T> IpBlock<T>
-where
-    T: std::str::FromStr,
-    <T as std::str::FromStr>::Err: std::fmt::Display,
-{
-    fn new(cidr: T, except_str: &[String]) -> Option<Self> {
-        let mut except = Vec::with_capacity(except_str.len());
-        for s in except_str {
-            let v = (s.parse())
-                .inspect_err(|e| error!("invalid ip block except (block ignored): {s}: {e}"))
-                .ok()?;
-            except.push(v);
-        }
-        Some(IpBlock { cidr, except })
-    }
-}
-
-trait PodSelector {
-    fn matches_pod(&self, key: &keys::Object, pod: &Pod) -> bool;
-}
-
-impl PodSelector for Policy {
-    fn matches_pod(&self, key: &keys::Object, pod: &Pod) -> bool {
-        if key.namespace != self.namespace {
-            return false;
-        }
-        self.pod_selector.matches_pod(key, pod)
-    }
-}
-
-impl PodSelector for LabelSelector {
-    fn matches_pod(&self, _: &keys::Object, pod: &Pod) -> bool {
-        self.matches_labels(&pod.labels)
-    }
-}
-
-trait LabelSel {
-    fn matches_labels(&self, labels: &Map<String, String>) -> bool;
-}
-
-impl LabelSel for LabelSelector {
-    fn matches_labels(&self, labels: &Map<String, String>) -> bool {
-        let matches_labels = 'b: {
-            let Some(ref filter) = self.match_labels else {
-                break 'b true; // empty => true
-            };
-            if filter.is_empty() {
-                break 'b true; // empty => true
-            }
-            for (k, v) in filter {
-                if labels.get(k) != Some(v) {
-                    break 'b false;
-                }
-            }
-            true
-        };
-
-        let matches_expressions = 'b: {
-            let Some(ref filter) = self.match_expressions else {
-                break 'b true; // empty => true
-            };
-            if filter.is_empty() {
-                break 'b true; // empty => true
-            }
-            for expr in filter {
-                let value = labels.get(&expr.key);
-
-                let eval = match expr.operator.as_str() {
-                    "Exists" => value.is_some(),
-                    "DoesNotExist" => value.is_none(),
-                    "In" => value.is_some_and(|value| {
-                        expr.values.as_ref().is_some_and(|v| v.contains(value))
-                    }),
-                    "NotIn" => value.is_none_or(|value| {
-                        expr.values.as_ref().is_some_and(|v| !v.contains(value))
-                    }),
-                    op => {
-                        error!("unknown operator {op}");
-                        false
-                    }
-                };
-
-                if !eval {
-                    return false;
-                }
-            }
-            true
-        };
-
-        matches_labels && matches_expressions
+/// The clause matching a single CIDR, inline (no set).
+fn ip_prefix_clause(cidr: &IpCidr, dir: Dir) -> Vec<Expr> {
+    let prefix = cidr.network_length();
+    match cidr {
+        IpCidr::V4(c) => rules::ip_prefix(
+            Family::V4,
+            dir,
+            prefix,
+            c.first_address().octets().to_vec(),
+            false,
+        ),
+        IpCidr::V6(c) => rules::ip_prefix(
+            Family::V6,
+            dir,
+            prefix,
+            c.first_address().octets().to_vec(),
+            false,
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        kube_watch::{Change, Event},
+        nftables::test_harness,
+    };
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
-        nftables::{NfTablesMessage, SetElementAttribute, SetElementList},
         NetfilterMessage, NetfilterMessageInner,
+        nftables::{
+            ChainAttribute, Cmp, DataAttribute, ExpressionAttribute, Expressions, ListAttribute,
+            Lookup, NfTablesMessage, RuleAttribute,
+        },
     };
+    use std::collections::BTreeMap as Map;
+    use std::process::Command;
+    use std::sync::Arc;
 
-    fn v4(s: &str) -> Ipv4Addr {
-        s.parse().expect("ipv4")
-    }
-
-    #[test]
-    fn peer_set_messages_create_then_fill() {
-        let mut sets = NamedSets::new("t");
-        sets.push_interval_v4("np_a_i_1_b1_v4".into(), vec![v4("10.0.0.0")..=v4("10.0.0.255")]);
-        sets.push_interval_v4("np_a_i_1_b1_v4_exc".into(), vec![v4("10.0.0.1")..=v4("10.0.0.2")]);
-        sets.push_simple_v4("np_a_i_1_pods_v4".into(), vec![v4("10.1.0.1")]);
-
-        let msgs = sets.peer_messages();
-        // create + fill for each of the three sets
-        assert_eq!(msgs.len(), 6);
-
-        let creates = msgs
+    fn pod(name: &str, namespace: &str, node: &str, labels: &str, ips: &[&str]) -> core::Pod {
+        let ips: Vec<_> = ips
             .iter()
-            .filter(|m| is_new_set(m))
-            .count();
-        let fills = msgs
-            .iter()
-            .filter(|m| is_new_elem(m))
-            .count();
-        assert_eq!(creates, 3);
-        assert_eq!(fills, 3);
+            .map(|ip| serde_json::json!({ "ip": ip }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name, "namespace": namespace, "labels": { "app": labels } },
+            "spec": { "nodeName": node },
+            "status": { "podIPs": ips },
+        }))
+        .expect("pod")
     }
 
-    #[test]
-    fn vmap_create_empty_and_fill_verdicts() {
-        let mut sets = NamedSets::new("t");
-        sets.pods_ingress.items.push((v4("10.0.0.1"), "ch".into()));
-
-        let create = sets.vmap_create_messages();
-        assert_eq!(create.len(), 1);
-        assert!(is_new_set(&create[0]));
-        // a create carries no elements
-        assert_eq!(new_set_elems(&create[0]).len(), 0);
-
-        let fill = sets.vmap_fill_messages();
-        assert_eq!(fill.len(), 1);
-        assert!(is_new_elem(&fill[0]));
-        assert_eq!(new_set_elems(&fill[0]).len(), 1);
+    fn netpol(name: &str, selector: &str, ingress: serde_json::Value) -> networking::NetworkPolicy {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name, "namespace": "default" },
+            "spec": {
+                "podSelector": { "matchLabels": { "app": selector } },
+                "policyTypes": ["Ingress"],
+                "ingress": ingress,
+            },
+        }))
+        .expect("netpol")
     }
 
-    #[test]
-    fn no_pod_maps_when_empty() {
-        let sets = NamedSets::new("t");
-        assert!(sets.vmap_create_messages().is_empty());
-        assert!(sets.vmap_fill_messages().is_empty());
-        assert!(sets.peer_messages().is_empty());
+    fn state_with(pods: &[core::Pod], netpols: &[networking::NetworkPolicy]) -> State {
+        let mut state = State::new();
+        for p in pods {
+            state.ingest(&Event::Pod(Change::InitApply(Arc::new(p.clone()))));
+        }
+        state.ingest(&Event::Pod(Change::InitDone));
+        for np in netpols {
+            state.ingest(&Event::NetworkPolicy(Change::InitApply(Arc::new(
+                np.clone(),
+            ))));
+        }
+        state.ingest(&Event::NetworkPolicy(Change::InitDone));
+        state.ingest(&Event::Namespace(Change::InitDone));
+        state
     }
 
-    #[test]
-    fn rendered_hash_tracks_elements() {
-        let a = Rendered {
-            script: "x".into(),
-            peers: Vec::new(),
-            vmap_create: Vec::new(),
-            vmap_fill: Vec::new(),
-        };
-        let b = Rendered {
-            script: "x".into(),
-            peers: Vec::new(),
-            vmap_create: Vec::new(),
-            vmap_fill: Vec::new(),
-        };
-        assert_eq!(a.hash(), b.hash(), "hash must be deterministic");
-
-        let mut sets = NamedSets::new("t");
-        sets.push_simple_v4("s".into(), vec![v4("10.0.0.1")]);
-        let c = Rendered {
-            script: "x".into(),
-            peers: sets.peer_messages(),
-            vmap_create: Vec::new(),
-            vmap_fill: Vec::new(),
-        };
-        assert_ne!(a.hash(), c.hash(), "element change must change the hash");
-    }
-
-    fn is_new_set(m: &Message) -> bool {
-        matches!(
-            m.payload,
-            NetlinkPayload::InnerMessage(NetfilterMessage {
-                inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(_)),
-                ..
-            })
+    /// A minimal state: one pod `app=a` on n1 and one ingress netpol.
+    fn basic_state(ingress: serde_json::Value) -> State {
+        state_with(
+            &[pod("a", "default", "n1", "a", &["10.0.0.1"])],
+            &[netpol("np", "a", ingress)],
         )
     }
 
-    fn is_new_elem(m: &Message) -> bool {
-        matches!(
-            m.payload,
-            NetlinkPayload::InnerMessage(NetfilterMessage {
-                inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSetElement(_)),
-                ..
-            })
-        )
+    fn default_cfg() -> Config {
+        Config {
+            table: "t".into(),
+            ..Default::default()
+        }
     }
 
-    fn new_set_elems(m: &Message) -> Vec<Vec<SetElementAttribute>> {
-        let NetlinkPayload::InnerMessage(NetfilterMessage {
-            inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSetElement(m)),
-            ..
-        }) = &m.payload
-        else {
-            return Vec::new();
-        };
-        m.attributes
-            .iter()
-            .find_map(|a| match a {
-                SetElementList::Elements(e) => Some(e),
-                _ => None,
-            })
-            .into_iter()
-            .flatten()
-            .filter_map(|item| match item {
-                ListAttribute::Element(attrs) => Some(attrs.clone()),
+    /// The chain names among `msgs`, in creation order.
+    fn chain_names(msgs: &[Message]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match &m.payload {
+                NetlinkPayload::InnerMessage(NetfilterMessage {
+                    inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewChain(c)),
+                    ..
+                }) => c.attributes.iter().find_map(|a| match a {
+                    ChainAttribute::Name(n) => Some(n.clone()),
+                    _ => None,
+                }),
                 _ => None,
             })
             .collect()
     }
 
-    use netlink_packet_netfilter::nftables::ListAttribute;
-
-    #[test]
-    fn render_references_named_sets_and_fills_maps() {
-        use crate::kube_watch::Event;
-        use kube::runtime::watcher::Event as W;
-        use std::sync::Arc;
-
-        let pod: core::Pod = serde_json::from_value(serde_json::json!({
-            "metadata": {
-                "name": "a",
-                "namespace": "default",
-                "labels": { "app": "a" },
-            },
-            "spec": { "nodeName": "n1" },
-            "status": { "podIPs": [ { "ip": "10.0.0.1" } ] },
-        }))
-        .expect("pod");
-
-        // ingress rule: from ipBlock 192.168.42.0/24 except 192.168.42.5
-        let np: networking::NetworkPolicy = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "np", "namespace": "default" },
-            "spec": {
-                "podSelector": { "matchLabels": { "app": "a" } },
-                "policyTypes": ["Ingress"],
-                "ingress": [ {
-                    "from": [ { "ipBlock": {
-                        "cidr": "192.168.42.0/24",
-                        "except": ["192.168.42.5/32"],
-                    } } ],
-                } ],
-            },
-        }))
-        .expect("netpol");
-
-        let mut state = State::new();
-        state.ingest(&Event::Pod(Arc::new(W::InitApply(pod))));
-        state.ingest(&Event::Pod(Arc::new(W::InitDone)));
-        state.ingest(&Event::NetworkPolicy(Arc::new(W::InitApply(np))));
-        state.ingest(&Event::NetworkPolicy(Arc::new(W::InitDone)));
-        state.ingest(&Event::Namespace(Arc::new(W::InitDone)));
-
-        let rendered = render(
-            &state,
-            &Config {
-                table: "t".into(),
-                ..Default::default()
-            },
-            "n1",
-        );
-
-        // script references the named peer sets and the pod vmap
-        assert!(
-            rendered.script.contains("ip saddr @np_default_np_i_1_b1_v4"),
-            "block set not referenced:\n{}",
-            rendered.script
-        );
-        assert!(
-            rendered
-                .script
-                .contains("ip saddr != @np_default_np_i_1_b1_v4_exc"),
-            "except set not referenced:\n{}",
-            rendered.script
-        );
-        assert!(
-            rendered.script.contains("ip daddr vmap @pods_ingress"),
-            "pod vmap not referenced:\n{}",
-            rendered.script
-        );
-        // inline elements are gone
-        assert!(!rendered.script.contains("192.168.42.0/24"));
-
-        // netlink carries the set/map contents
-        assert!(!rendered.peers.is_empty());
-        assert_eq!(rendered.vmap_create.len(), 1);
-        assert_eq!(rendered.vmap_fill.len(), 1);
+    /// Whether any message is a base chain (has a hook).
+    fn has_base_chain(msgs: &[Message]) -> bool {
+        msgs.iter().any(|m| {
+            matches!(
+                &m.payload,
+                NetlinkPayload::InnerMessage(NetfilterMessage {
+                    inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewChain(c)),
+                    ..
+                }) if c.attributes.iter().any(|a| matches!(a, ChainAttribute::Hook(_)))
+            )
+        })
     }
 
-    /// Applies a rendered table to the real kernel and dumps it.
+    /// Every rule's expressions, per chain.
+    fn rules(msgs: &[Message]) -> Vec<(String, Vec<RuleAttribute>)> {
+        msgs.iter()
+            .filter_map(|m| match &m.payload {
+                NetlinkPayload::InnerMessage(NetfilterMessage {
+                    inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewRule(r)),
+                    ..
+                }) => {
+                    let chain = r.attributes.iter().find_map(|a| match a {
+                        RuleAttribute::Chain(c) => Some(c.clone()),
+                        _ => None,
+                    })?;
+                    Some((chain, r.attributes.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(set_name, inverted)` for every lookup expression in `rule`.
+    fn lookups(rule: &[RuleAttribute]) -> Vec<(String, bool)> {
+        let Some(RuleAttribute::Expressions(exprs)) = rule
+            .iter()
+            .find(|a| matches!(a, RuleAttribute::Expressions(_)))
+        else {
+            return Vec::new();
+        };
+        exprs
+            .iter()
+            .filter_map(|e| match e {
+                ListAttribute::Element(attrs) => attrs.iter().find_map(|a| match a {
+                    ExpressionAttribute::Data(Expressions::Lookup(l)) => {
+                        let set = l.iter().find_map(|x| match x {
+                            Lookup::Set(s) => Some(s.clone()),
+                            _ => None,
+                        })?;
+                        let inv = l.iter().any(|x| matches!(x, Lookup::Flags(1)));
+                        Some((set, inv))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The names of every set created in `msgs`.
+    fn set_names(msgs: &[Message]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match &m.payload {
+                NetlinkPayload::InnerMessage(NetfilterMessage {
+                    inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(s)),
+                    ..
+                }) => s.attributes.iter().find_map(|a| match a {
+                    netlink_packet_netfilter::nftables::SetAttribute::Name(n) => Some(n.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_set<'a>(
+        msgs: &'a [Message],
+        name: &str,
+    ) -> Option<&'a netlink_packet_netfilter::nftables::SetMessage> {
+        msgs.iter().find_map(|m| {
+            match &m.payload {
+            NetlinkPayload::InnerMessage(NetfilterMessage {
+                inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(s)),
+                ..
+            }) if s.attributes.iter().any(|a| {
+                matches!(a, netlink_packet_netfilter::nftables::SetAttribute::Name(n) if n == name)
+            }) => Some(s),
+            _ => None,
+        }
+        })
+    }
+
+    /// Whether `rule` compares a register against `value` with equality (a
+    /// `Cmp` on `value`).
+    fn rule_has_prefix_eq(rule: &[RuleAttribute], value: &[u8]) -> bool {
+        let Some(RuleAttribute::Expressions(exprs)) = rule
+            .iter()
+            .find(|a| matches!(a, RuleAttribute::Expressions(_)))
+        else {
+            return false;
+        };
+        let op = netlink_packet_netfilter::nftables::Operator::Equal;
+        exprs.iter().any(|e| {
+            let ListAttribute::Element(attrs) = e else {
+                return false;
+            };
+            attrs.iter().any(|a| match a {
+                ExpressionAttribute::Data(Expressions::Cmp(c)) => {
+                    c.contains(&Cmp::Op(op))
+                        && c.iter()
+                            .any(|x| matches!(x, Cmp::Data(DataAttribute::Value(v)) if v == value))
+                }
+                _ => false,
+            })
+        })
+    }
+
+    #[test]
+    fn renders_chains_base_and_vmap() {
+        let state = basic_state(serde_json::json!([{ "from": [] }]));
+        let r = render(&state, &default_cfg(), "n1");
+
+        let names = chain_names(&r.messages);
+        assert!(
+            names.contains(&"pods_filter".to_string()),
+            "base chain missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"ingress_pod_default_a".to_string()),
+            "pod chain missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"ingress_netpol_default_np".to_string()),
+            "netpol chain missing: {names:?}"
+        );
+        assert!(has_base_chain(&r.messages), "no base chain hook");
+
+        // the pod map is filled with a goto to the pod chain
+        let dump = format!("{:?}", r.messages);
+        assert!(
+            dump.contains("goto") || dump.contains("Goto"),
+            "vmap goto missing"
+        );
+    }
+
+    #[test]
+    fn ipblock_and_except_match_inline() {
+        let state = basic_state(serde_json::json!([{
+            "from": [{ "ipBlock": { "cidr": "192.168.42.0/24", "except": ["192.168.42.5/32"] } }],
+        }]));
+        let r = render(&state, &default_cfg(), "n1");
+
+        // an anonymous set holds the excluded range; the pod vmap is the other
+        let names = set_names(&r.messages);
+        assert!(
+            names.contains(&"__set5".to_string()),
+            "except set missing: {names:?}"
+        );
+        let set = find_set(&r.messages, "__set5").expect("except set");
+        let flags = set.attributes.iter().find_map(|a| match a {
+            netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
+            _ => None,
+        });
+        let flags = flags.expect("flags");
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
+
+        // the rule matches the cidr inline (byte-aligned /24 => payload+eq) and
+        // excludes the anonymous set (inverted lookup)
+        let (_, rule) = rules(&r.messages)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        assert_eq!(lookups(&rule), vec![("__set5".to_string(), true)]);
+        assert!(rule_has_prefix_eq(&rule, &[192, 168, 42]));
+    }
+
+    #[test]
+    fn ports_become_a_concat_interval_set() {
+        let state = basic_state(serde_json::json!([{
+            "from": [],
+            "ports": [ { "protocol": "TCP", "port": 80 }, { "protocol": "UDP", "port": 53 } ],
+        }]));
+        let r = render(&state, &default_cfg(), "n1");
+
+        let set = find_set(&r.messages, "__set5").expect("port set");
+        let flags = set.attributes.iter().find_map(|a| match a {
+            netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
+            _ => None,
+        });
+        let flags = flags.expect("flags");
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Concat));
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
+
+        // dport 53/80 are stored as (proto, port) elements
+        let (_, rule) = rules(&r.messages)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        assert_eq!(lookups(&rule)[0].0, "__set5");
+    }
+
+    #[test]
+    fn any_port_is_a_full_range() {
+        // no port on the entry => a full 0-65535 range in the port set
+        let state = basic_state(serde_json::json!([{
+            "from": [],
+            "ports": [ { "protocol": "TCP" } ],
+        }]));
+        let r = render(&state, &default_cfg(), "n1");
+
+        let set = find_set(&r.messages, "__set5").expect("port set");
+        let flags = set.attributes.iter().find_map(|a| match a {
+            netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
+            _ => None,
+        });
+        let flags = flags.expect("flags");
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
+        assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
+
+        // the rule looks the protocol . service set up
+        let (_, rule) = rules(&r.messages)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        assert_eq!(lookups(&rule)[0].0, "__set5");
+    }
+
+    #[test]
+    fn mixed_any_port_and_specific_port() {
+        // {TCP, any port} + {UDP, 53}: both go into one anonymous port set
+        let state = basic_state(serde_json::json!([{
+            "from": [],
+            "ports": [ { "protocol": "TCP" }, { "protocol": "UDP", "port": 53 } ],
+        }]));
+        let r = render(&state, &default_cfg(), "n1");
+
+        find_set(&r.messages, "__set5").expect("port set");
+
+        let netpol_rules: Vec<_> = rules(&r.messages)
+            .into_iter()
+            .filter(|(c, _)| c == "ingress_netpol_default_np")
+            .collect();
+        // both alternatives share the one set
+        assert_eq!(netpol_rules.len(), 1, "expected one rule");
+        assert_eq!(lookups(&netpol_rules[0].1)[0].0, "__set5");
+    }
+
+    #[test]
+    fn reject_action_defaults_and_overrides() {
+        assert_eq!(RejectAction::from_annotation("drop"), RejectAction::Drop);
+        assert_eq!(
+            RejectAction::from_annotation("reject"),
+            RejectAction::Reject
+        );
+        assert_eq!(RejectAction::from_annotation("bogus"), RejectAction::Reject);
+
+        let mut p = Pod {
+            labels: Map::new(),
+            annotations: Map::new(),
+            node: "n1".into(),
+            ipsv4: Vec::new(),
+            ipsv6: Vec::new(),
+            host_network: false,
+        };
+        p.annotations.insert(ANN_REJECT.into(), "drop".into());
+        let rule = action_rule(&p, ANN_REJECT, RejectAction::Reject);
+        // `drop` is an immediate verdict, not a reject expression
+        assert_eq!(rule.len(), 1);
+    }
+
+    #[test]
+    fn hash_tracks_content() {
+        let a = render(&state_with(&[], &[]), &default_cfg(), "n1");
+        let b = render(&state_with(&[], &[]), &default_cfg(), "n1");
+        assert_eq!(a.hash(), b.hash());
+
+        let c = render(
+            &basic_state(serde_json::json!([{ "from": [] }])),
+            &default_cfg(),
+            "n1",
+        );
+        assert_ne!(a.hash(), c.hash());
+    }
+
+    /// A netpol [`System`](test_harness::System) for the golden
+    /// scenarios.
+    struct TestSystem {
+        state: State,
+        cfg: Config,
+    }
+
+    impl test_harness::System for TestSystem {
+        fn new(table: String) -> Self {
+            Self {
+                state: State::new(),
+                cfg: Config {
+                    table,
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn ingest(&mut self, event: Event) {
+            self.state.ingest(&event);
+        }
+
+        fn render(&self) -> Vec<Message> {
+            render(&self.state, &self.cfg, "n1").messages
+        }
+    }
+
+    /// Golden tests: each `test_assets/golden-ntables/netpol/*.yaml` scenario
+    /// (ipBlock/except, podSelector, ports), rendered and compared to
+    /// `nft list` at each step.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
+    #[tokio::test]
+    async fn golden() {
+        test_harness::golden_dir::<TestSystem>(
+            "test_assets/golden-ntables/netpol",
+            "knls-test-netpol-",
+        )
+        .await;
+    }
+
+    /// Applies a rendered table to the real kernel and checks the dump.
     ///
     /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
     #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
     #[tokio::test]
     async fn render_applies_to_kernel() {
-        use crate::kube_watch::Event;
-        use kube::runtime::watcher::Event as W;
-        use std::process::Command;
-        use std::sync::Arc;
-
         let table = "knls-test-netpol";
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", table])
             .status();
 
-        let pod: core::Pod = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "a", "namespace": "default", "labels": { "app": "a" } },
-            "spec": { "nodeName": "n1" },
-            "status": { "podIPs": [ { "ip": "10.0.0.1" }, { "ip": "fd00::1" } ] },
-        }))
-        .expect("pod");
-        let peer: core::Pod = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "b", "namespace": "other", "labels": { "app": "b" } },
-            "spec": { "nodeName": "n2" },
-            "status": { "podIPs": [ { "ip": "10.0.0.2" } ] },
-        }))
-        .expect("peer");
-        let np: networking::NetworkPolicy = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "np", "namespace": "default" },
-            "spec": {
-                "podSelector": { "matchLabels": { "app": "a" } },
-                "policyTypes": ["Ingress", "Egress"],
-                "ingress": [ {
-                    "from": [ { "ipBlock": { "cidr": "192.168.42.0/24", "except": ["192.168.42.5/32"] } } ],
-                    "ports": [ { "protocol": "TCP", "port": 80 } ],
-                } ],
-                "egress": [ { "to": [ { "podSelector": {} } ] } ],
-            },
-        }))
-        .expect("netpol");
-
-        let mut state = State::new();
-        state.ingest(&Event::Pod(Arc::new(W::InitApply(pod))));
-        state.ingest(&Event::Pod(Arc::new(W::InitApply(peer))));
-        state.ingest(&Event::Pod(Arc::new(W::InitDone)));
-        state.ingest(&Event::NetworkPolicy(Arc::new(W::InitApply(np))));
-        state.ingest(&Event::NetworkPolicy(Arc::new(W::InitDone)));
-        state.ingest(&Event::Namespace(Arc::new(W::InitDone)));
-
-        let rendered = render(
-            &state,
-            &Config {
-                table: table.into(),
-                ..Default::default()
-            },
-            "n1",
+        let state = state_with(
+            &[
+                pod("a", "default", "n1", "a", &["10.0.0.1", "fd00::1"]),
+                pod("b", "other", "n2", "b", &["10.0.0.2"]),
+            ],
+            &[netpol(
+                "np",
+                "a",
+                serde_json::json!([{
+                    "from": [{ "ipBlock": { "cidr": "192.168.32.0/20", "except": ["192.168.42.5/32"] } }],
+                    "ports": [ { "protocol": "TCP", "port": 80 }, { "protocol": "SCTP" } ],
+                }]),
+            )],
         );
+        let cfg = Config {
+            table: table.into(),
+            ..Default::default()
+        };
+        let rendered = render(&state, &cfg, "n1");
 
         let nl = netfilter::new_link().expect("netlink");
-        apply(&nl, table, rendered).await.expect("apply");
+        nl.send_as_transactions(rendered.messages.into_iter())
+            .await
+            .expect("apply");
 
         let out = Command::new("nft")
             .args(["list", "table", "inet", table])
@@ -1041,13 +1195,20 @@ mod tests {
             .expect("nft");
         let dump = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "nft list failed: {dump}");
-        assert!(dump.contains("192.168.42.0/24"), "block set missing:\n{dump}");
-        assert!(dump.contains("goto ingress_pod_default_a"), "vmap missing:\n{dump}");
-        assert!(dump.contains("goto egress_pod_default_a"), "vmap missing:\n{dump}");
+        assert!(
+            dump.contains("192.168.32.0/20"),
+            "inline block missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("goto ingress_pod_default_a"),
+            "vmap missing:\n{dump}"
+        );
+        assert!(dump.contains("tcp . 80"), "port element missing:\n{dump}");
+        // the any-port SCTP alternative matches the protocol alone
+        assert!(dump.contains("sctp"), "protocol-only rule missing:\n{dump}");
 
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", table])
             .status();
     }
 }
-

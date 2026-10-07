@@ -1,18 +1,24 @@
 use std::fmt;
 
 use netlink_packet_core::{
-    NetlinkHeader, NetlinkMessage, NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST,
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
 };
 use netlink_packet_netfilter::{
+    NetfilterMessage,
     nftables::{
-        ChainAttribute, ChainMessage, ExpressionAttribute, ListAttribute, NfTablesMessage,
+        ChainAttribute, ChainMessage, ExpressionAttribute, Hook, ListAttribute, NfTablesMessage,
         RuleAttribute, RuleMessage,
     },
-    NetfilterMessage,
 };
+
+pub use netlink_packet_netfilter::nftables::InetHookNumber;
 use xxhash_rust::xxh3::Xxh3;
 
-use super::{nft_header, Message};
+use super::{Message, nft_header};
+
+/// `NF_ACCEPT`: the only base-chain policy we use (per-pod chains do the
+/// filtering).
+pub const ACCEPT: u32 = 1;
 
 /// The expressions of a single rule.
 pub type Rule = Vec<ListAttribute<ExpressionAttribute>>;
@@ -30,7 +36,7 @@ pub type Rule = Vec<ListAttribute<ExpressionAttribute>>;
 #[derive(Clone)]
 pub struct Chain<'t> {
     table: &'t str,
-    chain: &'t str,
+    chain: String,
     hasher: Xxh3,
     rules: Vec<Message>,
 }
@@ -47,11 +53,12 @@ impl fmt::Debug for Chain<'_> {
 }
 
 impl<'t> Chain<'t> {
-    pub fn new(table: &'t str, chain: &'t str) -> Self {
+    pub fn new(table: &'t str, chain: impl Into<String>) -> Self {
+        let chain = chain.into();
         Self {
+            hasher: seeded(table, &chain),
             table,
             chain,
-            hasher: seeded(table, chain),
             rules: Vec::new(),
         }
     }
@@ -62,8 +69,8 @@ impl<'t> Chain<'t> {
     }
 
     /// The chain name.
-    pub fn chain(&self) -> &'t str {
-        self.chain
+    pub fn chain(&self) -> &str {
+        &self.chain
     }
 
     /// The hash of the table, chain and stored rules.
@@ -78,7 +85,7 @@ impl<'t> Chain<'t> {
 
     /// Appends a rule and updates the hash from its message.
     pub fn push(&mut self, rule: Rule) {
-        let mut msg = rule_msg(self.table, self.chain, rule);
+        let mut msg = rule_msg(self.table, &self.chain, rule);
         msg.finalize();
         hash_message(&mut self.hasher, &msg);
         self.rules.push(msg);
@@ -94,20 +101,41 @@ impl<'t> Chain<'t> {
     /// Removes every stored rule and resets the hash.
     pub fn clear(&mut self) {
         self.rules.clear();
-        self.hasher = seeded(self.table, self.chain);
+        self.hasher = seeded(self.table, &self.chain);
     }
 
     /// The message adding a regular (non-base) chain to the table.
     pub fn create(&self) -> Message {
+        self.create_chain(None)
+    }
+
+    /// The message adding a base chain, hooked into `hook` at `priority` with
+    /// `policy` (`NF_ACCEPT`/`NF_DROP`).
+    pub fn create_base(&self, hook: InetHookNumber, priority: i32, policy: u32) -> Message {
+        self.create_chain(Some((hook, priority, policy)))
+    }
+
+    fn create_chain(&self, base: Option<(InetHookNumber, i32, u32)>) -> Message {
         let mut header = NetlinkHeader::default();
         header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 
-        let msg = NfTablesMessage::NewChain(ChainMessage {
-            attributes: vec![
-                ChainAttribute::Table(self.table.to_string()),
-                ChainAttribute::Name(self.chain.to_string()),
-            ],
-        });
+        let mut attributes = vec![
+            ChainAttribute::Table(self.table.to_string()),
+            ChainAttribute::Name(self.chain.clone()),
+        ];
+
+        // A hook makes the kernel create a base chain (it sets NFT_CHAIN_BASE
+        // itself); it needs a type and policy too, as nft emits them.
+        if let Some((hook, priority, policy)) = base {
+            attributes.push(ChainAttribute::Type("filter".into()));
+            attributes.push(ChainAttribute::Hook(vec![
+                Hook::Number(hook.into()),
+                Hook::Priority(priority as u32),
+            ]));
+            attributes.push(ChainAttribute::Policy(policy));
+        }
+
+        let msg = NfTablesMessage::NewChain(ChainMessage { attributes });
 
         NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
     }
@@ -124,7 +152,7 @@ impl<'t> Chain<'t> {
         let msg = NfTablesMessage::DeleteRule(RuleMessage {
             attributes: vec![
                 RuleAttribute::Table(self.table.to_string()),
-                RuleAttribute::Chain(self.chain.to_string()),
+                RuleAttribute::Chain(self.chain.clone()),
             ],
         });
 
@@ -179,8 +207,8 @@ fn hash_message(hasher: &mut Xxh3, msg: &Message) {
 mod tests {
     use super::*;
     use netlink_packet_core::NetlinkPayload;
-    use netlink_packet_netfilter::nftables::VerdictAttribute;
     use netlink_packet_netfilter::NetfilterMessageInner;
+    use netlink_packet_netfilter::nftables::VerdictAttribute;
 
     fn del_rules(msg: Message) -> Vec<RuleAttribute> {
         let NetlinkPayload::InnerMessage(NetfilterMessage {

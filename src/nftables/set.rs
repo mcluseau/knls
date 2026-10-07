@@ -1,12 +1,12 @@
 use netlink_packet_core::{
-    Emitable, NetlinkHeader, NetlinkMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST,
+    Emitable, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
 };
 use netlink_packet_netfilter::{
+    NetfilterMessage,
     nftables::{
         ListAttribute, NfTablesMessage, SetAttribute, SetDescription, SetElementAttribute,
         SetElementList, SetElementMessage, SetFlags, SetMessage, Verdict as NlVerdict,
     },
-    NetfilterMessage,
 };
 use std::{
     collections::BTreeSet,
@@ -15,7 +15,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use super::{nft_header, Message};
+use super::{Message, nft_header};
 
 /// A named set of single keys.
 pub type SimpleSet<'t, T> = Set<'t, T>;
@@ -83,6 +83,7 @@ pub enum DataAttr {
 }
 
 mod attr {
+    use netlink_packet_core::DefaultNla;
     use netlink_packet_netfilter::nftables::{
         DataAttribute,
         ListAttribute::{self, Element},
@@ -139,6 +140,22 @@ mod attr {
     pub(super) fn interval_end(end: Vec<u8>) -> ListAttribute<SetElementAttribute> {
         let mut attrs = elem_key(end, None);
         attrs.push(Flags(SetElementFlags::IntervalEnd));
+        Element(attrs)
+    }
+
+    /// A concatenated-key interval (`KEY` start + `KEY_END` inclusive end), as
+    /// nft emits it. The kernel rejects the `IntervalEnd` pair form for
+    /// concatenations.
+    pub(super) fn interval_range(
+        start: Vec<u8>,
+        end: Vec<u8>,
+    ) -> ListAttribute<SetElementAttribute> {
+        const NFTA_DATA_VALUE: u16 = 1;
+        let mut attrs = elem_key(start, None);
+        attrs.push(SetElementAttribute::KeyEnd(vec![DefaultNla::new(
+            NFTA_DATA_VALUE,
+            end,
+        )]));
         Element(attrs)
     }
 
@@ -212,19 +229,31 @@ fn key_attributes<K: Data>() -> Vec<SetAttribute> {
     attrs
 }
 
-/// Builds the elements of an inclusive range key:
-/// an empty range yields nothing, a range ending on the maximum key is open,
-/// and every other range is `start..end+1`. `data` rides the start element only.
-fn interval_elems(start: Vec<u8>, mut end: Vec<u8>) -> Vec<ListAttribute<SetElementAttribute>> {
+/// Builds the elements of an inclusive range key.
+///
+/// A scalar key uses the `start` + `IntervalEnd(start..=end+1)` pair, or an open
+/// interval when the end is the field maximum. A concatenated key, which the
+/// kernel requires in a different shape, uses a single element with an inclusive
+/// `KEY_END`. Empty ranges yield nothing.
+fn interval_elems(
+    start: Vec<u8>,
+    end: Vec<u8>,
+    concat: bool,
+) -> Vec<ListAttribute<SetElementAttribute>> {
     if start > end {
         return vec![];
     }
 
-    let is_open = end.iter().all(|b| *b == u8::MAX);
+    if concat {
+        // inclusive end, as nft stores concatenation ranges
+        return vec![attr::interval_range(start, end)];
+    }
 
+    let is_open = end.iter().all(|b| *b == u8::MAX);
     if is_open {
         vec![attr::open_interval(start)]
     } else {
+        let mut end = end;
         increment_be(&mut end);
         vec![attr::interval_start(start), attr::interval_end(end)]
     }
@@ -243,15 +272,16 @@ impl<T: Data> Elem for T {
 }
 
 impl<T: Data> Elem for RangeInclusive<T> {
-    // intervals do not support concatenation
-    const SET_FLAGS: SetFlags = SetFlags::Interval;
+    // intervals of concatenated keys keep the `Concat` flag of the key type
+    const SET_FLAGS: SetFlags = T::SET_FLAGS.union(SetFlags::Interval);
 
     fn set_attributes() -> Vec<SetAttribute> {
         key_attributes::<T>()
     }
 
     fn attributes(&self) -> Vec<ListAttribute<SetElementAttribute>> {
-        interval_elems(self.start().elem_data(), self.end().elem_data())
+        let concat = T::SET_FLAGS.contains(SetFlags::Concat);
+        interval_elems(self.start().elem_data(), self.end().elem_data(), concat)
     }
 }
 
@@ -518,6 +548,19 @@ where
     /// `comment` is an optional free-form string, attached as nftables userdata
     /// so it shows up in `nft list`.
     pub fn create(&self, comment: Option<String>) -> Message {
+        self.create_with(T::SET_FLAGS, comment)
+    }
+
+    /// Creates the set as **anonymous** (`NFT_SET_ANONYMOUS`).
+    ///
+    /// The kernel binds an anonymous set to a single rule and nft prints it
+    /// inline (`{ tcp . 80, tcp . 443 }`) rather than as a named `@set`. The set
+    /// must be created and filled before the rule referencing it.
+    pub fn create_anonymous(&self) -> Message {
+        self.create_with(T::SET_FLAGS | SetFlags::Anonymous, None)
+    }
+
+    fn create_with(&self, flags: SetFlags, comment: Option<String>) -> Message {
         let mut header = NetlinkHeader::default();
         header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 
@@ -528,8 +571,8 @@ where
             SetAttribute::Id(self.id),
         ];
         attributes.extend(T::set_attributes());
-        if !T::SET_FLAGS.is_empty() {
-            attributes.push(SetAttribute::Flags(T::SET_FLAGS));
+        if !flags.is_empty() {
+            attributes.push(SetAttribute::Flags(flags));
         }
         if let Some(comment) = comment {
             attributes.push(SetAttribute::UserData(set_comment(comment)));
@@ -741,8 +784,8 @@ mod tests {
     use super::*;
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
-        nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
         NetfilterMessageInner,
+        nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
     };
 
     /// A set for tests: table `t`, name `s`.
@@ -898,9 +941,11 @@ mod tests {
             })
             .expect("a concat descriptor");
         // the `NFT_SET_CONCAT` flag is set
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat))));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat)))
+        );
 
         let lens: Vec<u32> = concat
             .iter()
@@ -924,9 +969,11 @@ mod tests {
     #[test]
     fn interval_set_has_interval_flag() {
         let attrs = new_set_attrs::<RangeInclusive<Ipv4Addr>>();
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval))
+        );
         // key type/len come from the underlying address
         assert_eq!(
             get_u32(&attrs, |a| match a {
@@ -1004,9 +1051,11 @@ mod tests {
             }),
             Some(2)
         );
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
+        );
     }
 
     #[test]
@@ -1049,9 +1098,11 @@ mod tests {
         );
         // verdicts carry no DataLen
         assert!(!attrs.iter().any(|a| matches!(a, SetAttribute::DataLen(_))));
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
+        );
     }
 
     /// The nested verdict attributes of the first element produced.
@@ -1136,6 +1187,67 @@ mod tests {
         assert_eq!(
             elems,
             vec![(vec![20, 0, 0, 0], SetElementFlags::empty(), true)]
+        );
+    }
+
+    /// A concatenated interval is a single element with an inclusive `KEY_END`,
+    /// not the scalar start/end pair.
+    fn concat_interval_keys(
+        items: impl IntoIterator<Item = RangeInclusive<(u8, u16)>>,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        for msg in fill_msgs::<RangeInclusive<(u8, u16)>, _>("t", "s", items.into_iter()) {
+            let NetlinkPayload::InnerMessage(NetfilterMessage {
+                inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSetElement(m)),
+                ..
+            }) = msg.payload
+            else {
+                panic!("not a NewSetElement message");
+            };
+            let elems = m
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    SetElementList::Elements(e) => Some(e),
+                    _ => None,
+                })
+                .expect("elements");
+            for item in elems {
+                let ListAttribute::Element(attrs) = item else {
+                    continue;
+                };
+                let mut key = None;
+                let mut end = None;
+                for attr in attrs {
+                    match attr {
+                        SetElementAttribute::Key(DataAttribute::Value(v)) => key = Some(v.clone()),
+                        SetElementAttribute::KeyEnd(nlas) => {
+                            use netlink_packet_core::Nla;
+                            let n = nlas.first().expect("data value");
+                            let mut buf = vec![0u8; n.value_len()];
+                            n.emit_value(&mut buf);
+                            end = Some(buf);
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((key.expect("key"), end));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn concat_interval_uses_key_end() {
+        // tcp . 80-90 : start (tcp,80), inclusive KEY_END (tcp,90)
+        let elems = concat_interval_keys([(6u8, 80u16)..=(6, 90)]);
+        assert_eq!(elems.len(), 1, "one element, not a start/end pair");
+        let (key, end) = &elems[0];
+        assert_eq!(key, &vec![6, 0, 0, 0, 0, 80, 0, 0]);
+        assert_eq!(
+            end.as_deref(),
+            Some(&[6, 0, 0, 0, 0, 90, 0, 0][..]),
+            "inclusive end"
         );
     }
 

@@ -1,12 +1,12 @@
 use super::Netlink;
 use cidr::IpCidr;
-use eyre::{bail, eyre, Result};
+use eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use log::debug;
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
+use netlink_packet_core::{NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
 use netlink_packet_generic::{
-    ctrl::{nlas::GenlCtrlAttrs, GenlCtrl, GenlCtrlCmd},
     GenlMessage,
+    ctrl::{GenlCtrl, GenlCtrlCmd, nlas::GenlCtrlAttrs},
 };
 use netlink_packet_wireguard::{
     WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,

@@ -9,8 +9,8 @@ use netlink_packet_netfilter::nftables::{
     Lookup, Meta, MetaKey, Operator, Payload, Register, Verdict as NlVerdict, VerdictAttribute,
 };
 
-/// The expressions of a rule (see [`Rule`](super::chain::Rule)).
-type Expr = ListAttribute<ExpressionAttribute>;
+/// A single rule expression (see [`Rule`](super::chain::Rule)).
+pub type Expr = ListAttribute<ExpressionAttribute>;
 
 /// `NFTA_PAYLOAD_NETWORK_HEADER`: payload offset from the network header.
 pub const NETWORK_HEADER: u32 = 1;
@@ -129,12 +129,12 @@ pub fn drop() -> Expr {
 }
 
 /// `jump <chain>`.
-pub fn jump(chain: &str) -> Expr {
+pub fn jump(chain: impl Into<String>) -> Expr {
     verdict(Verdict::Jump(chain.into()))
 }
 
 /// `goto <chain>`.
-pub fn goto(chain: &str) -> Expr {
+pub fn goto(chain: impl Into<String>) -> Expr {
     verdict(Verdict::Goto(chain.into()))
 }
 
@@ -170,29 +170,33 @@ pub fn eq(reg: Register, value: impl Into<Vec<u8>>) -> Expr {
 }
 
 /// `reg in @set`, without a destination register (plain membership).
-pub fn lookup_set(reg: Register, set: &str) -> Expr {
-    lookup(reg, set, None, false)
-}
-
-/// `reg in @set`, storing the verdict in `Verdict` (a `vmap`).
-pub fn lookup_vmap(reg: Register, set: &str) -> Expr {
-    lookup(reg, set, Some(Register::Verdict), false)
+pub fn lookup_set(reg: Register, set: impl Into<String>) -> Expr {
+    Expressions::Lookup(vec![Lookup::SourceRegister(reg), Lookup::Set(set.into())]).into()
 }
 
 /// `reg != @set`, i.e. an inverted membership test.
-pub fn lookup_set_inv(reg: Register, set: &str) -> Expr {
-    lookup(reg, set, None, true)
+pub fn lookup_set_inv(reg: Register, set: impl Into<String>) -> Expr {
+    Expressions::Lookup(vec![
+        Lookup::SourceRegister(reg),
+        Lookup::Set(set.into()),
+        Lookup::Flags(1), // NFT_LOOKUP_F_INV
+    ])
+    .into()
 }
 
-fn lookup(reg: Register, set: &str, dreg: Option<Register>, invert: bool) -> Expr {
-    let mut attrs = vec![Lookup::SourceRegister(reg), Lookup::Set(set.into())];
-    if let Some(dreg) = dreg {
-        attrs.push(Lookup::DestinationRegister(dreg));
-    }
-    if invert {
-        attrs.push(Lookup::Flags(1)); // NFT_LOOKUP_F_INV
-    }
-    Expressions::Lookup(attrs).into()
+/// `reg in @set`, storing the looked-up value into `dreg` (a map).
+pub fn lookup_map(reg: Register, dreg: Register, map: impl Into<String>) -> Expr {
+    Expressions::Lookup(vec![
+        Lookup::SourceRegister(reg),
+        Lookup::Set(map.into()),
+        Lookup::DestinationRegister(dreg),
+    ])
+    .into()
+}
+
+/// `reg in @set`, storing the verdict in `Verdict` (a `vmap`).
+pub fn lookup_vmap(reg: Register, map: impl Into<String>) -> Expr {
+    lookup_map(reg, Register::Verdict, map)
 }
 
 /// Masks `reg` with `mask` (and xors with `xor`), storing back in `reg`.
@@ -282,6 +286,71 @@ pub fn ip_set(family: Family, dir: Dir, set: &str, invert: bool) -> Vec<Expr> {
     exprs
 }
 
+/// `ip saddr 1.2.3.0/24` / `ip6 daddr 2001:db8::/32` (with the `meta nfproto`
+/// guard nft emits in an `inet` table). `invert` produces `!=`.
+///
+/// `network` is the full-length network address bytes (host part zero), `prefix`
+/// the number of leading bits. A byte-aligned prefix loads only the significant
+/// bytes; otherwise the whole field is loaded and masked, as nft does.
+pub fn ip_prefix(
+    family: Family,
+    dir: Dir,
+    prefix: u8,
+    network: impl Into<Vec<u8>>,
+    invert: bool,
+) -> Vec<Expr> {
+    let network = network.into();
+    let op = if invert {
+        Operator::NotEqual
+    } else {
+        Operator::Equal
+    };
+
+    let mut exprs = vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+    ];
+
+    let bytes = prefix as usize / 8;
+    if prefix > 0 && prefix.is_multiple_of(8) {
+        // byte-aligned: load and compare only the significant bytes
+        exprs.push(payload(
+            Register::Reg1,
+            NETWORK_HEADER,
+            family.offset(dir),
+            bytes as u32,
+        ));
+        exprs.push(cmp(Register::Reg1, op, network[..bytes].to_vec()));
+    } else {
+        // otherwise load the whole field, mask it, and compare
+        let len = family.len() as usize;
+        exprs.push(payload(
+            Register::Reg1,
+            NETWORK_HEADER,
+            family.offset(dir),
+            family.len(),
+        ));
+        exprs.push(bitwise(
+            Register::Reg1,
+            family.len(),
+            prefix_mask(len, prefix),
+            vec![0; len],
+        ));
+        exprs.push(cmp(Register::Reg1, op, network));
+    }
+
+    exprs
+}
+
+/// The big-endian mask with the first `prefix` bits set.
+fn prefix_mask(len: usize, prefix: u8) -> Vec<u8> {
+    let mut mask = vec![0u8; len];
+    for bit in 0..prefix as usize {
+        mask[bit / 8] |= 0x80 >> (bit % 8);
+    }
+    mask
+}
+
 /// `ip daddr vmap @map` / `ip6 saddr vmap @map` (verdict map lookup).
 pub fn ip_vmap(family: Family, dir: Dir, map: &str) -> Vec<Expr> {
     vec![
@@ -308,6 +377,16 @@ pub fn l4proto_dport_set(set: &str) -> Vec<Expr> {
         meta(MetaKey::L4Proto, Register::Reg1),
         payload(Register::Reg32_01, TRANSPORT_HEADER, 2, 2),
         lookup_set(Register::Reg1, set),
+    ]
+}
+
+/// `meta l4proto == <proto>`, a protocol-only match (no port constraint).
+///
+/// A 1-byte compare, as nft emits it.
+pub fn l4proto_eq(proto: u8) -> Vec<Expr> {
+    vec![
+        meta(MetaKey::L4Proto, Register::Reg1),
+        eq(Register::Reg1, vec![proto]),
     ]
 }
 
@@ -448,8 +527,120 @@ mod tests {
             ExpressionAttribute::Data(Expressions::Payload(p)) => Some(p),
             _ => None,
         });
-        assert!(payload
-            .expect("payload")
-            .contains(&Payload::DestinationRegister(Register::Reg32_01)));
+        assert!(
+            payload
+                .expect("payload")
+                .contains(&Payload::DestinationRegister(Register::Reg32_01))
+        );
+    }
+
+    /// The lookup attrs of `e`.
+    fn lookup_attrs(e: &Expr) -> Vec<Lookup> {
+        let ListAttribute::Element(attrs) = e else {
+            panic!("not an element");
+        };
+        attrs
+            .iter()
+            .find_map(|a| match a {
+                ExpressionAttribute::Data(Expressions::Lookup(l)) => Some(l.clone()),
+                _ => None,
+            })
+            .expect("lookup")
+    }
+
+    #[test]
+    fn lookup_variants() {
+        // plain membership: no destination register
+        assert_eq!(
+            lookup_attrs(&lookup_set(Register::Reg1, "s")),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::Set("s".into())
+            ]
+        );
+
+        // map: explicit destination register
+        assert_eq!(
+            lookup_attrs(&lookup_map(Register::Reg1, Register::Reg2, "m")),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::Set("m".into()),
+                Lookup::DestinationRegister(Register::Reg2),
+            ]
+        );
+
+        // verdict map: destination is the verdict register
+        assert_eq!(
+            lookup_attrs(&lookup_vmap(Register::Reg1, "v")),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::Set("v".into()),
+                Lookup::DestinationRegister(Register::Verdict),
+            ]
+        );
+
+        // inverted membership
+        assert_eq!(
+            lookup_attrs(&lookup_set_inv(Register::Reg1, "s")),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::Set("s".into()),
+                Lookup::Flags(1),
+            ]
+        );
+    }
+
+    /// The expressions of `ip_prefix`, as a compact `(kind, ...)` view.
+    fn prefix_shape(e: &[Expr]) -> Vec<&'static str> {
+        e.iter()
+            .map(|x| {
+                let ListAttribute::Element(attrs) = x else {
+                    panic!("not an element");
+                };
+                attrs
+                    .iter()
+                    .find_map(|a| match a {
+                        ExpressionAttribute::Data(Expressions::Meta(_)) => Some("meta"),
+                        ExpressionAttribute::Data(Expressions::Cmp(_)) => Some("cmp"),
+                        ExpressionAttribute::Data(Expressions::Payload(_)) => Some("payload"),
+                        ExpressionAttribute::Data(Expressions::Bitwise(_)) => Some("bitwise"),
+                        _ => None,
+                    })
+                    .expect("expression")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ip_prefix_byte_aligned_loads_prefix_bytes() {
+        // /24 => meta nfproto, cmp nfproto, payload 3 bytes, cmp; no bitwise
+        let e = ip_prefix(Family::V4, Dir::Src, 24, vec![192, 168, 42, 0], false);
+        assert_eq!(prefix_shape(&e), ["meta", "cmp", "payload", "cmp"]);
+
+        let ListAttribute::Element(attrs) = &e[2] else {
+            panic!()
+        };
+        let payload = attrs.iter().find_map(|a| match a {
+            ExpressionAttribute::Data(Expressions::Payload(p)) => Some(p),
+            _ => None,
+        });
+        assert!(payload.expect("payload").contains(&Payload::Len(3)));
+    }
+
+    #[test]
+    fn ip_prefix_unaligned_masks() {
+        // /20 => payload 4 bytes, bitwise, cmp
+        let e = ip_prefix(Family::V4, Dir::Src, 20, vec![1, 2, 0, 0], false);
+        assert_eq!(
+            prefix_shape(&e),
+            ["meta", "cmp", "payload", "bitwise", "cmp"]
+        );
+    }
+
+    #[test]
+    fn prefix_mask_covers_prefix() {
+        assert_eq!(prefix_mask(4, 20), vec![0xff, 0xff, 0xf0, 0x00]);
+        assert_eq!(prefix_mask(4, 32), vec![0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(prefix_mask(4, 0), vec![0, 0, 0, 0]);
     }
 }

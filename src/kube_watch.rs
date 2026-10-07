@@ -10,15 +10,40 @@ use tokio::sync::mpsc;
 
 pub type EventReceiver = mpsc::Receiver<Event>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "stream", content = "event")]
 pub enum Event {
-    MyNode(Arc<watcher::Event<core::Node>>),
-    Service(Arc<watcher::Event<core::Service>>),
-    EndpointSlice(Arc<watcher::Event<discovery::EndpointSlice>>),
-    Node(Arc<watcher::Event<core::Node>>),
-    NetworkPolicy(Arc<watcher::Event<networking::NetworkPolicy>>),
-    Namespace(Arc<watcher::Event<core::Namespace>>),
-    Pod(Arc<watcher::Event<core::Pod>>),
+    MyNode(Change<core::Node>),
+    Service(Change<core::Service>),
+    EndpointSlice(Change<discovery::EndpointSlice>),
+    Node(Change<core::Node>),
+    NetworkPolicy(Change<networking::NetworkPolicy>),
+    Namespace(Change<core::Namespace>),
+    Pod(Change<core::Pod>),
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Change<K> {
+    Init,
+    InitApply(Arc<K>),
+    InitDone,
+    Apply(Arc<K>),
+    Delete(Arc<K>),
+}
+
+impl<K> From<watcher::Event<K>> for Change<K> {
+    fn from(event: watcher::Event<K>) -> Self {
+        use Change as C;
+        use watcher::Event as E;
+        match event {
+            E::Init => C::Init,
+            E::InitApply(v) => C::InitApply(Arc::new(v)),
+            E::InitDone => C::InitDone,
+            E::Apply(v) => C::Apply(Arc::new(v)),
+            E::Delete(v) => C::Delete(Arc::new(v)),
+        }
+    }
 }
 
 pub struct Config {
@@ -130,7 +155,7 @@ async fn watch_to_events<K>(
     api: Api<K>,
     watcher_config: watcher::Config,
     tx: mpsc::Sender<Event>,
-    map: fn(Arc<watcher::Event<K>>) -> Event,
+    map: fn(Change<K>) -> Event,
 ) where
     K: kube::api::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
 {
@@ -154,7 +179,7 @@ async fn watch_to_events<K>(
             return;
         };
 
-        if tx.send(map(Arc::new(event))).await.is_err() {
+        if tx.send(map(event.into())).await.is_err() {
             info!("receiver of {resource} stopped");
             return;
         }
