@@ -1,5 +1,5 @@
 use cidr::IpCidr;
-use eyre::{Result, bail, eyre};
+use eyre::{bail, eyre, Result};
 use std::{
     collections::BTreeMap as Map,
     net::{Ipv4Addr, Ipv6Addr},
@@ -53,11 +53,7 @@ impl Firewall {
     pub async fn apply(&self) -> Result<()> {
         let nl = netfilter::new_link()?;
 
-        let mut id_seq = 0u32;
-        let mut next_id = || {
-            id_seq += 1;
-            id_seq
-        };
+        let mut builder = set::Builder::new(&self.table);
 
         // step 1: recreate the table and define/fill the regular sets in one
         // atomic batch. Country sets are only created here (empty); their
@@ -69,19 +65,11 @@ impl Firewall {
         let mut deferred = vec![];
 
         for (name, ipset) in &self.ipsets {
-            let v4 = set::IntervalSet::<Ipv4Addr>::new(
-                self.table.clone(),
-                format!("{name}_ipv4"),
-                next_id(),
-            );
-            let v6 = set::IntervalSet::<Ipv6Addr>::new(
-                self.table.clone(),
-                format!("{name}_ipv6"),
-                next_id(),
-            );
+            let v4 = builder.build_interval::<Ipv4Addr>(format!("{name}_ipv4"));
+            let v6 = builder.build_interval::<Ipv6Addr>(format!("{name}_ipv6"));
 
-            msgs.extend([v4.create(), v4.flush()]);
-            msgs.extend([v6.create(), v6.flush()]);
+            msgs.extend([v4.create(None), v4.flush()]);
+            msgs.extend([v6.create(None), v6.flush()]);
 
             match ipset {
                 IpSet::Ips(ips) => {

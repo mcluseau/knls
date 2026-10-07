@@ -1,33 +1,34 @@
 use netlink_packet_core::{
-    Emitable, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    Emitable, NetlinkHeader, NetlinkMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST,
 };
 use netlink_packet_netfilter::{
-    NetfilterMessage,
     nftables::{
         ListAttribute, NfTablesMessage, SetAttribute, SetDescription, SetElementAttribute,
         SetElementList, SetElementMessage, SetFlags, SetMessage, Verdict as NlVerdict,
     },
+    NetfilterMessage,
 };
 use std::{
+    collections::BTreeSet,
     marker::PhantomData,
     net::{Ipv4Addr, Ipv6Addr},
     ops::RangeInclusive,
 };
 
-use super::{Message, nft_header};
+use super::{nft_header, Message};
 
 /// A named set of single keys.
-pub type SimpleSet<T> = Set<T>;
+pub type SimpleSet<'t, T> = Set<'t, T>;
 
 /// A named set of intervals over keys of type `T`. `fill` takes inclusive
 /// `RangeInclusive<T>`.
-pub type IntervalSet<T> = Set<RangeInclusive<T>>;
+pub type IntervalSet<'t, T> = Set<'t, RangeInclusive<T>>;
 
 /// A named map from key type `K` to data type `D`.
-pub type MapSet<K, D> = Set<MapElem<K, D>>;
+pub type MapSet<'t, K, D> = Set<'t, MapElem<K, D>>;
 
 /// A named map from key type `K` to verdicts of value type `V`.
-pub type VerdictMapSet<K> = Set<VerdictElem<K>>;
+pub type VerdictMapSet<'t, K> = Set<'t, VerdictElem<K>>;
 
 /// Maximum size of the `NFTA_SET_ELEM_LIST_ELEMENTS` attribute payload.
 ///
@@ -324,6 +325,15 @@ impl Data for u16 {
     }
 }
 
+impl Data for u32 {
+    const TYPE: u32 = 19; // TYPE_MARK
+    const LEN: u32 = 4;
+
+    fn elem_data(&self) -> Vec<u8> {
+        self.to_be_bytes().into()
+    }
+}
+
 impl<A: Data, B: Data> Data for (A, B) {
     const TYPE: u32 = (A::TYPE << 6) | B::TYPE;
     const LEN: u32 = padded(A::LEN) + padded(B::LEN);
@@ -430,129 +440,241 @@ fn increment_be(bytes: &mut [u8]) {
     }
 }
 
+/// Builds [`Set`]s inside one table, handing out unique ids.
+pub struct Builder<'t> {
+    table: &'t str,
+    id: u32,
+}
+
+impl<'t> Builder<'t> {
+    /// A builder for sets of `table`, assigning each a unique id.
+    pub fn new(table: &'t str) -> Self {
+        Self { table, id: 0 }
+    }
+
+    /// Builds the `Set` named `name` with the next id.
+    pub fn build<T: Elem>(&mut self, name: impl Into<String>) -> Set<'t, T> {
+        self.id += 1;
+        Set {
+            table: self.table,
+            name: name.into(),
+            id: self.id,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Builds a [`SimpleSet`] named `name`.
+    pub fn build_simple<K: Data>(&mut self, name: impl Into<String>) -> SimpleSet<'t, K> {
+        self.build(name)
+    }
+
+    /// Builds an [`IntervalSet`] named `name`.
+    pub fn build_interval<K: Data>(&mut self, name: impl Into<String>) -> IntervalSet<'t, K> {
+        self.build(name)
+    }
+
+    /// Builds a [`MapSet`] named `name`.
+    pub fn build_map<K: Data, D: Data>(&mut self, name: impl Into<String>) -> MapSet<'t, K, D> {
+        self.build(name)
+    }
+
+    /// Builds a [`VerdictMapSet`] named `name`.
+    pub fn build_verdict_map<K: Data>(&mut self, name: impl Into<String>) -> VerdictMapSet<'t, K> {
+        self.build(name)
+    }
+}
+
 /// A named nftables set inside an `inet` table.
-pub struct Set<T> {
-    table: String,
+pub struct Set<'t, T> {
+    table: &'t str,
     name: String,
     id: u32,
     _marker: PhantomData<T>,
 }
 
-impl<'a, T> Set<T>
+impl<'t, T> Set<'t, T>
 where
     T: Elem,
 {
-    pub fn new(table: impl Into<String>, name: impl Into<String>, id: u32) -> Self {
+    pub fn new(table: &'t str, name: impl Into<String>, id: u32) -> Self {
         Self {
-            table: table.into(),
+            table,
             name: name.into(),
             id,
             _marker: PhantomData,
         }
     }
 
-    pub fn create(&self) -> Message {
-        new_set_msg::<T>(&self.table, &self.name, self.id)
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Creates the set.
+    ///
+    /// `comment` is an optional free-form string, attached as nftables userdata
+    /// so it shows up in `nft list`.
+    pub fn create(&self, comment: Option<String>) -> Message {
+        let mut header = NetlinkHeader::default();
+        header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+
+        let mut attributes = vec![
+            SetAttribute::Table(self.table.to_string()),
+            SetAttribute::Name(self.name.clone()),
+            // the kernel requires an id even for named sets
+            SetAttribute::Id(self.id),
+        ];
+        attributes.extend(T::set_attributes());
+        if !T::SET_FLAGS.is_empty() {
+            attributes.push(SetAttribute::Flags(T::SET_FLAGS));
+        }
+        if let Some(comment) = comment {
+            attributes.push(SetAttribute::UserData(set_comment(comment)));
+        }
+
+        let msg = NfTablesMessage::NewSet(SetMessage { attributes });
+
+        NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
     }
 
     pub fn flush(&self) -> Message {
-        flush_msg(&self.table, &self.name)
+        let mut header = NetlinkHeader::default();
+        header.flags = NLM_F_REQUEST | NLM_F_ACK;
+
+        // A `DeleteSetElement` without elements means "flush the whole set".
+        let msg = NfTablesMessage::DeleteSetElement(SetElementMessage {
+            attributes: vec![
+                SetElementList::Table(self.table.to_string()),
+                SetElementList::Set(self.name.clone()),
+            ],
+        });
+
+        NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
     }
 
     /// Add (or update) every given element.
-    pub fn fill<I: Iterator<Item = T>>(&self, items: I) -> impl Iterator<Item = Message> {
-        fill_msgs::<T, I>(&self.table, &self.name, items)
+    pub fn fill<I: Iterator<Item = T>>(
+        &self,
+        items: I,
+    ) -> impl Iterator<Item = Message> + use<'_, 't, I, T> {
+        fill_msgs(self.table, &self.name, items)
     }
 
     pub fn create_flush_fill<I: Iterator<Item = T>>(
         &self,
+        comment: Option<String>,
         items: I,
-    ) -> impl Iterator<Item = Message> {
-        std::iter::once(self.create())
+    ) -> impl Iterator<Item = Message> + use<'_, 't, I, T> {
+        std::iter::once(self.create(comment))
             .chain(std::iter::once(self.flush()))
-            .chain(fill_msgs(&self.table, &self.name, items))
+            .chain(fill_msgs::<T, I>(self.table, &self.name, items))
     }
 }
 
-fn new_set_msg<T>(table: &str, name: &str, id: u32) -> Message
-where
-    T: Elem,
-{
-    let mut header = NetlinkHeader::default();
-    header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+/// `NFTNL_UDATA_SET_COMMENT`: nft's userdata type for a set comment.
+const UDATA_SET_COMMENT: u8 = 7;
 
-    let mut attributes = vec![
-        SetAttribute::Table(table.to_string()),
-        SetAttribute::Name(name.to_string()),
-        // the kernel requires an id even for named sets
-        SetAttribute::Id(id),
-    ];
-    attributes.extend(T::set_attributes());
-    if !T::SET_FLAGS.is_empty() {
-        attributes.push(SetAttribute::Flags(T::SET_FLAGS));
-    }
-
-    let msg = NfTablesMessage::NewSet(SetMessage { attributes });
-
-    NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+/// Encodes `comment` as nft's userdata for `NFTA_SET_USERDATA`: a TLV of
+/// `[type: u8][len: u8][string with trailing NUL]`, as `nftnl_udata_put_strz`
+/// writes it.
+fn set_comment(comment: String) -> Vec<u8> {
+    let bytes = comment.into_bytes();
+    let mut udata = Vec::with_capacity(bytes.len() + 3);
+    udata.push(UDATA_SET_COMMENT);
+    udata.push((bytes.len() + 1) as u8);
+    udata.extend_from_slice(&bytes);
+    udata.push(0); // strz
+    udata
 }
 
-fn flush_msg(table: &str, name: &str) -> Message {
-    let mut header = NetlinkHeader::default();
-    header.flags = NLM_F_REQUEST | NLM_F_ACK;
-
-    // A `DeleteSetElement` without elements means "flush the whole set".
-    let msg = NfTablesMessage::DeleteSetElement(SetElementMessage {
-        attributes: vec![
-            SetElementList::Table(table.to_string()),
-            SetElementList::Set(name.to_string()),
-        ],
-    });
-
-    NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
-}
-
-fn fill_msgs<'a, T, I>(table: impl Into<String>, name: impl Into<String>, items: I) -> FillMsgs<I>
+fn fill_msgs<'a, T, I>(
+    table: &'a str,
+    name: &'a str,
+    items: I,
+) -> impl Iterator<Item = Message> + use<'a, T, I>
 where
     T: Elem,
     I: Iterator<Item = T>,
 {
-    FillMsgs::<I> {
-        table: table.into(),
-        name: name.into(),
-        items,
+    ElemMsgs {
+        table,
+        name,
+        delete: false,
+        items: items.map(|item| item.attributes()),
         buf: Vec::new(),
         bytes: 0,
     }
 }
 
-/// Iterator over the `NEWSETELEM` messages for a fill.
+/// The messages bringing the set from `orig` to `target`: every element of
+/// `orig` that is missing from `target` is deleted first, then every element of
+/// `target` that was missing from `orig` is added.
+///
+/// Each blob is a canonical element key (as produced by
+/// [`Data::elem_data`], or read from the kernel), so a plain set is diffed with
+/// [`BTreeSet`]s of those blobs. Creating the set itself is done separately by
+/// [`Set::create`].
+pub fn sync_raw_set<'a, T: Elem>(
+    set: &'a Set<'a, T>,
+    orig: &'a BTreeSet<Vec<u8>>,
+    target: &'a BTreeSet<Vec<u8>>,
+) -> impl Iterator<Item = Message> + use<'a, T> {
+    let delete = ElemMsgs {
+        table: set.table,
+        name: &set.name,
+        delete: true,
+        items: orig
+            .difference(target)
+            .map(|key| vec![attr::key(key.clone())]),
+        buf: Vec::new(),
+        bytes: 0,
+    };
+
+    let add = ElemMsgs {
+        table: set.table,
+        name: &set.name,
+        delete: false,
+        items: target
+            .difference(orig)
+            .map(|key| vec![attr::key(key.clone())]),
+        buf: Vec::new(),
+        bytes: 0,
+    };
+
+    delete.chain(add)
+}
+
+/// Iterator over the `NEWSETELEM`/`DELSETELEM` messages for a batch of elements.
 ///
 /// Only the message currently under construction is buffered in `buf`, with its
 /// serialized size tracked in `bytes`; the allocation is recycled from one
 /// message to the next. An item's elements (an interval's start and end) are
 /// appended as a unit, so they never split across messages.
-struct FillMsgs<I> {
-    table: String,
-    name: String,
+struct ElemMsgs<'t, I> {
+    table: &'t str,
+    name: &'t str,
+    delete: bool,
+    /// Per-element attributes (an interval yields two elements as a unit).
     items: I,
     buf: Vec<ListAttribute<SetElementAttribute>>,
     bytes: usize,
 }
 
-impl<T, I> Iterator for FillMsgs<I>
+impl<'t, I> Iterator for ElemMsgs<'t, I>
 where
-    T: Elem,
-    I: Iterator<Item = T>,
+    I: Iterator<Item = Vec<ListAttribute<SetElementAttribute>>>,
 {
     type Item = Message;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for item in self.items.by_ref() {
+        for attrs in self.items.by_ref() {
             let before = self.buf.len();
             let mut added = 0;
 
-            for attr in item.attributes() {
+            for attr in attrs {
                 added += attr.buffer_len();
                 self.buf.push(attr);
             }
@@ -562,7 +684,7 @@ where
                 let overflow = self.buf.split_off(before);
                 let elems = std::mem::replace(&mut self.buf, overflow);
                 self.bytes = added;
-                return Some(elem_msg(&self.table, &self.name, elems));
+                return Some(elem_msg(self.table, self.name, elems, self.delete));
             }
 
             self.bytes += added;
@@ -572,9 +694,10 @@ where
         if !self.buf.is_empty() {
             self.bytes = 0;
             return Some(elem_msg(
-                &self.table,
-                &self.name,
+                self.table,
+                self.name,
                 std::mem::take(&mut self.buf),
+                self.delete,
             ));
         }
 
@@ -582,18 +705,33 @@ where
     }
 }
 
-fn elem_msg(table: &str, name: &str, elements: Vec<ListAttribute<SetElementAttribute>>) -> Message {
+fn elem_msg(
+    table: &str,
+    name: &str,
+    elements: Vec<ListAttribute<SetElementAttribute>>,
+    delete: bool,
+) -> Message {
     let mut header = NetlinkHeader::default();
     // No NLM_F_EXCL: adding an existing element updates it.
-    header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+    header.flags = if delete {
+        NLM_F_REQUEST | NLM_F_ACK
+    } else {
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE
+    };
 
-    let msg = NfTablesMessage::NewSetElement(SetElementMessage {
+    let message = SetElementMessage {
         attributes: vec![
             SetElementList::Table(table.to_string()),
             SetElementList::Set(name.to_string()),
             SetElementList::Elements(elements),
         ],
-    });
+    };
+
+    let msg = if delete {
+        NfTablesMessage::DeleteSetElement(message)
+    } else {
+        NfTablesMessage::NewSetElement(message)
+    };
 
     NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
 }
@@ -603,9 +741,14 @@ mod tests {
     use super::*;
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
-        NetfilterMessageInner,
         nftables::{DataAttribute, SetElementFlags, VerdictAttribute},
+        NetfilterMessageInner,
     };
+
+    /// A set for tests: table `t`, name `s`.
+    fn test_set<T: Elem>() -> Set<'static, T> {
+        Set::new("t", "s", 1)
+    }
 
     /// `(key, flags, is_open)` for every element produced by `items`.
     fn parts<T>(items: impl IntoIterator<Item = T>) -> Vec<(Vec<u8>, SetElementFlags, bool)>
@@ -659,7 +802,7 @@ mod tests {
     where
         T: Elem,
     {
-        let msg = new_set_msg::<T>("t", "s", 1);
+        let msg = test_set::<T>().create(None);
         let NetlinkPayload::InnerMessage(NetfilterMessage {
             inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(m)),
             ..
@@ -755,11 +898,9 @@ mod tests {
             })
             .expect("a concat descriptor");
         // the `NFT_SET_CONCAT` flag is set
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat)))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if f.contains(SetFlags::Concat))));
 
         let lens: Vec<u32> = concat
             .iter()
@@ -783,11 +924,9 @@ mod tests {
     #[test]
     fn interval_set_has_interval_flag() {
         let attrs = new_set_attrs::<RangeInclusive<Ipv4Addr>>();
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Interval)));
         // key type/len come from the underlying address
         assert_eq!(
             get_u32(&attrs, |a| match a {
@@ -865,11 +1004,9 @@ mod tests {
             }),
             Some(2)
         );
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
     }
 
     #[test]
@@ -912,11 +1049,9 @@ mod tests {
         );
         // verdicts carry no DataLen
         assert!(!attrs.iter().any(|a| matches!(a, SetAttribute::DataLen(_))));
-        assert!(
-            attrs
-                .iter()
-                .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map))
-        );
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, SetAttribute::Flags(f) if *f == SetFlags::Map)));
     }
 
     /// The nested verdict attributes of the first element produced.
@@ -1104,10 +1239,9 @@ mod tests {
 
     #[test]
     fn element_message_roundtrips() {
-        let mut msg =
-            fill_msgs::<Ipv4Addr, _>("tbl", "set", [Ipv4Addr::new(10, 0, 0, 1)].into_iter())
-                .next()
-                .expect("one message");
+        let mut msg = fill_msgs::<Ipv4Addr, _>("t", "s", [Ipv4Addr::new(10, 0, 0, 1)].into_iter())
+            .next()
+            .expect("one message");
         msg.finalize();
 
         let mut buf = vec![0; msg.buffer_len()];
@@ -1116,5 +1250,96 @@ mod tests {
         let parsed = NetlinkMessage::<NetfilterMessage>::deserialize(&buf).expect("parse back");
         assert_eq!(parsed.payload, msg.payload);
         assert_eq!(parsed.header.message_type, msg.header.message_type);
+    }
+
+    /// `(is_delete, keys)` of a set element message.
+    fn classify(msg: &Message) -> (bool, Vec<Vec<u8>>) {
+        let (delete, m) = match &msg.payload {
+            NetlinkPayload::InnerMessage(NetfilterMessage {
+                inner: NetfilterMessageInner::NfTables(NfTablesMessage::DeleteSetElement(m)),
+                ..
+            }) => (true, m),
+            NetlinkPayload::InnerMessage(NetfilterMessage {
+                inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSetElement(m)),
+                ..
+            }) => (false, m),
+            _ => panic!("not a set element message"),
+        };
+
+        let keys = m
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                SetElementList::Elements(e) => Some(e),
+                _ => None,
+            })
+            .expect("elements")
+            .iter()
+            .filter_map(|item| match item {
+                ListAttribute::Element(attrs) => attrs.iter().find_map(|a| match a {
+                    SetElementAttribute::Key(DataAttribute::Value(v)) => Some(v.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+
+        (delete, keys)
+    }
+
+    fn v4(n: u8) -> Vec<u8> {
+        Ipv4Addr::new(10, 0, 0, n).elem_data()
+    }
+
+    #[test]
+    fn sync_deletes_then_adds() {
+        let orig: BTreeSet<_> = [v4(1), v4(2), v4(3)].into_iter().collect();
+        let target: BTreeSet<_> = [v4(2), v4(3), v4(4)].into_iter().collect();
+
+        let msgs: Vec<_> = sync_raw_set(&test_set::<Ipv4Addr>(), &orig, &target).collect();
+        // one delete message (10.0.0.1) then one add message (10.0.0.4)
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(classify(&msgs[0]), (true, vec![v4(1)]));
+        assert_eq!(classify(&msgs[1]), (false, vec![v4(4)]));
+    }
+
+    #[test]
+    fn sync_noop_when_equal() {
+        let s: BTreeSet<_> = [v4(1), v4(2)].into_iter().collect();
+        assert_eq!(sync_raw_set(&test_set::<Ipv4Addr>(), &s, &s).count(), 0);
+    }
+
+    #[test]
+    fn sync_empty_orig_adds_all() {
+        let orig = BTreeSet::new();
+        let target: BTreeSet<_> = [v4(1), v4(2)].into_iter().collect();
+        let msgs: Vec<_> = sync_raw_set(&test_set::<Ipv4Addr>(), &orig, &target).collect();
+        assert_eq!(msgs.len(), 1); // batched into one add message
+        let (delete, keys) = classify(&msgs[0]);
+        assert!(!delete);
+        assert_eq!(keys, vec![v4(1), v4(2)]);
+    }
+
+    #[test]
+    fn sync_empty_target_deletes_all() {
+        let orig: BTreeSet<_> = [v4(1), v4(2)].into_iter().collect();
+        let target = BTreeSet::new();
+        let msgs: Vec<_> = sync_raw_set(&test_set::<Ipv4Addr>(), &orig, &target).collect();
+        assert_eq!(msgs.len(), 1); // batched into one delete message
+        let (delete, keys) = classify(&msgs[0]);
+        assert!(delete);
+        assert_eq!(keys, vec![v4(1), v4(2)]);
+    }
+
+    #[test]
+    fn sync_batches_and_keeps_order() {
+        let orig = BTreeSet::new();
+        let target: BTreeSet<_> = (0..20_000u32)
+            .map(|i| Ipv4Addr::from(0x0a00_0000 + i).elem_data())
+            .collect();
+        let msgs: Vec<_> = sync_raw_set(&test_set::<Ipv4Addr>(), &orig, &target).collect();
+        assert!(msgs.len() >= 2, "expected batching across messages");
+        let total: usize = msgs.iter().map(|m| classify(m).1.len()).sum();
+        assert_eq!(total, 20_000);
     }
 }

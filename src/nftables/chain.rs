@@ -133,10 +133,6 @@ impl<'t> Chain<'t> {
 
     /// The messages replacing the chain's content: a flush, then the stored
     /// `add rule` messages.
-    ///
-    /// This does not update the hash (which [`push`](Chain::push) maintains).
-    /// Because the chain is always flushed first, no rule reference (handle)
-    /// needs to be tracked.
     pub fn fill(&self) -> impl Iterator<Item = Message> {
         std::iter::once(self.flush()).chain(self.rules.iter().cloned())
     }
