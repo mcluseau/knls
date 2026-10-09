@@ -241,6 +241,13 @@ pub mod test_harness {
     }
 
     /// The table body (without the `table <table> { … }` wrapper) as dumped by
+    /// `nft list`, without deleting the table first. Exposed for scenario
+    /// drivers that apply their own way (e.g. a legacy `nft` script).
+    pub async fn dump_current(table: &str) -> String {
+        dump_existing(table).await
+    }
+
+    /// The table body (without the `table <table> { … }` wrapper) as dumped by
     /// `nft list`, without deleting the table first.
     async fn dump_existing(table: &str) -> String {
         let out = Command::new("nft")

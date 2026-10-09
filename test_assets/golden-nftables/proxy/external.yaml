@@ -1,0 +1,115 @@
+- !ingest
+  - stream: MyNode
+    event: !init_apply
+      metadata: { name: n1 }
+      spec: { podCIDRs: [10.244.0.0/24] }
+      status:
+        addresses:
+          - { type: InternalIP, address: 192.168.1.10 }
+  - stream: MyNode
+    event: !init_done
+  - stream: Service
+    event: !init_apply
+      metadata: { name: lb, namespace: default }
+      spec:
+        type: LoadBalancer
+        clusterIPs: [10.96.0.20]
+        externalIPs: [203.0.113.5]
+        loadBalancerSourceRanges: [203.0.113.0/24]
+        externalTrafficPolicy: Local
+        ports:
+          - { name: http, protocol: TCP, port: 80, targetPort: 8080 }
+  - stream: EndpointSlice
+    event: !init_apply
+      metadata:
+        name: lb-abc
+        namespace: default
+        labels: { "kubernetes.io/service-name": lb }
+      addressType: IPv4
+      endpoints:
+        - addresses: [10.244.0.5]
+          conditions: { ready: true }
+          nodeName: n1
+      ports:
+        - { name: http, port: 8080, protocol: TCP }
+  - stream: Service
+    event: !init_done
+  - stream: EndpointSlice
+    event: !init_done
+
+- !verify |
+    map svc_default_lb {
+    	typeof numgen random mod 1 : verdict
+    	elements = { 0 : goto svc_default_lb_ep_0af40005 }
+    }
+
+    map svc_default_lb_ext {
+    	typeof numgen random mod 1 : verdict
+    	elements = { 0 : goto svc_default_lb_ext_ep_0af40005 }
+    }
+
+    map service_ips {
+    	type ipv4_addr . inet_proto . inet_service : verdict
+    	comment "ClusterIP, ExternalIP and LoadBalancer IP traffic"
+    	elements = { 203.0.113.5 . tcp . 80 : goto svc_default_lb_ext,
+    		     10.96.0.20 . tcp . 80 : goto svc_default_lb }
+    }
+
+    map service_nodeports {
+    	type inet_proto . inet_service : verdict
+    	comment "NodePort traffic"
+    }
+
+    set need_masquerade {
+    	type ipv4_addr . ipv4_addr . ipv4_addr
+    	elements = { 10.244.0.5 . 10.244.0.5 . 203.0.113.5,
+    		     10.244.0.5 . 10.244.0.5 . 10.96.0.20 }
+    }
+
+    set need_masquerade6 {
+    	type ipv6_addr . ipv6_addr . ipv6_addr
+    }
+
+    chain svc_default_lb_ep_0af40005 {
+    	meta nfproto ipv4 tcp dport 80 meta mark set meta mark | 0x00004000 dnat ip to 10.244.0.5:8080
+    }
+
+    chain svc_default_lb {
+    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_lb
+    	reject with icmpv6 port-unreachable
+    }
+
+    chain svc_default_lb_ext_ep_0af40005 {
+    	meta nfproto ipv4 tcp dport 80 meta mark set meta mark | 0x00004000 dnat ip to 10.244.0.5:8080
+    }
+
+    chain svc_default_lb_ext {
+    	ip saddr != 203.0.113.0/24 reject with icmp port-unreachable
+    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_lb_ext
+    	reject with icmpv6 port-unreachable
+    }
+
+    chain dispatch {
+    	ip daddr . ip protocol . th dport vmap @service_ips
+    	fib daddr type local ip protocol . th dport vmap @service_nodeports
+    }
+
+    chain a_hook_dnat_prerouting {
+    	type nat hook prerouting priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain a_hook_dnat_output {
+    	type nat hook output priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain a_hook_dnat_postrouting {
+    	type nat hook postrouting priority filter; policy accept;
+    	ip saddr . ip daddr . ct original ip daddr @need_masquerade masquerade
+    	ip6 saddr . ip6 daddr . ct original ip6 daddr @need_masquerade6 masquerade
+    	ip saddr 10.244.0.0/24 return
+    	ip daddr 10.244.0.0/24 return
+    	meta mark & 0x00004000 == 0x00000000 return
+    	meta mark set meta mark ^ 0x00004000 masquerade fully-random
+    }

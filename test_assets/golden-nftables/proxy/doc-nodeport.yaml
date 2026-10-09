@@ -1,0 +1,103 @@
+# From the "Choosing your own port" NodePort example in
+# content/en/docs/concepts/services-networking/service.md: `my-service` of type
+# NodePort, port 80 -> targetPort 80 with nodePort 30007.
+- !ingest
+  - stream: MyNode
+    event: !init_apply
+      metadata: { name: n1 }
+      spec: { podCIDRs: [10.244.0.0/24] }
+      status:
+        addresses:
+          - { type: InternalIP, address: 192.168.1.10 }
+  - stream: MyNode
+    event: !init_done
+  - stream: Service
+    event: !init_apply
+      metadata: { name: my-service, namespace: default }
+      spec:
+        type: NodePort
+        clusterIPs: [10.96.0.13]
+        ports:
+          - { port: 80, targetPort: 80, nodePort: 30007 }
+  - stream: EndpointSlice
+    event: !init_apply
+      metadata:
+        name: my-service-1
+        namespace: default
+        labels: { "kubernetes.io/service-name": my-service }
+      addressType: IPv4
+      ports:
+        - { port: 80 }
+      endpoints:
+        - addresses: ["10.4.5.6"]
+        - addresses: ["10.1.2.3"]
+  - stream: Service
+    event: !init_done
+  - stream: EndpointSlice
+    event: !init_done
+
+- !verify |
+    map svc_default_my-service {
+    	typeof numgen random mod 1 : verdict
+    	elements = { 0 : goto svc_default_my-service_ep_0a010203, 1 : goto svc_default_my-service_ep_0a040506 }
+    }
+
+    map service_ips {
+    	type ipv4_addr . inet_proto . inet_service : verdict
+    	comment "ClusterIP, ExternalIP and LoadBalancer IP traffic"
+    	elements = { 10.96.0.13 . tcp . 80 : goto svc_default_my-service }
+    }
+
+    map service_nodeports {
+    	type inet_proto . inet_service : verdict
+    	comment "NodePort traffic"
+    	elements = { tcp . 30007 : goto svc_default_my-service }
+    }
+
+    set need_masquerade {
+    	type ipv4_addr . ipv4_addr . ipv4_addr
+    }
+
+    set need_masquerade6 {
+    	type ipv6_addr . ipv6_addr . ipv6_addr
+    }
+
+    chain svc_default_my-service_ep_0a010203 {
+    	meta nfproto ipv4 tcp dport 80 meta mark set meta mark | 0x00004000 dnat ip to 10.1.2.3:80
+    	fib daddr type local meta nfproto ipv4 tcp dport 30007 meta mark set meta mark | 0x00004000 dnat ip to 10.1.2.3:80
+    }
+
+    chain svc_default_my-service_ep_0a040506 {
+    	meta nfproto ipv4 tcp dport 80 meta mark set meta mark | 0x00004000 dnat ip to 10.4.5.6:80
+    	fib daddr type local meta nfproto ipv4 tcp dport 30007 meta mark set meta mark | 0x00004000 dnat ip to 10.4.5.6:80
+    }
+
+    chain svc_default_my-service {
+    	meta nfproto ipv4 numgen random mod 2 vmap @svc_default_my-service
+    	reject with icmpv6 port-unreachable
+    }
+
+    chain dispatch {
+    	ip daddr . ip protocol . th dport vmap @service_ips
+    	fib daddr type local ip protocol . th dport vmap @service_nodeports
+    }
+
+    chain a_hook_dnat_prerouting {
+    	type nat hook prerouting priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain a_hook_dnat_output {
+    	type nat hook output priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain a_hook_dnat_postrouting {
+    	type nat hook postrouting priority filter; policy accept;
+    	ip saddr . ip daddr . ct original ip daddr @need_masquerade masquerade
+    	ip6 saddr . ip6 daddr . ct original ip6 daddr @need_masquerade6 masquerade
+    	ip saddr 10.244.0.0/24 return
+    	ip daddr 10.244.0.0/24 return
+    	meta mark & 0x00004000 == 0x00000000 return
+    	meta mark set meta mark ^ 0x00004000 masquerade fully-random
+    }
