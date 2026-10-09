@@ -1,0 +1,273 @@
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.1, 10.0.0.2 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+- !custom 1
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+- !custom 2
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+- !custom 3
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a, 10.0.0.3 : goto pod_c }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+    chain pod_c {
+    	accept
+    }
+
+- !custom 4
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a, 10.0.0.3 : goto pod_c }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	drop
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+    chain pod_c {
+    	accept
+    }
+
+- !custom 5
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a, 10.0.0.3 : goto pod_c }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter + 10; policy accept;
+    	drop
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+    chain pod_c {
+    	accept
+    }
+
+- !custom 6
+
+- !verify |
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.2, 10.0.0.3 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter + 10; policy accept;
+    	drop
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }
+
+- !nft |
+    delete table inet {table}
+
+- !custom 0
+
+- !verify |
+    set blocked {
+    	type ipv4_addr
+    	flags interval
+    	elements = { 192.168.1.0/24 }
+    }
+
+    map dispatch {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto pod_a }
+    }
+
+    set src {
+    	type ipv4_addr
+    	elements = { 10.0.0.1, 10.0.0.2 }
+    }
+
+    chain filter {
+    	type filter hook forward priority filter; policy accept;
+    	ip daddr @src accept
+    	ip daddr vmap @dispatch
+    }
+
+    chain pod_a {
+    	accept
+    }
+
+    chain pod_b {
+    	meta l4proto . th dport { tcp . 80 } accept
+    }

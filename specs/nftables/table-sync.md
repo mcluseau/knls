@@ -408,7 +408,7 @@ This exercises the **diff path**, not just the initial render: a scenario
 applies the table, mutates state, and verifies the table after the incremental
 update equals the table after a fresh full render of the same target.
 
-New golden scenarios under `test_assets/golden-ntables/<subsystem>/` should
+New golden scenarios under `test_assets/golden-nftables/<subsystem>/` should
 cover at least:
 
 - first apply (full create);

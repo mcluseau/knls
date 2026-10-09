@@ -22,6 +22,7 @@ pub enum Event {
     Pod(Change<core::Pod>),
 }
 
+/// kube's watcher::Event are not serde. Since we need that, also use Arc here, as we need that.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Change<K> {

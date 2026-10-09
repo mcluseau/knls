@@ -41,8 +41,11 @@ non-interactively. CI/dev images can grant `CAP_NET_ADMIN` instead of full root.
 `src/nftables.rs` exposes `#[cfg(test)] pub mod test_harness`, shared by every
 nftables subsystem:
 
-- `System` trait — a subsystem under test implements `new(table)`, `ingest(event)`
-  and `render() -> Vec<Message>` (`Message` is a netfilter netlink message).
+- `System` trait — a subsystem under test implements `new(table)`, `ingest(event)`,
+  `custom(id)` and either `render() -> Vec<Message>` or `apply(table)` (the
+  default `apply` renders then sends; `ingest`/`custom` default to no-ops). A
+  full-render subsystem implements `render`; an incremental one overrides
+  `apply`, typically driving a `table_sync::TableState`.
 - `golden(table, yaml)` — runs one scenario.
 - `golden_dir(dir, table_prefix)` — runs every `*.yaml` in `dir`, each against a
   table named `{table_prefix}{file_stem}`.
@@ -68,22 +71,28 @@ A scenario is a YAML list of ops:
 
 - `!ingest` feeds a list of `kube_watch::Event`s (see `src/kube_watch.rs`) into
   the `System`, simulating watch events.
-- `!verify` applies the current rendering to the kernel and compares the table
-  **body** — the harness strips the surrounding `table <name> { … }` wrapper, so
-  the golden only holds the table's contents.
+- `!custom <id>` selects one of the scenario's states (whatever the `System`
+  defines it to be, e.g. a `TableSync` to render).
+- `!nft <script>` runs an `nft` script against the kernel out of band, so the
+  table changes behind the `System`'s back (`{table}` is replaced by the
+  scenario's table name); the next `apply` is expected to detect the divergence
+  and rebuild.
+- `!verify` applies the current state to the (once-emptied, then persistent)
+  table and compares the table **body** — the harness strips the surrounding
+  `table <name> { … }` wrapper, so the golden only holds the table's contents.
 
 The comparison `normalize`s whitespace (line wrapping/indentation in `nft list`
 doesn't matter), but is otherwise exact. A mismatch prints the full actual dump
 to make updating the golden easy.
 
-Golden files live under `test_assets/golden-ntables/<subsystem>/<name>.yaml`.
+Golden files live under `test_assets/golden-nftables/<subsystem>/<name>.yaml`.
 Scenarios use serde_yaml 0.9, which requires the `!tag` syntax for enums and
 cannot deserialize nested enums — hence `kube_watch::Event` is adjacently
 tagged over a `stream`/`event` pair.
 
 Currently:
 
-- `src/netpol/nftables.rs` runs `golden_dir("test_assets/golden-ntables/netpol", "knls-test-netpol-")`.
+- `src/netpol/nftables.rs` runs `golden_dir("test_assets/golden-nftables/netpol", "knls-test-netpol-")`.
 - `src/firewall.rs` has an older, equivalent in-file golden (`firewall/tests.yaml`)
   with the expected dump embedded per case; prefer the `test_harness` style for
   new tests.

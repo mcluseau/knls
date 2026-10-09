@@ -1133,12 +1133,12 @@ mod tests {
             self.state.ingest(&event);
         }
 
-        fn render(&self) -> Vec<Message> {
+        fn render(&mut self) -> Vec<Message> {
             render(&self.state, &self.cfg, "n1").messages
         }
     }
 
-    /// Golden tests: each `test_assets/golden-ntables/netpol/*.yaml` scenario
+    /// Golden tests: each `test_assets/golden-nftables/netpol/*.yaml` scenario
     /// (ipBlock/except, podSelector, ports), rendered and compared to
     /// `nft list` at each step.
     ///
@@ -1147,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn golden() {
         test_harness::golden_dir::<TestSystem>(
-            "test_assets/golden-ntables/netpol",
+            "test_assets/golden-nftables/netpol",
             "knls-test-netpol-",
         )
         .await;

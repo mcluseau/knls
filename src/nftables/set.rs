@@ -40,7 +40,10 @@ const MAX_ELEMS_BYTES: usize = u16::MAX as usize - 4;
 const NFT_DATA_VERDICT: u32 = 0xffffff00;
 
 /// A verdict map value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Ord` is derived so a [`BTreeMap`] of raw keys can hold a verdict as its
+/// value (see [`table_sync`](super::table_sync)).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Verdict {
     /// Accept the packet (`NF_ACCEPT`).
     Accept,
@@ -561,26 +564,15 @@ where
     }
 
     fn create_with(&self, flags: SetFlags, comment: Option<String>) -> Message {
-        let mut header = NetlinkHeader::default();
-        header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
-
-        let mut attributes = vec![
-            SetAttribute::Table(self.table.to_string()),
-            SetAttribute::Name(self.name.clone()),
-            // the kernel requires an id even for named sets
-            SetAttribute::Id(self.id),
-        ];
-        attributes.extend(T::set_attributes());
-        if !flags.is_empty() {
-            attributes.push(SetAttribute::Flags(flags));
+        Raw {
+            table: self.table,
+            name: self.name.clone(),
+            id: self.id,
+            flags,
+            attributes: &T::set_attributes(),
+            comment: comment.as_deref(),
         }
-        if let Some(comment) = comment {
-            attributes.push(SetAttribute::UserData(set_comment(comment)));
-        }
-
-        let msg = NfTablesMessage::NewSet(SetMessage { attributes });
-
-        NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+        .create()
     }
 
     pub fn flush(&self) -> Message {
@@ -617,18 +609,155 @@ where
     }
 }
 
+/// The `NFTA_SET_ELEM_*` attributes of one set element, already encoded in the
+/// canonical kernel form.
+///
+/// An interval's start and end are one group, treated as an atomic block by the
+/// fill/delete iterators so they never split across messages.
+#[derive(Clone, Debug)]
+pub struct Element(Vec<ListAttribute<SetElementAttribute>>);
+
+impl Element {
+    /// A simple-set key.
+    pub fn key(key: Vec<u8>) -> Self {
+        Self(vec![attr::key(key)])
+    }
+
+    /// A map entry: key → plain value.
+    pub fn map_entry(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self(vec![attr::key_with_data(key, DataAttr::Value(value))])
+    }
+
+    /// A verdict-map entry: key → verdict.
+    pub fn verdict_entry(key: Vec<u8>, verdict: Verdict) -> Self {
+        Self(vec![attr::key_with_data(key, DataAttr::Verdict(verdict))])
+    }
+
+    /// An inclusive `start..=end` interval (`concat` selects the concatenated
+    /// `KEY_END` form). Empty ranges yield an empty group.
+    pub fn interval(start: Vec<u8>, end: Vec<u8>, concat: bool) -> Self {
+        Self(interval_elems(start, end, concat))
+    }
+}
+
+/// A named set/map with pre-encoded metadata and element bytes, as stored in a
+/// [`TableSync`](super::table_sync::TableSync).
+///
+/// Unlike [`Set`], the key/data type is erased to raw [`SetAttribute`]s, so the
+/// same set can be created and diffed without knowing its nft type.
+pub struct Raw<'t> {
+    /// The table the set lives in.
+    pub table: &'t str,
+    /// The set's name.
+    pub name: String,
+    /// The set id, only meaningful within one netlink transaction.
+    pub id: u32,
+    /// The set-level flags.
+    pub flags: SetFlags,
+    /// The `NFTA_SET_*` attributes minus table/name/id and flags, as
+    /// [`Elem::set_attributes`] returns them.
+    pub attributes: &'t [SetAttribute],
+    /// Optional `NFTA_SET_USERDATA` comment.
+    pub comment: Option<&'t str>,
+}
+
+impl<'t> Raw<'t> {
+    /// The `NewSet` message creating the set.
+    ///
+    /// Created with `NLM_F_CREATE` (no `EXCL`), so re-issuing it updates the
+    /// metadata (e.g. the comment) in place without dropping its elements.
+    pub fn create(&self) -> Message {
+        let mut header = NetlinkHeader::default();
+        header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+
+        let mut attrs = vec![
+            SetAttribute::Table(self.table.to_string()),
+            SetAttribute::Name(self.name.clone()),
+            // the kernel requires an id even for named sets
+            SetAttribute::Id(self.id),
+        ];
+        attrs.extend_from_slice(self.attributes);
+        if !self.flags.is_empty() {
+            attrs.push(SetAttribute::Flags(self.flags));
+        }
+        if let Some(comment) = self.comment {
+            attrs.push(SetAttribute::UserData(set_comment(comment)));
+        }
+
+        let msg = NfTablesMessage::NewSet(SetMessage { attributes: attrs });
+
+        NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+    }
+
+    /// The message deleting the set.
+    pub fn delete(&self) -> Message {
+        delete(self.table, &self.name)
+    }
+
+    /// The messages adding `items` to the set, batched.
+    pub fn fill<I>(&self, items: I) -> impl Iterator<Item = Message> + use<'_, 't, I>
+    where
+        I: Iterator<Item = Element>,
+    {
+        raw_elems(self.table, &self.name, false, items)
+    }
+
+    /// The messages removing `items` from the set, batched.
+    pub fn delete_elems<I>(&self, items: I) -> impl Iterator<Item = Message> + use<'_, 't, I>
+    where
+        I: Iterator<Item = Element>,
+    {
+        raw_elems(self.table, &self.name, true, items)
+    }
+}
+
+/// Deletes the named set `name` in `table`.
+pub fn delete(table: &str, name: &str) -> Message {
+    let mut header = NetlinkHeader::default();
+    header.flags = NLM_F_REQUEST | NLM_F_ACK;
+
+    let msg = NfTablesMessage::DeleteSet(SetMessage {
+        attributes: vec![
+            SetAttribute::Table(table.to_string()),
+            SetAttribute::Name(name.to_string()),
+        ],
+    });
+
+    NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+}
+
+/// Batches `items` (each an atomic element group) into add/delete messages.
+fn raw_elems<'a, I>(
+    table: &'a str,
+    name: &'a str,
+    delete: bool,
+    items: I,
+) -> impl Iterator<Item = Message> + use<'a, I>
+where
+    I: Iterator<Item = Element>,
+{
+    ElemMsgs {
+        table,
+        name,
+        delete,
+        items: items.map(|element| element.0),
+        buf: Vec::new(),
+        bytes: 0,
+    }
+}
+
 /// `NFTNL_UDATA_SET_COMMENT`: nft's userdata type for a set comment.
 const UDATA_SET_COMMENT: u8 = 7;
 
 /// Encodes `comment` as nft's userdata for `NFTA_SET_USERDATA`: a TLV of
 /// `[type: u8][len: u8][string with trailing NUL]`, as `nftnl_udata_put_strz`
 /// writes it.
-fn set_comment(comment: String) -> Vec<u8> {
-    let bytes = comment.into_bytes();
+fn set_comment(comment: &str) -> Vec<u8> {
+    let bytes = comment.as_bytes();
     let mut udata = Vec::with_capacity(bytes.len() + 3);
     udata.push(UDATA_SET_COMMENT);
     udata.push((bytes.len() + 1) as u8);
-    udata.extend_from_slice(&bytes);
+    udata.extend_from_slice(bytes);
     udata.push(0); // strz
     udata
 }

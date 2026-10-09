@@ -164,6 +164,21 @@ impl<'t> Chain<'t> {
     pub fn fill(&self) -> impl Iterator<Item = Message> {
         std::iter::once(self.flush()).chain(self.rules.iter().cloned())
     }
+
+    /// The message deleting the chain.
+    pub fn delete(&self) -> Message {
+        let mut header = NetlinkHeader::default();
+        header.flags = NLM_F_REQUEST | NLM_F_ACK;
+
+        let msg = NfTablesMessage::DeleteChain(ChainMessage {
+            attributes: vec![
+                ChainAttribute::Table(self.table.to_string()),
+                ChainAttribute::Name(self.chain.clone()),
+            ],
+        });
+
+        NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+    }
 }
 
 /// The `add rule` message for a rule built from `expressions`.

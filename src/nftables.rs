@@ -2,6 +2,7 @@ pub mod chain;
 pub mod rules;
 pub mod set;
 pub mod table;
+pub mod table_sync;
 
 use eyre::Result;
 use log::debug;
@@ -72,23 +73,79 @@ pub mod test_harness {
     pub enum Op {
         /// Feed each event into the system.
         Ingest(Vec<kube_watch::Event>),
+        /// Select a scenario-provided state, e.g. a [`TableSync`] to render.
+        ///
+        /// [`TableSync`]: crate::nftables::table_sync::TableSync
+        Custom(usize),
+        /// Run an `nft` script against the kernel, out of band: it changes the
+        /// table behind the system's back, so the next `apply` must detect the
+        /// divergence and rebuild. `{table}` is replaced by the scenario table.
+        Nft(String),
         /// Apply the current table and compare against this `nft list` body.
         Verify(String),
     }
 
     /// A subsystem under test, driven by a golden scenario.
+    ///
+    /// `render` is applied to the persistent table at every `Verify` (the table
+    /// is emptied once, at the start of the scenario). A full-render system
+    /// re-creates the table itself; an incremental one
+    /// ([`TableState`](crate::nftables::table_sync::TableState)) emits only the
+    /// diff against its previously rendered state, and so must be `&mut self`.
+    #[allow(async_fn_in_trait)]
     pub trait System: Sized {
         /// Builds the subsystem, rendering into `table`.
         fn new(table: String) -> Self;
         /// Ingests one watch event.
-        fn ingest(&mut self, event: kube_watch::Event);
-        /// The netlink messages rendering the current state.
-        fn render(&self) -> Vec<Message>;
+        fn ingest(&mut self, _event: kube_watch::Event) {}
+        /// Selects one of the scenario's states.
+        fn custom(&mut self, _id: usize) {}
+        /// The netlink messages applying the current state to the table.
+        ///
+        /// Only needed by the default [`apply`](System::apply); a system that
+        /// overrides `apply` need not implement it.
+        fn render(&mut self) -> Vec<Message> {
+            unimplemented!("implement either `render` or `apply`")
+        }
+        /// Renders the current state and sends the resulting messages to
+        /// `table`. Overridable, e.g. to apply through a
+        /// [`TableState`](crate::nftables::table_sync::TableState).
+        async fn apply(&mut self, table: &str) {
+            let messages = self.render();
+            let nl = netfilter::new_link().expect("netlink");
+            nl.send_as_transactions(messages.into_iter())
+                .await
+                .unwrap_or_else(|e| panic!("apply to {table} failed: {e}"));
+        }
     }
 
     /// Collapse all whitespace, so line wrapping and indentation don't matter.
     pub fn normalize(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The table body (without the `table <table> { … }` wrapper), with nft's
+    /// one level of table indentation stripped — the layout `nft list` would use
+    /// for the table's contents alone. The comparison normalizes whitespace, so
+    /// this is for the golden's readability only.
+    fn table_body(dump: &str) -> String {
+        let (_, body) = dump.split_once('{').expect("table opener");
+        let (body, _) = body.rsplit_once('}').expect("table closer");
+
+        body.lines()
+            .map(|line| line.strip_prefix('\t').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    /// Applies `messages` to a clean `table` and returns the resulting body, as
+    /// [`dump`] would. Exposed for scenario drivers that render themselves.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    pub async fn capture(table: &str, messages: Vec<Message>) -> String {
+        dump(table, messages).await
     }
 
     /// Applies `messages` to `table` and returns the table body (without the
@@ -116,21 +173,40 @@ pub mod test_harness {
             .args(["delete", "table", "inet", table])
             .status();
 
-        // drop the `table <table> {` opener and the final `}`
-        let (_, body) = dump.split_once('{').expect("table opener");
-        let (body, _) = body.rsplit_once('}').expect("table closer");
+        table_body(&dump)
+    }
 
-        body.trim().to_string()
+    /// The table body (without the `table <table> { … }` wrapper) as dumped by
+    /// `nft list`, without deleting the table first.
+    async fn dump_existing(table: &str) -> String {
+        let out = Command::new("nft")
+            .args(["list", "table", "inet", table])
+            .output()
+            .expect("nft");
+        let dump = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "nft list failed: {dump}");
+
+        table_body(&dump)
     }
 
     /// Runs a golden scenario (a YAML list of [`Op`]s) against a fresh
-    /// `S::new(table)` system: `Ingest` events are fed to it, and every
-    /// `Verify` re-applies `render()` and compares the resulting table body
-    /// with the expected `nft list` output.
+    /// `S::new(table)` system: `Ingest`/`Custom`/`Nft` drive it, and every
+    /// `Verify` applies the current state to the (once-emptied, then persistent)
+    /// table and compares the resulting body with the expected `nft list` output.
+    ///
+    /// A full-render system re-creates the table itself; an incremental one only
+    /// emits the diff against its previous render.
     ///
     /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
     pub async fn golden<S: System>(table: impl Into<String>, yaml: &str) {
         let table = table.into();
+
+        // empty the table once: the first `render` builds it.
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", &table])
+            .stderr(Stdio::null())
+            .status();
+
         let mut system = S::new(table.clone());
 
         let ops: Vec<Op> = serde_yaml::from_str(yaml).expect("bad scenario yaml");
@@ -142,8 +218,14 @@ pub mod test_harness {
                         system.ingest(event);
                     }
                 }
+                Op::Custom(id) => system.custom(id),
+                Op::Nft(script) => {
+                    let script = script.replace("{table}", &table);
+                    super::apply_script(script).await.expect("nft script");
+                }
                 Op::Verify(expected) => {
-                    let actual = dump(&table, system.render()).await;
+                    system.apply(&table).await;
+                    let actual = dump_existing(&table).await;
                     assert_eq!(
                         normalize(&actual),
                         normalize(&expected),
@@ -152,6 +234,10 @@ pub mod test_harness {
                 }
             }
         }
+
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", &table])
+            .status();
     }
 
     /// Runs every `*.yaml` golden scenario in `dir`, each against a table named
