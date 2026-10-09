@@ -65,6 +65,7 @@ pub mod test_harness {
         kube_watch,
         netlink::netfilter::{self, NetlinkExt as _},
     };
+    use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
 
     /// One step of a golden scenario.
@@ -138,6 +139,69 @@ pub mod test_harness {
             .join("\n")
             .trim()
             .to_string()
+    }
+
+    /// Splits a dedented table body into its top-level objects, keyed by
+    /// `"<kind> <name>"` (e.g. `"map my-map"`) with the object's raw text as
+    /// value.
+    ///
+    /// `nft list` prints sets/maps then chains, each in creation (handle) order,
+    /// not sorted; keying by name makes the comparison order-independent and
+    /// lets a mismatch name the offending object.
+    fn objects(body: &str) -> BTreeMap<String, String> {
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        let mut name = String::new();
+        let mut block = String::new();
+
+        for line in body.lines() {
+            // a top-level object starts with its kind keyword at column 0; its
+            // body lines (and closing brace) are indented.
+            let header =
+                line.starts_with("set ") || line.starts_with("map ") || line.starts_with("chain ");
+            if header {
+                if !name.is_empty() {
+                    out.insert(std::mem::take(&mut name), block.trim().to_string());
+                    block.clear();
+                }
+                name = line.split('{').next().unwrap_or(line).trim().to_string();
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+        if !name.is_empty() {
+            out.insert(name, block.trim().to_string());
+        }
+        out
+    }
+
+    /// Compares two table bodies object by object, returning a message that
+    /// names the first mismatching object.
+    fn compare_bodies(expected: &str, actual: &str) -> Result<(), String> {
+        let expected = objects(expected);
+        let actual = objects(actual);
+
+        for (name, want) in &expected {
+            match actual.get(name) {
+                None => {
+                    return Err(format!(
+                        "{name} is missing from the table. Expected:\n{want}"
+                    ));
+                }
+                Some(got) if normalize(got) != normalize(want) => {
+                    return Err(format!(
+                        "{name} does not match. Expected:\n{want}\nGot:\n{got}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = actual.keys().find(|name| !expected.contains_key(*name)) {
+            return Err(format!(
+                "unexpected {name} in the table. Got:\n{}",
+                actual[name]
+            ));
+        }
+        Ok(())
     }
 
     /// Applies `messages` to a clean `table` and returns the resulting body, as
@@ -226,11 +290,9 @@ pub mod test_harness {
                 Op::Verify(expected) => {
                     system.apply(&table).await;
                     let actual = dump_existing(&table).await;
-                    assert_eq!(
-                        normalize(&actual),
-                        normalize(&expected),
-                        "step {i}: table mismatch, actual dump:\n{actual}"
-                    );
+                    if let Err(message) = compare_bodies(&expected, &actual) {
+                        panic!("step {i}: {message}\n\nfull actual dump:\n{actual}");
+                    }
                 }
             }
         }
@@ -261,6 +323,45 @@ pub mod test_harness {
             let table = format!("{table_prefix}{stem}");
 
             golden::<S>(table, &yaml).await;
+        }
+    }
+
+    mod tests {
+        use super::*;
+
+        const A: &str = "set a {\n\ttype ipv4_addr\n\telements = { 1.2.3.4 }\n}\n\n\
+                         chain c {\n\taccept\n}";
+
+        #[test]
+        fn objects_splits_top_level_objects_by_name() {
+            let objects = objects(A);
+            assert_eq!(objects.len(), 2);
+            assert!(objects.contains_key("set a"));
+            assert!(objects.contains_key("chain c"));
+        }
+
+        #[test]
+        fn compare_ignores_object_order() {
+            let reordered = "chain c {\n\taccept\n}\n\n\
+                             set a {\n\ttype ipv4_addr\n\telements = { 1.2.3.4 }\n}";
+            assert_eq!(compare_bodies(A, reordered), Ok(()));
+        }
+
+        #[test]
+        fn compare_names_the_mismatching_object() {
+            let changed = "chain c {\n\taccept\n}\n\n\
+                           set a {\n\ttype ipv4_addr\n\telements = { 5.6.7.8 }\n}";
+            let err = compare_bodies(A, changed).expect_err("a mismatch");
+            assert!(err.starts_with("set a does not match"), "{err}");
+        }
+
+        #[test]
+        fn compare_reports_missing_and_unexpected_objects() {
+            let missing = compare_bodies(A, "chain c {\n\taccept\n}").expect_err("missing");
+            assert!(missing.starts_with("set a is missing"), "{missing}");
+
+            let extra = compare_bodies("chain c {\n\taccept\n}", A).expect_err("unexpected");
+            assert!(extra.starts_with("unexpected set a"), "{extra}");
         }
     }
 }

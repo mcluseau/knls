@@ -139,6 +139,24 @@ impl SetSync {
         matches!(self, Self::VerdictMap(_))
     }
 
+    /// The set's metadata, mutably.
+    pub fn meta_mut(&mut self) -> &mut SetMeta {
+        match self {
+            Self::Set(s) => &mut s.meta,
+            Self::Interval(s) => &mut s.meta,
+            Self::Map(s) => &mut s.meta,
+            Self::VerdictMap(s) => &mut s.meta,
+        }
+    }
+
+    /// Marks the set anonymous (`NFT_SET_ANONYMOUS`).
+    ///
+    /// The kernel binds an anonymous set to a single rule and `nft` prints it
+    /// inline (`{ tcp . 80, … }`) rather than as a named `@set`.
+    pub fn set_anonymous(&mut self) {
+        self.meta_mut().flags |= SetFlags::Anonymous;
+    }
+
     /// A set of keys of `keys`.
     pub fn simple<K: Data>(keys: impl IntoIterator<Item = K>, comment: Option<String>) -> Self {
         Self::Set(SetSpec {
@@ -213,7 +231,7 @@ pub struct ChainRef {
 ///
 /// Chains are kept as a fingerprint (holding every rule alive between updates
 /// is a lot of baseline memory); named sets are kept in full.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableSyncRef {
     pub chains: BTreeMap<String, ChainRef>,
     pub sets: BTreeMap<String, SetSync>,

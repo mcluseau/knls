@@ -1,15 +1,12 @@
 use super::{ANN_EGRESS_REJECT, ANN_REJECT, Peer, Policy, PolicyPort, PolicyRule, RejectAction};
 use crate::{
     kube_watch::EventReceiver,
-    netlink::netfilter::{self, NetlinkExt as _},
     nftables::{
-        Message,
-        chain::{self, Chain, Rule},
+        chain::{self, Rule},
         rules,
         rules::{Dir, Expr, Family, Reject},
-        set,
-        set::{Verdict, VerdictElem},
-        table,
+        set::{Data, Verdict},
+        table_sync::{BaseChain, ChainSync, SetSync, TableState, TableSync},
     },
     state::{Namespace, Pod},
 };
@@ -17,11 +14,10 @@ use cidr::IpCidr;
 use eyre::Result;
 use k8s_openapi::{api::core::v1 as core, api::networking::v1 as networking};
 use log::error;
-use std::collections::BTreeSet as Set;
+use std::collections::{BTreeMap, BTreeSet as Set};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use xxhash_rust::xxh3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -53,13 +49,10 @@ crate::multimap!(
 );
 
 pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
-    let mut prev = 0u128;
-
     let node_name = ctx.node_name.as_str();
 
     let mut state = State::new();
-
-    let nl = netfilter::new_link()?;
+    let mut table = TableState::new(cfg.table.clone());
 
     loop {
         let Some(updated) = state.ingest_events(&mut events).await else {
@@ -69,86 +62,63 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             continue;
         }
 
-        let rendered = render(&state, &cfg, node_name);
-
-        let h = rendered.hash();
-
-        if prev == h {
-            continue;
-        }
-        prev = h;
-
-        // Everything in one atomic batch: the message order satisfies every
-        // reference (sets before the rules using them, chains before the vmap
-        // elements that `goto` them).
-        if let Err(e) = nl.send_as_transactions(rendered.messages.into_iter()).await {
+        if let Err(e) = table.update(render(&state, &cfg, node_name)).await {
             error!("netpol update failed: {e}");
         }
     }
 }
 
-/// The rendered netpol table: the netlink messages to apply.
-struct Rendered {
-    messages: Vec<Message>,
-}
-
-impl Rendered {
-    /// The full-content hash, so an element-only change is not missed.
-    fn hash(&self) -> u128 {
-        let mut hasher = xxh3::Xxh3::new();
-        for msg in &self.messages {
-            let mut msg = msg.clone();
-            msg.finalize();
-            let mut buf = vec![0u8; msg.buffer_len()];
-            msg.serialize(&mut buf);
-            hasher.update(&buf);
-        }
-        hasher.digest128()
-    }
-}
-
-/// Renders the netpol table for `state` as netlink messages.
-fn render(state: &State, cfg: &Config, node_name: &str) -> Rendered {
+/// Renders the netpol table for `state` as a target [`TableSync`].
+fn render(state: &State, cfg: &Config, node_name: &str) -> TableSync {
     let mut b = Builder::new(cfg);
 
     b.pod_chains(state, node_name);
     b.netpol_chains(state);
     b.base_chain();
 
-    Rendered {
-        messages: b.into_messages(),
-    }
-}
-
-/// A chain plus whether it is a base chain (needs the hook on creation).
-struct BuiltChain<'t> {
-    chain: Chain<'t>,
-    base: bool,
+    b.into_table()
 }
 
 /// Accumulates the sets, maps and chains of one netpol table.
 struct Builder<'t> {
     cfg: &'t Config,
-    sets: NamedSets,
-    chains: Vec<BuiltChain<'t>>,
+    sets: BTreeMap<String, SetSync>,
+    chains: BTreeMap<String, ChainSync>,
+    next_id: u32,
 }
 
 impl<'t> Builder<'t> {
     fn new(cfg: &'t Config) -> Self {
         Self {
             cfg,
-            sets: NamedSets::new(&cfg.table),
-            chains: Vec::new(),
+            sets: BTreeMap::new(),
+            chains: BTreeMap::new(),
+            next_id: 0,
         }
     }
 
-    /// Adds a regular chain and returns it for filling.
-    fn chain(&mut self, name: String) -> &mut Chain<'t> {
-        self.chains.push(BuiltChain {
-            chain: Chain::new(self.cfg.table.as_str(), name),
-            base: false,
-        });
-        &mut self.chains.last_mut().expect("just pushed").chain
+    /// Adds a regular chain with its rules and anonymous sets.
+    fn add_chain(&mut self, name: String, rules: Vec<Rule>, anon_sets: BTreeMap<String, SetSync>) {
+        self.chains.insert(
+            name,
+            ChainSync {
+                base: None,
+                rules,
+                anon_sets,
+            },
+        );
+    }
+
+    /// Adds the pod verdict-map entry `key -> goto chain`, creating the map on
+    /// first use.
+    fn vmap_entry<A: Data>(&mut self, map: &str, key: A, chain: String) {
+        let entry = self
+            .sets
+            .entry(map.to_string())
+            .or_insert_with(|| SetSync::verdict_map::<A>(std::iter::empty(), None));
+        if let SetSync::VerdictMap(m) = entry {
+            m.entries.insert(key.elem_data(), Verdict::Goto(chain));
+        }
     }
 
     fn pod_chains(&mut self, state: &State, node_name: &str) {
@@ -177,13 +147,10 @@ impl<'t> Builder<'t> {
             if !ingress.is_empty() {
                 let chain_name = format!("ingress_pod_{ns}_{name}");
                 for ip in &pod.ipsv4 {
-                    self.sets.pods_ingress.items.push((*ip, chain_name.clone()));
+                    self.vmap_entry("pods_ingress", *ip, chain_name.clone());
                 }
                 for ip in &pod.ipsv6 {
-                    self.sets
-                        .pods_ingress6
-                        .items
-                        .push((*ip, chain_name.clone()));
+                    self.vmap_entry("pods_ingress6", *ip, chain_name.clone());
                 }
 
                 let mut rules: Vec<Rule> = ingress
@@ -193,7 +160,7 @@ impl<'t> Builder<'t> {
                     })
                     .collect();
                 rules.push(action_rule(pod, ANN_REJECT, self.cfg.reject));
-                self.chain(chain_name).extend(rules);
+                self.add_chain(chain_name, rules, BTreeMap::new());
             }
 
             let egress: Vec<_> = (netpols.iter())
@@ -203,10 +170,10 @@ impl<'t> Builder<'t> {
             if !egress.is_empty() {
                 let chain_name = format!("egress_pod_{ns}_{name}");
                 for ip in &pod.ipsv4 {
-                    self.sets.pods_egress.items.push((*ip, chain_name.clone()));
+                    self.vmap_entry("pods_egress", *ip, chain_name.clone());
                 }
                 for ip in &pod.ipsv6 {
-                    self.sets.pods_egress6.items.push((*ip, chain_name.clone()));
+                    self.vmap_entry("pods_egress6", *ip, chain_name.clone());
                 }
 
                 let mut rules: Vec<Rule> = egress
@@ -216,7 +183,7 @@ impl<'t> Builder<'t> {
                     })
                     .collect();
                 rules.push(action_rule(pod, ANN_EGRESS_REJECT, self.cfg.egress_reject));
-                self.chain(chain_name).extend(rules);
+                self.add_chain(chain_name, rules, BTreeMap::new());
             }
         }
     }
@@ -240,94 +207,89 @@ impl<'t> Builder<'t> {
 
             if np.is_ingress() {
                 let chain = format!("ingress_netpol_{ns}_{name}");
-                let mut helper = Helper {
-                    state,
-                    sets: &mut self.sets,
-                    prefix: format!("np_{ns}_{name}_i"),
-                    idx: 0,
+                let (rules, anon_sets) = {
+                    let mut helper = Helper {
+                        state,
+                        named: &mut self.sets,
+                        next_id: &mut self.next_id,
+                        prefix: format!("np_{ns}_{name}_i"),
+                        idx: 0,
+                        anon: BTreeMap::new(),
+                    };
+                    let rules: Vec<Rule> = np
+                        .ingress()
+                        .iter()
+                        .flat_map(|rule| helper.rule(rule, Dir::Src))
+                        .collect();
+                    (rules, helper.anon)
                 };
-                let rules: Vec<Rule> = np
-                    .ingress()
-                    .iter()
-                    .flat_map(|rule| helper.rule(rule, Dir::Src))
-                    .collect();
-                self.chain(chain).extend(rules);
+                self.add_chain(chain, rules, anon_sets);
             }
 
             if np.is_egress() {
                 let chain = format!("egress_netpol_{ns}_{name}");
-                let mut helper = Helper {
-                    state,
-                    sets: &mut self.sets,
-                    prefix: format!("np_{ns}_{name}_e"),
-                    idx: 0,
+                let (rules, anon_sets) = {
+                    let mut helper = Helper {
+                        state,
+                        named: &mut self.sets,
+                        next_id: &mut self.next_id,
+                        prefix: format!("np_{ns}_{name}_e"),
+                        idx: 0,
+                        anon: BTreeMap::new(),
+                    };
+                    let rules: Vec<Rule> = np
+                        .egress()
+                        .iter()
+                        .flat_map(|rule| helper.rule(rule, Dir::Dst))
+                        .collect();
+                    (rules, helper.anon)
                 };
-                let rules: Vec<Rule> = np
-                    .egress()
-                    .iter()
-                    .flat_map(|rule| helper.rule(rule, Dir::Dst))
-                    .collect();
-                self.chain(chain).extend(rules);
+                self.add_chain(chain, rules, anon_sets);
             }
         }
     }
 
     fn base_chain(&mut self) {
-        let pods_ingress = &self.sets.pods_ingress;
-        let pods_ingress6 = &self.sets.pods_ingress6;
-        let pods_egress = &self.sets.pods_egress;
-        let pods_egress6 = &self.sets.pods_egress6;
+        let mut rules = Vec::new();
 
-        let mut chain = Chain::new(self.cfg.table.as_str(), "pods_filter");
-
-        let maps: [(Family, Dir, &PodMap<Ipv4Addr>); 2] = [
-            (Family::V4, Dir::Dst, pods_ingress),
-            (Family::V4, Dir::Src, pods_egress),
+        let maps: [(Family, Dir, &str); 2] = [
+            (Family::V4, Dir::Dst, "pods_ingress"),
+            (Family::V4, Dir::Src, "pods_egress"),
         ];
         for (family, dir, map) in maps {
-            if !map.is_empty() {
-                chain.extend(std::iter::once(rules::ip_vmap(family, dir, &map.name)));
+            if self.sets.contains_key(map) {
+                rules.push(rules::ip_vmap(family, dir, map));
             }
         }
-        let maps6: [(Family, Dir, &PodMap<Ipv6Addr>); 2] = [
-            (Family::V6, Dir::Dst, pods_ingress6),
-            (Family::V6, Dir::Src, pods_egress6),
+        let maps6: [(Family, Dir, &str); 2] = [
+            (Family::V6, Dir::Dst, "pods_ingress6"),
+            (Family::V6, Dir::Src, "pods_egress6"),
         ];
         for (family, dir, map) in maps6 {
-            if !map.is_empty() {
-                chain.extend(std::iter::once(rules::ip_vmap(family, dir, &map.name)));
+            if self.sets.contains_key(map) {
+                rules.push(rules::ip_vmap(family, dir, map));
             }
         }
 
-        self.chains.push(BuiltChain { chain, base: true });
+        self.chains.insert(
+            "pods_filter".into(),
+            ChainSync {
+                base: Some(BaseChain {
+                    hook: chain::InetHookNumber::Forward,
+                    priority: 0,
+                    policy: chain::ACCEPT,
+                }),
+                rules,
+                anon_sets: BTreeMap::new(),
+            },
+        );
     }
 
-    fn into_messages(self) -> Vec<Message> {
-        let Self { sets, chains, .. } = self;
-
-        let mut out = Vec::new();
-
-        // 1. table + sets/maps, all before any rule references them.
-        out.extend(table::recreate(&sets.table));
-        out.extend(sets.set_messages());
-
-        // 2. chains (base gets its hook), then their rules.
-        for c in &chains {
-            out.push(if c.base {
-                c.chain
-                    .create_base(chain::InetHookNumber::Forward, 0, chain::ACCEPT)
-            } else {
-                c.chain.create()
-            });
+    fn into_table(self) -> TableSync {
+        TableSync {
+            chains: self.chains,
+            sets: self.sets,
         }
-        for c in &chains {
-            out.extend(c.chain.fill());
-        }
-
-        // 3. vmap elements, now that the chains they `goto` exist.
-        out.extend(sets.vmap_fill_messages());
-
-        out
     }
 }
 
@@ -344,15 +306,66 @@ fn action_rule(pod: &Pod, annotation: &str, default: RejectAction) -> Rule {
     }
 }
 
-/// Builds the rules of one netpol rule, registering its named sets.
-struct Helper<'t> {
-    state: &'t State,
-    sets: &'t mut NamedSets,
+/// Builds the rules of one netpol rule, registering its named and anonymous
+/// sets.
+struct Helper<'a> {
+    state: &'a State,
+    /// Named peer sets, added to the table.
+    named: &'a mut BTreeMap<String, SetSync>,
+    /// Shared, table-wide counter for anonymous set names.
+    next_id: &'a mut u32,
     prefix: String,
     idx: u32,
+    /// Anonymous sets this chain's rules reference, by generated name.
+    anon: BTreeMap<String, SetSync>,
 }
 
 impl Helper<'_> {
+    fn next_id(&mut self) -> u32 {
+        *self.next_id += 1;
+        *self.next_id
+    }
+
+    /// Registers a fresh anonymous port set, returning its name.
+    ///
+    /// The kernel binds an anonymous set to a single rule, so one is created per
+    /// rule that constrains ports; nft prints it inline (`{ tcp . 80, … }`).
+    fn push_anon_ports(&mut self, ranges: Vec<RangeInclusive<(u8, u16)>>) -> String {
+        let name = format!("__set{}", self.next_id());
+        let mut set = SetSync::interval(ranges, None);
+        set.set_anonymous();
+        self.anon.insert(name.clone(), set);
+        name
+    }
+
+    /// Registers a fresh anonymous IPv4 interval set (an `ipBlock`'s `except`
+    /// list), returning its name. nft prints it inline (`!= { … }`).
+    fn push_anon_v4(&mut self, ranges: Vec<RangeInclusive<Ipv4Addr>>) -> String {
+        let name = format!("__set{}", self.next_id());
+        let mut set = SetSync::interval(ranges, None);
+        set.set_anonymous();
+        self.anon.insert(name.clone(), set);
+        name
+    }
+
+    /// Registers a fresh anonymous IPv6 interval set (an `ipBlock`'s `except`
+    /// list), returning its name.
+    fn push_anon_v6(&mut self, ranges: Vec<RangeInclusive<Ipv6Addr>>) -> String {
+        let name = format!("__set{}", self.next_id());
+        let mut set = SetSync::interval(ranges, None);
+        set.set_anonymous();
+        self.anon.insert(name.clone(), set);
+        name
+    }
+
+    fn push_simple_v4(&mut self, name: String, items: Vec<Ipv4Addr>) {
+        self.named.insert(name, SetSync::simple(items, None));
+    }
+
+    fn push_simple_v6(&mut self, name: String, items: Vec<Ipv6Addr>) {
+        self.named.insert(name, SetSync::simple(items, None));
+    }
+
     /// Builds the rules of one netpol rule: one rule per peer clause, all
     /// `accept`. Each generated rule gets its own anonymous port set (the
     /// kernel binds an anonymous set to a single rule).
@@ -397,7 +410,7 @@ impl Helper<'_> {
             }
         }
 
-        let name = self.sets.push_anon_ports(ranges);
+        let name = self.push_anon_ports(ranges);
         vec![rules::l4proto_dport_set(&name)]
     }
 
@@ -450,14 +463,12 @@ impl Helper<'_> {
 
         if !ipsv4.is_empty() {
             let name = format!("{}_{}_pods_v4", self.prefix, self.idx);
-            self.sets
-                .push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
+            self.push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
             clauses.push(rules::ip_set(Family::V4, dir, &name, false));
         }
         if !ipsv6.is_empty() {
             let name = format!("{}_{}_pods_v6", self.prefix, self.idx);
-            self.sets
-                .push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
+            self.push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
             clauses.push(rules::ip_set(Family::V6, dir, &name, false));
         }
 
@@ -491,225 +502,14 @@ impl Helper<'_> {
 
         let mut out = Vec::new();
         if !v4.is_empty() {
-            let name = self.sets.push_anon_v4(v4);
+            let name = self.push_anon_v4(v4);
             out.extend(rules::ip_set(Family::V4, dir, &name, true));
         }
         if !v6.is_empty() {
-            let name = self.sets.push_anon_v6(v6);
+            let name = self.push_anon_v6(v6);
             out.extend(rules::ip_set(Family::V6, dir, &name, true));
         }
         out
-    }
-}
-
-/// The named peer sets, anonymous port/except sets and verdict maps a netpol
-/// table references.
-struct NamedSets {
-    table: String,
-    next_id: u32,
-    anon_ports: Vec<NamedSet<RangeInclusive<(u8, u16)>>>,
-    anon_v4: Vec<NamedSet<RangeInclusive<Ipv4Addr>>>,
-    anon_v6: Vec<NamedSet<RangeInclusive<Ipv6Addr>>>,
-    simple_v4: Vec<NamedSet<Ipv4Addr>>,
-    simple_v6: Vec<NamedSet<Ipv6Addr>>,
-    pods_ingress: PodMap<Ipv4Addr>,
-    pods_ingress6: PodMap<Ipv6Addr>,
-    pods_egress: PodMap<Ipv4Addr>,
-    pods_egress6: PodMap<Ipv6Addr>,
-}
-
-/// Sorts inclusive ranges by their endpoints (`RangeInclusive` isn't `Ord`).
-fn sort_ranges<T: Ord>(ranges: &mut [RangeInclusive<T>]) {
-    ranges.sort_by(|a, b| a.start().cmp(b.start()).then_with(|| a.end().cmp(b.end())));
-}
-
-struct NamedSet<T> {
-    id: u32,
-    name: String,
-    items: Vec<T>,
-}
-
-struct PodMap<A> {
-    id: u32,
-    name: String,
-    items: Vec<(A, String)>,
-}
-
-impl<A> PodMap<A> {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}
-
-impl NamedSets {
-    fn new(table: &str) -> Self {
-        let mut sets = Self {
-            table: table.into(),
-            next_id: 0,
-            anon_ports: Vec::new(),
-            anon_v4: Vec::new(),
-            anon_v6: Vec::new(),
-            simple_v4: Vec::new(),
-            simple_v6: Vec::new(),
-            pods_ingress: PodMap {
-                id: 0,
-                name: "pods_ingress".into(),
-                items: Vec::new(),
-            },
-            pods_ingress6: PodMap {
-                id: 0,
-                name: "pods_ingress6".into(),
-                items: Vec::new(),
-            },
-            pods_egress: PodMap {
-                id: 0,
-                name: "pods_egress".into(),
-                items: Vec::new(),
-            },
-            pods_egress6: PodMap {
-                id: 0,
-                name: "pods_egress6".into(),
-                items: Vec::new(),
-            },
-        };
-        sets.pods_ingress.id = sets.next_id();
-        sets.pods_ingress6.id = sets.next_id();
-        sets.pods_egress.id = sets.next_id();
-        sets.pods_egress6.id = sets.next_id();
-        sets
-    }
-
-    fn next_id(&mut self) -> u32 {
-        self.next_id += 1;
-        self.next_id
-    }
-
-    /// Registers a fresh anonymous port set, returning its name.
-    ///
-    /// The kernel binds an anonymous set to a single rule, so one is created per
-    /// rule that constrains ports; nft prints it inline (`{ tcp . 80, … }`).
-    fn push_anon_ports(&mut self, mut items: Vec<RangeInclusive<(u8, u16)>>) -> String {
-        let id = self.next_id();
-        sort_ranges(&mut items);
-        let name = format!("__set{id}");
-        self.anon_ports.push(NamedSet {
-            id,
-            name: name.clone(),
-            items,
-        });
-        name
-    }
-    fn push_simple_v4(&mut self, name: String, mut items: Vec<Ipv4Addr>) {
-        let id = self.next_id();
-        items.sort();
-        items.dedup();
-        self.simple_v4.push(NamedSet { id, name, items });
-    }
-    fn push_simple_v6(&mut self, name: String, mut items: Vec<Ipv6Addr>) {
-        let id = self.next_id();
-        items.sort();
-        items.dedup();
-        self.simple_v6.push(NamedSet { id, name, items });
-    }
-
-    /// Registers a fresh anonymous IPv4 interval set (an `ipBlock`'s `except`
-    /// list), returning its name. nft prints it inline (`!= { … }`).
-    fn push_anon_v4(&mut self, mut items: Vec<RangeInclusive<Ipv4Addr>>) -> String {
-        let id = self.next_id();
-        sort_ranges(&mut items);
-        let name = format!("__set{id}");
-        self.anon_v4.push(NamedSet {
-            id,
-            name: name.clone(),
-            items,
-        });
-        name
-    }
-
-    /// Registers a fresh anonymous IPv6 interval set (an `ipBlock`'s `except`
-    /// list), returning its name.
-    fn push_anon_v6(&mut self, mut items: Vec<RangeInclusive<Ipv6Addr>>) -> String {
-        let id = self.next_id();
-        sort_ranges(&mut items);
-        let name = format!("__set{id}");
-        self.anon_v6.push(NamedSet {
-            id,
-            name: name.clone(),
-            items,
-        });
-        name
-    }
-
-    /// Create + fill every named peer/port set, and create the pod maps.
-    fn set_messages(&self) -> Vec<Message> {
-        let mut out = Vec::new();
-
-        for s in &self.anon_ports {
-            let set = set::Set::<RangeInclusive<(u8, u16)>>::new(&self.table, &s.name, s.id);
-            out.push(set.create_anonymous());
-            out.extend(set.fill(s.items.iter().cloned()));
-        }
-        for s in &self.anon_v4 {
-            let set = set::Set::<RangeInclusive<Ipv4Addr>>::new(&self.table, &s.name, s.id);
-            out.push(set.create_anonymous());
-            out.extend(set.fill(s.items.iter().cloned()));
-        }
-        for s in &self.anon_v6 {
-            let set = set::Set::<RangeInclusive<Ipv6Addr>>::new(&self.table, &s.name, s.id);
-            out.push(set.create_anonymous());
-            out.extend(set.fill(s.items.iter().cloned()));
-        }
-        for s in &self.simple_v4 {
-            let set = set::Set::<Ipv4Addr>::new(&self.table, &s.name, s.id);
-            out.push(set.create(None));
-            out.extend(set.fill(s.items.iter().copied()));
-        }
-        for s in &self.simple_v6 {
-            let set = set::Set::<Ipv6Addr>::new(&self.table, &s.name, s.id);
-            out.push(set.create(None));
-            out.extend(set.fill(s.items.iter().copied()));
-        }
-        for map in [&self.pods_ingress, &self.pods_egress] {
-            if !map.is_empty() {
-                out.push(map.create_message(&self.table));
-            }
-        }
-        for map in [&self.pods_ingress6, &self.pods_egress6] {
-            if !map.is_empty() {
-                out.push(map.create_message(&self.table));
-            }
-        }
-
-        out
-    }
-
-    /// Fill the pod verdict maps (requires the target chains to exist).
-    fn vmap_fill_messages(&self) -> Vec<Message> {
-        let mut out = Vec::new();
-        out.extend(self.pods_ingress.fill_messages(&self.table));
-        out.extend(self.pods_ingress6.fill_messages(&self.table));
-        out.extend(self.pods_egress.fill_messages(&self.table));
-        out.extend(self.pods_egress6.fill_messages(&self.table));
-        out
-    }
-}
-
-impl<A: set::Data + Copy> PodMap<A> {
-    fn create_message(&self, table: &str) -> Message {
-        set::Set::<VerdictElem<A>>::new(table, &self.name, self.id).create(None)
-    }
-
-    fn fill_messages(&self, table: &str) -> Vec<Message> {
-        if self.items.is_empty() {
-            return Vec::new();
-        }
-        set::Set::<VerdictElem<A>>::new(table, &self.name, self.id)
-            .fill(
-                self.items
-                    .iter()
-                    .map(|(ip, chain)| VerdictElem(*ip, Verdict::Goto(chain.clone()))),
-            )
-            .collect()
     }
 }
 
@@ -739,7 +539,8 @@ mod tests {
     use super::*;
     use crate::{
         kube_watch::{Change, Event},
-        nftables::test_harness,
+        netlink::netfilter::{self, NetlinkExt as _},
+        nftables::{Message, table_sync::sync, test_harness},
     };
     use netlink_packet_core::NetlinkPayload;
     use netlink_packet_netfilter::{
@@ -807,6 +608,11 @@ mod tests {
             table: "t".into(),
             ..Default::default()
         }
+    }
+
+    /// The full-render messages for `state` (a first-apply sync).
+    fn messages(state: &State, cfg: &Config, node: &str) -> Vec<Message> {
+        sync(&cfg.table, None, &render(state, cfg, node))
     }
 
     /// The chain names among `msgs`, in creation order.
@@ -945,9 +751,9 @@ mod tests {
     #[test]
     fn renders_chains_base_and_vmap() {
         let state = basic_state(serde_json::json!([{ "from": [] }]));
-        let r = render(&state, &default_cfg(), "n1");
+        let r = messages(&state, &default_cfg(), "n1");
 
-        let names = chain_names(&r.messages);
+        let names = chain_names(&r);
         assert!(
             names.contains(&"pods_filter".to_string()),
             "base chain missing: {names:?}"
@@ -960,10 +766,10 @@ mod tests {
             names.contains(&"ingress_netpol_default_np".to_string()),
             "netpol chain missing: {names:?}"
         );
-        assert!(has_base_chain(&r.messages), "no base chain hook");
+        assert!(has_base_chain(&r), "no base chain hook");
 
         // the pod map is filled with a goto to the pod chain
-        let dump = format!("{:?}", r.messages);
+        let dump = format!("{:?}", r);
         assert!(
             dump.contains("goto") || dump.contains("Goto"),
             "vmap goto missing"
@@ -975,15 +781,22 @@ mod tests {
         let state = basic_state(serde_json::json!([{
             "from": [{ "ipBlock": { "cidr": "192.168.42.0/24", "except": ["192.168.42.5/32"] } }],
         }]));
-        let r = render(&state, &default_cfg(), "n1");
+        let r = messages(&state, &default_cfg(), "n1");
 
-        // an anonymous set holds the excluded range; the pod vmap is the other
-        let names = set_names(&r.messages);
-        assert!(
-            names.contains(&"__set5".to_string()),
-            "except set missing: {names:?}"
-        );
-        let set = find_set(&r.messages, "__set5").expect("except set");
+        // the rule matches the cidr inline (byte-aligned /24 => payload+eq) and
+        // excludes an anonymous interval set (inverted lookup)
+        let (_, rule) = rules(&r)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        let found = lookups(&rule);
+        assert_eq!(found.len(), 1);
+        let (name, inverted) = &found[0];
+        assert!(*inverted, "except set lookup must be inverted");
+
+        let names = set_names(&r);
+        assert!(names.contains(name), "except set missing: {names:?}");
+        let set = find_set(&r, name).expect("except set");
         let flags = set.attributes.iter().find_map(|a| match a {
             netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
             _ => None,
@@ -992,13 +805,6 @@ mod tests {
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
 
-        // the rule matches the cidr inline (byte-aligned /24 => payload+eq) and
-        // excludes the anonymous set (inverted lookup)
-        let (_, rule) = rules(&r.messages)
-            .into_iter()
-            .find(|(c, _)| c == "ingress_netpol_default_np")
-            .expect("netpol rule");
-        assert_eq!(lookups(&rule), vec![("__set5".to_string(), true)]);
         assert!(rule_has_prefix_eq(&rule, &[192, 168, 42]));
     }
 
@@ -1008,9 +814,16 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP", "port": 80 }, { "protocol": "UDP", "port": 53 } ],
         }]));
-        let r = render(&state, &default_cfg(), "n1");
+        let r = messages(&state, &default_cfg(), "n1");
 
-        let set = find_set(&r.messages, "__set5").expect("port set");
+        // dport 53/80 are stored as (proto, port) elements in the set the rule
+        // looks up
+        let (_, rule) = rules(&r)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        let (name, _) = lookups(&rule).into_iter().next().expect("lookup");
+        let set = find_set(&r, &name).expect("port set");
         let flags = set.attributes.iter().find_map(|a| match a {
             netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
             _ => None,
@@ -1019,13 +832,6 @@ mod tests {
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Concat));
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
-
-        // dport 53/80 are stored as (proto, port) elements
-        let (_, rule) = rules(&r.messages)
-            .into_iter()
-            .find(|(c, _)| c == "ingress_netpol_default_np")
-            .expect("netpol rule");
-        assert_eq!(lookups(&rule)[0].0, "__set5");
     }
 
     #[test]
@@ -1035,9 +841,15 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP" } ],
         }]));
-        let r = render(&state, &default_cfg(), "n1");
+        let r = messages(&state, &default_cfg(), "n1");
 
-        let set = find_set(&r.messages, "__set5").expect("port set");
+        // the rule looks the protocol . service set up
+        let (_, rule) = rules(&r)
+            .into_iter()
+            .find(|(c, _)| c == "ingress_netpol_default_np")
+            .expect("netpol rule");
+        let (name, _) = lookups(&rule).into_iter().next().expect("lookup");
+        let set = find_set(&r, &name).expect("port set");
         let flags = set.attributes.iter().find_map(|a| match a {
             netlink_packet_netfilter::nftables::SetAttribute::Flags(f) => Some(*f),
             _ => None,
@@ -1045,13 +857,6 @@ mod tests {
         let flags = flags.expect("flags");
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Interval));
         assert!(flags.contains(netlink_packet_netfilter::nftables::SetFlags::Anonymous));
-
-        // the rule looks the protocol . service set up
-        let (_, rule) = rules(&r.messages)
-            .into_iter()
-            .find(|(c, _)| c == "ingress_netpol_default_np")
-            .expect("netpol rule");
-        assert_eq!(lookups(&rule)[0].0, "__set5");
     }
 
     #[test]
@@ -1061,17 +866,19 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP" }, { "protocol": "UDP", "port": 53 } ],
         }]));
-        let r = render(&state, &default_cfg(), "n1");
+        let r = messages(&state, &default_cfg(), "n1");
 
-        find_set(&r.messages, "__set5").expect("port set");
-
-        let netpol_rules: Vec<_> = rules(&r.messages)
+        let netpol_rules: Vec<_> = rules(&r)
             .into_iter()
             .filter(|(c, _)| c == "ingress_netpol_default_np")
             .collect();
         // both alternatives share the one set
         assert_eq!(netpol_rules.len(), 1, "expected one rule");
-        assert_eq!(lookups(&netpol_rules[0].1)[0].0, "__set5");
+        let (name, _) = lookups(&netpol_rules[0].1)
+            .into_iter()
+            .next()
+            .expect("lookup");
+        find_set(&r, &name).expect("port set");
     }
 
     #[test]
@@ -1098,17 +905,18 @@ mod tests {
     }
 
     #[test]
-    fn hash_tracks_content() {
-        let a = render(&state_with(&[], &[]), &default_cfg(), "n1");
-        let b = render(&state_with(&[], &[]), &default_cfg(), "n1");
-        assert_eq!(a.hash(), b.hash());
+    fn reference_tracks_content() {
+        let a = render(&state_with(&[], &[]), &default_cfg(), "n1").reference("t");
+        let b = render(&state_with(&[], &[]), &default_cfg(), "n1").reference("t");
+        assert_eq!(a, b);
 
         let c = render(
             &basic_state(serde_json::json!([{ "from": [] }])),
             &default_cfg(),
             "n1",
-        );
-        assert_ne!(a.hash(), c.hash());
+        )
+        .reference("t");
+        assert_ne!(a, c);
     }
 
     /// A netpol [`System`](test_harness::System) for the golden
@@ -1134,7 +942,7 @@ mod tests {
         }
 
         fn render(&mut self) -> Vec<Message> {
-            render(&self.state, &self.cfg, "n1").messages
+            messages(&self.state, &self.cfg, "n1")
         }
     }
 
@@ -1151,6 +959,50 @@ mod tests {
             "knls-test-netpol-",
         )
         .await;
+    }
+
+    /// Prints, for each `test_assets/golden-nftables/netpol/*.yaml` scenario, the
+    /// kernel body its ingest events produce. Used to (re)generate the goldens.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored --nocapture`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
+    #[tokio::test]
+    async fn print_goldens() {
+        let dir = "test_assets/golden-nftables/netpol";
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .expect("golden dir")
+            .map(|e| e.expect("golden dir entry").path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("golden file stem");
+            let table = format!("knls-test-netpol-regen-{stem}");
+            let cfg = Config {
+                table: table.clone(),
+                ..Default::default()
+            };
+
+            let yaml = std::fs::read_to_string(&path).expect("golden file read");
+            let ops: Vec<test_harness::Op> =
+                serde_yaml::from_str(&yaml).expect("bad scenario yaml");
+
+            let mut state = State::new();
+            for op in ops {
+                if let test_harness::Op::Ingest(events) = op {
+                    for event in events {
+                        state.ingest(&event);
+                    }
+                }
+            }
+
+            let body = test_harness::capture(&table, messages(&state, &cfg, "n1")).await;
+            println!("=== {stem} ===\n{body}\n");
+        }
     }
 
     /// Applies a rendered table to the real kernel and checks the dump.
@@ -1182,10 +1034,10 @@ mod tests {
             table: table.into(),
             ..Default::default()
         };
-        let rendered = render(&state, &cfg, "n1");
+        let messages = sync(&cfg.table, None, &render(&state, &cfg, "n1"));
 
         let nl = netfilter::new_link().expect("netlink");
-        nl.send_as_transactions(rendered.messages.into_iter())
+        nl.send_as_transactions(messages.into_iter())
             .await
             .expect("apply");
 
