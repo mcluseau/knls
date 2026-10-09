@@ -184,6 +184,27 @@ pub fn lookup_set_inv(reg: Register, set: impl Into<String>) -> Expr {
     .into()
 }
 
+/// `reg in anon#index`: a lookup in an *anonymous* set, referenced by its
+/// position in the chain's anonymous sets.
+///
+/// The reference is emitted as `NFTA_LOOKUP_SET_ID`; [`sync`] replaces it with
+/// the anonymous set's generated name before the rule reaches the kernel.
+///
+/// [`sync`]: super::table_sync::sync
+pub fn lookup_anon(reg: Register, index: u32) -> Expr {
+    Expressions::Lookup(vec![Lookup::SourceRegister(reg), Lookup::SetId(index)]).into()
+}
+
+/// `reg != anon#index`, i.e. an inverted anonymous-set lookup.
+pub fn lookup_anon_inv(reg: Register, index: u32) -> Expr {
+    Expressions::Lookup(vec![
+        Lookup::SourceRegister(reg),
+        Lookup::SetId(index),
+        Lookup::Flags(1), // NFT_LOOKUP_F_INV
+    ])
+    .into()
+}
+
 /// `reg in @set`, storing the looked-up value into `dreg` (a map).
 pub fn lookup_map(reg: Register, dreg: Register, map: impl Into<String>) -> Expr {
     Expressions::Lookup(vec![
@@ -286,6 +307,27 @@ pub fn ip_set(family: Family, dir: Dir, set: &str, invert: bool) -> Vec<Expr> {
     exprs
 }
 
+/// `ip saddr @anon#index` / `ip6 daddr @anon#index`, cf. [`ip_set`] with an
+/// anonymous set reference. `invert` produces `!=`.
+pub fn ip_set_anon(family: Family, dir: Dir, index: u32, invert: bool) -> Vec<Expr> {
+    let mut exprs = vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        payload(
+            Register::Reg1,
+            NETWORK_HEADER,
+            family.offset(dir),
+            family.len(),
+        ),
+    ];
+    exprs.push(if invert {
+        lookup_anon_inv(Register::Reg1, index)
+    } else {
+        lookup_anon(Register::Reg1, index)
+    });
+    exprs
+}
+
 /// `ip saddr 1.2.3.0/24` / `ip6 daddr 2001:db8::/32` (with the `meta nfproto`
 /// guard nft emits in an `inet` table). `invert` produces `!=`.
 ///
@@ -377,6 +419,16 @@ pub fn l4proto_dport_set(set: &str) -> Vec<Expr> {
         meta(MetaKey::L4Proto, Register::Reg1),
         payload(Register::Reg32_01, TRANSPORT_HEADER, 2, 2),
         lookup_set(Register::Reg1, set),
+    ]
+}
+
+/// `meta l4proto . th dport @anon#index`, cf. [`l4proto_dport_set`] with an
+/// anonymous set reference.
+pub fn l4proto_dport_anon(index: u32) -> Vec<Expr> {
+    vec![
+        meta(MetaKey::L4Proto, Register::Reg1),
+        payload(Register::Reg32_01, TRANSPORT_HEADER, 2, 2),
+        lookup_anon(Register::Reg1, index),
     ]
 }
 
@@ -585,6 +637,42 @@ mod tests {
             vec![
                 Lookup::SourceRegister(Register::Reg1),
                 Lookup::Set("s".into()),
+                Lookup::Flags(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn anon_lookups_use_set_id_placeholders() {
+        // an anonymous reference carries only its index (`NFTA_LOOKUP_SET_ID`);
+        // `sync` lowers it to a name.
+        assert_eq!(
+            lookup_attrs(&lookup_anon(Register::Reg1, 3)),
+            vec![Lookup::SourceRegister(Register::Reg1), Lookup::SetId(3),]
+        );
+        assert_eq!(
+            lookup_attrs(&lookup_anon_inv(Register::Reg1, 3)),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::SetId(3),
+                Lookup::Flags(1),
+            ]
+        );
+
+        // the concat and ip variants use the same placeholder in their lookup
+        assert_eq!(
+            lookup_attrs(l4proto_dport_anon(7).last().expect("lookup")),
+            vec![Lookup::SourceRegister(Register::Reg1), Lookup::SetId(7),]
+        );
+        assert_eq!(
+            lookup_attrs(
+                ip_set_anon(Family::V4, Dir::Src, 9, true)
+                    .last()
+                    .expect("lookup")
+            ),
+            vec![
+                Lookup::SourceRegister(Register::Reg1),
+                Lookup::SetId(9),
                 Lookup::Flags(1),
             ]
         );

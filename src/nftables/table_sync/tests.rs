@@ -173,7 +173,7 @@ fn table_with_chain(rules: Vec<Rule>) -> TableSync {
         ChainSync {
             base: None,
             rules,
-            anon_sets: BTreeMap::new(),
+            anon_sets: Vec::new(),
         },
     );
     t
@@ -186,7 +186,7 @@ fn table_all() -> TableSync {
         ChainSync {
             base: None,
             rules: vec![rule("other")],
-            anon_sets: BTreeMap::new(),
+            anon_sets: Vec::new(),
         },
     );
     t
@@ -379,7 +379,7 @@ fn verdict_map_goto_new_chain_orders_chain_before_map_fill() {
         ChainSync {
             base: None,
             rules: vec![vec![rules::accept()]],
-            anon_sets: BTreeMap::new(),
+            anon_sets: Vec::new(),
         },
     );
     new.sets.insert(
@@ -435,22 +435,14 @@ fn removed_set_and_chain_are_deleted_last() {
 #[test]
 fn reference_hash_detects_anonymous_set_content_change() {
     // a chain whose rule references an anon set; the rule itself is unchanged.
-    let mut set1 = BTreeMap::new();
-    set1.insert(
-        "a".into(),
-        SetSync::interval(
-            [(Ipv4Addr::new(10, 0, 0, 1)..=Ipv4Addr::new(10, 0, 0, 1))],
-            None,
-        ),
-    );
-    let mut set2 = set1.clone();
-    set2.insert(
-        "a".into(),
-        SetSync::interval(
-            [(Ipv4Addr::new(10, 0, 0, 1)..=Ipv4Addr::new(10, 0, 0, 2))],
-            None,
-        ),
-    );
+    let set1 = vec![SetSync::interval(
+        [(Ipv4Addr::new(10, 0, 0, 1)..=Ipv4Addr::new(10, 0, 0, 1))],
+        None,
+    )];
+    let set2 = vec![SetSync::interval(
+        [(Ipv4Addr::new(10, 0, 0, 1)..=Ipv4Addr::new(10, 0, 0, 2))],
+        None,
+    )];
 
     let old = ChainSync {
         base: None,
@@ -494,13 +486,11 @@ fn scenario_states() -> Vec<TableSync> {
     let pod_b = || {
         let mut c = ChainSync::default();
         let mut anon = SetSync::interval([(6u8, 80u16)..=(6u8, 80u16)], None);
-        if let SetSync::Interval(s) = &mut anon {
-            s.meta.flags |= netlink_packet_netfilter::nftables::SetFlags::Anonymous;
-        }
-        let mut r = rules::l4proto_dport_set("__set1");
+        anon.set_anonymous();
+        let mut r = rules::l4proto_dport_anon(0);
         r.push(rules::accept());
         c.rules.push(r);
-        c.anon_sets.insert("__set1".into(), anon);
+        c.anon_sets.push(anon);
         c
     };
     let filter = |priority: i32, with_drop: bool| {
@@ -664,7 +654,7 @@ fn new_verdict_map_and_chain_are_created_before_the_referencing_rule() {
                 policy: chain::ACCEPT,
             }),
             rules: vec![rules::ip_vmap(Family::V4, Dir::Dst, "vm")],
-            anon_sets: BTreeMap::new(),
+            anon_sets: Vec::new(),
         },
     );
     new.chains.insert(
@@ -672,7 +662,7 @@ fn new_verdict_map_and_chain_are_created_before_the_referencing_rule() {
         ChainSync {
             base: None,
             rules: vec![vec![rules::accept()]],
-            anon_sets: BTreeMap::new(),
+            anon_sets: Vec::new(),
         },
     );
     new.sets.insert(
@@ -733,4 +723,73 @@ fn scenario_yaml_parses() {
         vec!["delete table inet {table}\n"],
         "the out-of-band script must have its block indentation stripped"
     );
+}
+
+/// The `Lookup::Set` name of the first `NewRule` in `msgs`, if any.
+fn rule_lookup(msgs: &[Message]) -> Option<String> {
+    use netlink_packet_netfilter::nftables::{
+        ExpressionAttribute, Expressions, ListAttribute, Lookup, RuleAttribute,
+    };
+
+    for msg in msgs {
+        let NetlinkPayload::InnerMessage(NetfilterMessage {
+            inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewRule(m)),
+            ..
+        }) = &msg.payload
+        else {
+            continue;
+        };
+        for attr in &m.attributes {
+            let RuleAttribute::Expressions(exprs) = attr else {
+                continue;
+            };
+            for expr in exprs {
+                let ListAttribute::Element(attrs) = expr else {
+                    continue;
+                };
+                for attr in attrs {
+                    let ExpressionAttribute::Data(Expressions::Lookup(lookups)) = attr else {
+                        continue;
+                    };
+                    for lookup in lookups {
+                        if let Lookup::Set(name) = lookup {
+                            return Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn sync_generates_and_resolves_anonymous_set_names() {
+    let mut anon = SetSync::interval([(6u8, 80u16)..=(6u8, 80u16)], None);
+    anon.set_anonymous();
+    let mut table = TableSync::default();
+    table.chains.insert(
+        "c".into(),
+        ChainSync {
+            base: None,
+            rules: vec![rules::l4proto_dport_anon(0)],
+            anon_sets: vec![anon],
+        },
+    );
+
+    let msgs = sync("t", None, &table);
+    let s = steps(&msgs);
+
+    // the anonymous set is created with a sync-generated name, before the rule
+    // that references it, and the rule names that same set.
+    let create = s
+        .iter()
+        .position(|x| *x == Step::NewSet("__set1".into()))
+        .expect("anonymous set created");
+    let rule = s
+        .iter()
+        .position(|x| *x == Step::NewRule("c".into()))
+        .expect("rule added");
+    assert!(create < rule, "anonymous set before its rule: {s:?}");
+    assert_eq!(rule_lookup(&msgs).as_deref(), Some("__set1"));
 }
