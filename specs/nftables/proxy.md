@@ -1,6 +1,33 @@
 # Proxy on TableSync: pure-netlink kube-proxy
 
-Status: draft.
+Status: implemented. `proxy` renders a `TableSync` (`render`), applies it through
+`TableState`, and no longer invokes `nft`; the `doc-*`/feature goldens pass over
+the netlink path (see "Implementation notes"). The old script renderer and
+`TableTracker` are deleted.
+
+## Implementation notes
+
+Encodings that had to be reverse-engineered from a kernel dump (nft's own
+netlink, captured with a throwaway dumper) and are now pinned by the goldens:
+
+- Untyped expressions the crate does not model (`fib`, `numgen`, `ct`, `nat`,
+  `redir`, `masq`, `dynset`, the family `reject`) are emitted as
+  `Expressions::Other` with the exact nft attributes (`rules.rs`).
+- `meta mark` constants and a `fib` result compare are **host-endian**; the
+  `numgen` result keying the endpoint map is host-endian too. Addresses/ports
+  are big-endian. Mixing these up is invisible until the kernel dump.
+- The per-service endpoint map is `typeof numgen random mod 1 : verdict`, with
+  decimal elements. nft has no *named* plain-integer datatype — `integer` is
+  unnameable (renders as `type 0`), `mark` renders hex, and `gid`/`uid`/`realm`/
+  `classid`/`nf_proto`/… reject a `numgen` key (datatype mismatch) — so the
+  `typeof` annotation is the only way to get a decimal integer key, carried in
+  `NFTA_SET_USERDATA`. `nftables/userdata.rs` *builds* that TLV tree from
+  `#[repr]` enums mirroring the nft/libnftnl ones (`SetUdata`, `TypeofUdata`,
+  `NumgenUdata`, `ExprType`, `NgType`, `ByteOrder`) rather than hardcoding
+  bytes; a unit test pins it against the captured dump.
+- An affinity set referenced by an `update` rule must be created with
+  `NFT_SET_EVAL` (`dynamic`); nft normally adds it while parsing the script.
+  It is only added when the map's family has at least one endpoint.
 
 ## Problem
 
@@ -278,13 +305,24 @@ Switch `watch()` to `TableState`; delete `TableTracker`, `TableUpdater`,
 
 ## Risks / notes
 
-- **Same-name chain/map** (above) is the first thing a golden must confirm, and
-  may force a small correction in `sync`'s structural/deletion logic.
-- **Kernel-mutated set flags**: adding an `update @set` rule can leave the
-  affinity set with `dynamic` in `nft list` even if only `timeout` was declared.
-  `TableState.current` tracks the *rendered* target, so this does not thrash;
-  the golden pins the actual flags so the renderer declares them up front.
-- **`numgen` key bytes**: the dispatch map's raw key encoding is only known once
-  dumped; the golden decides it, not a guess.
+- **Same-name chain/map**: confirmed against the kernel; `TableSync` keys chains
+  and sets/maps separately, so nothing in `sync` needed changing.
+- **Kernel-mutated set flags**: handled by declaring `NFT_SET_EVAL` up front
+  (see the implementation notes). `TableState.current` still tracks the rendered
+  target, so even a surprise does not thrash.
+- **`numgen` key bytes**: confirmed host-endian, emitted from raw bytes.
 - **Message sequence differs** from the script path (no inline map
   redefinition, `sync`'s ordering); only the resulting table body is compared.
+- **v6 cluster/external IPs** are still skipped when filling the v4-only
+  `service_ips` map (as the script effectively required); the goldens are v4.
+
+## Outcome
+
+- `watch` owns a `TableState`; `render(my_node, cfg) -> TableSync` is the only
+  renderer. `TableTracker`/`TableUpdater`/`CtrKind`/`DnatWriter`, the `nft`
+  spawn and the `nft_proto`/`hash` helpers are gone.
+- Foundation added to shared code: `ChainType` on `BaseChain`, the
+  `rules.rs` expression builders, `SetMeta::with_timeout`,
+  `SetSync::{simple_with_meta, verdict_map_with_meta, verdict_map_raw}`.
+- All 13 proxy goldens pass over netlink, alongside the netpol and table_sync
+  goldens (8 `#[ignore]` tests total).

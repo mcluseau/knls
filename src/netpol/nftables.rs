@@ -271,6 +271,7 @@ impl<'t> Builder<'t> {
             "pods_filter".into(),
             ChainSync {
                 base: Some(BaseChain {
+                    chain_type: chain::ChainType::Filter,
                     hook: chain::InetHookNumber::Forward,
                     priority: 0,
                     policy: chain::ACCEPT,

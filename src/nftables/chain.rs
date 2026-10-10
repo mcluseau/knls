@@ -20,6 +20,24 @@ use super::{Message, nft_header};
 /// filtering).
 pub const ACCEPT: u32 = 1;
 
+/// A base chain's type (`NFTA_CHAIN_TYPE`): `filter` matches ordinary
+/// filtering, `nat` is required for a chain with `dnat`/`masquerade`/`redirect`
+/// statements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainType {
+    Filter,
+    Nat,
+}
+
+impl ChainType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Filter => "filter",
+            Self::Nat => "nat",
+        }
+    }
+}
+
 /// The expressions of a single rule.
 pub type Rule = Vec<ListAttribute<ExpressionAttribute>>;
 
@@ -109,13 +127,25 @@ impl<'t> Chain<'t> {
         self.create_chain(None)
     }
 
-    /// The message adding a base chain, hooked into `hook` at `priority` with
-    /// `policy` (`NF_ACCEPT`/`NF_DROP`).
+    /// The message adding a `filter` base chain, hooked into `hook` at
+    /// `priority` with `policy` (`NF_ACCEPT`/`NF_DROP`).
     pub fn create_base(&self, hook: InetHookNumber, priority: i32, policy: u32) -> Message {
-        self.create_chain(Some((hook, priority, policy)))
+        self.create_base_with(ChainType::Filter, hook, priority, policy)
     }
 
-    fn create_chain(&self, base: Option<(InetHookNumber, i32, u32)>) -> Message {
+    /// The message adding a base chain of `chain_type`, hooked into `hook` at
+    /// `priority` with `policy` (`NF_ACCEPT`/`NF_DROP`).
+    pub fn create_base_with(
+        &self,
+        chain_type: ChainType,
+        hook: InetHookNumber,
+        priority: i32,
+        policy: u32,
+    ) -> Message {
+        self.create_chain(Some((chain_type, hook, priority, policy)))
+    }
+
+    fn create_chain(&self, base: Option<(ChainType, InetHookNumber, i32, u32)>) -> Message {
         let mut header = NetlinkHeader::default();
         header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 
@@ -126,8 +156,8 @@ impl<'t> Chain<'t> {
 
         // A hook makes the kernel create a base chain (it sets NFT_CHAIN_BASE
         // itself); it needs a type and policy too, as nft emits them.
-        if let Some((hook, priority, policy)) = base {
-            attributes.push(ChainAttribute::Type("filter".into()));
+        if let Some((chain_type, hook, priority, policy)) = base {
+            attributes.push(ChainAttribute::Type(chain_type.as_str().into()));
             attributes.push(ChainAttribute::Hook(vec![
                 Hook::Number(hook.into()),
                 Hook::Priority(priority as u32),

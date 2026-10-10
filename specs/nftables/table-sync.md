@@ -48,10 +48,12 @@ handle the "no previous state" (first apply) case.
 
 ## Representation
 
-`TableSync` is the target state of one table. Names are unique within the table.
-The table's own name is **not** part of `TableSync`; it is passed to `sync` (and
-to the manager), so the same structure can be rendered against whatever table
-the caller targets.
+`TableSync` is the target state of one table. Chains and sets/maps have separate
+name spaces: a chain `X` and a set/map `X` may coexist (the proxy's per-service
+dispatch uses exactly that — a map and a chain sharing a name). The table's own
+name is **not** part of `TableSync`; it is passed to `sync` (and to the
+manager), so the same structure can be rendered against whatever table the
+caller targets.
 
 ```rust
 /// A whole `inet` table's desired state (contents only; the table name is
@@ -114,11 +116,16 @@ struct ChainSync {
 }
 
 struct BaseChain {
+    chain_type: ChainType, // Filter / Nat
     hook: InetHookNumber,
     priority: i32,
     policy: u32, // NF_ACCEPT / NF_DROP
 }
 ```
+
+`chain_type` is the `NFTA_CHAIN_TYPE` (`filter`/`nat`); the proxy's `nat`
+hooks (`prerouting`/`output`/`postrouting`) need it. A change to any field is
+structural.
 
 `Rule` is `chain::Rule` (`Vec<ListAttribute<ExpressionAttribute>>`), the same
 type `Chain::push` takes. Rules are compared **by their serialized netlink

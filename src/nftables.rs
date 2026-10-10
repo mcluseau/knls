@@ -3,6 +3,7 @@ pub mod rules;
 pub mod set;
 pub mod table;
 pub mod table_sync;
+pub mod userdata;
 
 use eyre::Result;
 use log::debug;

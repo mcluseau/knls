@@ -358,6 +358,7 @@ fn base_chain_change_is_a_full_recreate() {
     let old = table_with_chain(vec![rule("a")]);
     let mut new = table_with_chain(vec![rule("a")]);
     new.chains.get_mut("c").expect("c").base = Some(BaseChain {
+        chain_type: chain::ChainType::Filter,
         hook: chain::InetHookNumber::Forward,
         priority: 0,
         policy: chain::ACCEPT,
@@ -496,6 +497,7 @@ fn scenario_states() -> Vec<TableSync> {
     let filter = |priority: i32, with_drop: bool| {
         let mut c = ChainSync {
             base: Some(BaseChain {
+                chain_type: chain::ChainType::Filter,
                 hook: chain::InetHookNumber::Forward,
                 priority,
                 policy: chain::ACCEPT,
@@ -636,6 +638,7 @@ fn new_verdict_map_and_chain_are_created_before_the_referencing_rule() {
         "filter".into(),
         ChainSync {
             base: Some(BaseChain {
+                chain_type: chain::ChainType::Filter,
                 hook: chain::InetHookNumber::Forward,
                 priority: 0,
                 policy: chain::ACCEPT,
@@ -649,6 +652,7 @@ fn new_verdict_map_and_chain_are_created_before_the_referencing_rule() {
         "filter".into(),
         ChainSync {
             base: Some(BaseChain {
+                chain_type: chain::ChainType::Filter,
                 hook: chain::InetHookNumber::Forward,
                 priority: 0,
                 policy: chain::ACCEPT,

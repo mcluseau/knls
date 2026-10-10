@@ -1,10 +1,20 @@
-use eyre::{Result, format_err};
-use log::{debug, error, info};
-use std::collections::BTreeMap as Map;
-use std::io::{self, Write};
-use std::net::IpAddr;
-use std::process::Stdio;
+use cidr::IpCidr;
+use eyre::Result;
+use log::{debug, error};
+use netlink_packet_netfilter::nftables::{Register, SetAttribute, SetFlags};
+use std::collections::{BTreeMap as Map, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
+
+use crate::nftables::{
+    chain::{self, ChainType, InetHookNumber, Rule},
+    rules,
+    rules::{Dir, Dnat, Family, Verdict as RuleVerdict},
+    set::Verdict,
+    table_sync::{BaseChain, ChainSync, SetMeta, SetSync, TableState, TableSync},
+    userdata,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -20,13 +30,10 @@ fn default_table() -> String {
 }
 
 use super::conntrack;
+use crate::kube_watch::{EventReceiver, ingest_events};
 use crate::state::{
     LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, State, keys,
     proxy,
-};
-use crate::{
-    change,
-    kube_watch::{EventReceiver, ingest_events},
 };
 
 const MASQ_MARK: u32 = 1 << 14;
@@ -37,7 +44,7 @@ const NEED_MASQ_V4: &str = "need_masquerade";
 const NEED_MASQ_V6: &str = "need_masquerade6";
 
 pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
-    let mut table = TableTracker::new(format!("inet {}", cfg.table));
+    let mut table = TableState::new(cfg.table.clone());
     let mut state = State::new(ctx.node_name.clone());
 
     let mut ct_state = conntrack::State::new().await?;
@@ -63,22 +70,13 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         let Some(my_node) = state.my_node.get() else {
             continue;
         };
-        let Some(cfg) = proxy::from_state(&state, cfg.disable_nodeports) else {
+        let Some(svc) = proxy::from_state(&state, cfg.disable_nodeports) else {
             continue;
         };
 
-        if let Err(e) = update_table(&mut table, my_node, &cfg) {
-            error!("partial update of table failed ({e}); doing a full update");
-
-            table.clear();
-            if let Err(e) = update_table(&mut table, my_node, &cfg) {
-                error!("full update failed ({e}), will retry on next update");
-                table.clear();
-                continue;
-            }
+        if let Err(e) = table.update(render(my_node, &svc)).await {
+            error!("proxy table update failed: {e}");
         }
-
-        table.update_done();
 
         if !ct_state.is_ready() {
             debug!("ct not ready");
@@ -89,204 +87,6 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         }
     }
 
-    Ok(())
-}
-
-fn update_table(table: &mut TableTracker, my_node: &Node, cfg: &proxy::State) -> Result<()> {
-    debug!("updating table {}", table.table);
-
-    let mut child = std::process::Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-
-    let mut nft = io::BufWriter::new(child.stdin.as_mut().expect("stdin should be defined"));
-
-    update_table_to(&mut nft, table, my_node, cfg)?;
-
-    nft.flush()?;
-    drop(nft);
-
-    let status = child.wait()?;
-    if status.success() {
-        return Ok(()); // all good
-    }
-
-    // update failed; if debugging, dump the failing update script.
-    if log::log_enabled!(log::Level::Debug) {
-        // revert to the previous table state
-        table.update_failed();
-
-        debug!("update failed, writing update script to stderr");
-        let mut nft = std::io::stderr();
-
-        // and produce the script again
-        if let Err(e) = update_table_to(&mut nft, table, my_node, cfg) {
-            debug!("failed to write update script: {e}");
-        }
-    }
-
-    Err(format_err!("nft command failed ({status})"))
-}
-
-fn update_table_to<W: Write>(
-    nft: &mut W,
-    table: &mut TableTracker,
-    my_node: &Node,
-    cfg: &proxy::State,
-) -> Result<()> {
-    let mut update = table.update(nft);
-
-    update.prepare()?;
-
-    // ----------------------------------------
-    for (key, svc) in cfg.iter() {
-        write_service_slices_elements(&mut update, my_node, key, svc, false, &svc.internal_slices)?;
-
-        if svc.needs_ext_chain() {
-            write_service_slices_elements(
-                &mut update,
-                my_node,
-                key,
-                svc,
-                true,
-                svc.external_slices(),
-            )?;
-        };
-    }
-
-    // ----------------------------------------
-    update.ctr(CtrKind::Map, "service_ips", |buf| {
-        writeln!(
-            buf,
-            concat!(
-                "  comment \"ClusterIP, ExternalIP and LoadBalancer IP traffic\"\n",
-                "  type ipv4_addr . inet_proto . inet_service : verdict"
-            )
-        )
-    })?;
-
-    for (key, svc) in cfg.iter().filter(|(_, svc)| !svc.cluster_ips.is_empty()) {
-        let svc_chain = svc_chain(key);
-        let svc_chain_ext = svc_chain_ext(key, svc);
-
-        for port in &svc.ports {
-            let (proto, port) = port.0.protocol_port();
-            let proto = nft_proto(proto);
-
-            for ip in &svc.cluster_ips {
-                update.map_element(
-                    SERVICE_IPS,
-                    format!("{ip} . {proto} . {port}"),
-                    format!("goto {svc_chain}"),
-                )?;
-            }
-            for ip in &svc.external_ips {
-                update.map_element(
-                    SERVICE_IPS,
-                    format!("{ip} . {proto} . {port}"),
-                    format!("goto {svc_chain_ext}"),
-                )?;
-            }
-        }
-    }
-
-    // ----------------------------------------
-    update.ctr(CtrKind::Map, SERVICE_NODEPORTS, |buf| {
-        writeln!(buf, "  comment \"NodePort traffic\"")?;
-        writeln!(buf, "  type inet_proto . inet_service : verdict")
-    })?;
-
-    for (key, svc) in cfg.iter().filter(|(_, svc)| !svc.cluster_ips.is_empty()) {
-        let svc_chain_ext = svc_chain_ext(key, svc);
-
-        for port in &svc.node_ports {
-            let (proto, port) = port.0.protocol_port();
-            let proto = nft_proto(proto);
-
-            update.map_element(
-                SERVICE_NODEPORTS,
-                format!("{proto} . {port}"),
-                format!("goto {}", svc_chain_ext),
-            )?;
-        }
-    }
-
-    // ----------------------------------------
-    update.ctr(CtrKind::Chain, "dispatch", |buf| {
-        writeln!(
-            buf,
-            concat!(
-                "  ip daddr . ip protocol . th dport vmap @service_ips;\n",
-                "  fib daddr type local ip protocol . th dport vmap @service_nodeports;"
-            )
-        )
-    })?;
-
-    // ----------------------------------------
-    update.ctr(CtrKind::Chain, "a_hook_dnat_prerouting", |buf| {
-        writeln!(buf, "  type nat hook prerouting priority 0;")?;
-        writeln!(buf, "  jump dispatch;")
-    })?;
-    update.ctr(CtrKind::Chain, "a_hook_dnat_output", |buf| {
-        writeln!(buf, "  type nat hook output priority 0;")?;
-        writeln!(buf, "  jump dispatch;")
-    })?;
-
-    // ----------------------------------------
-    update.ctr(CtrKind::Set, "need_masquerade", |buf| {
-        writeln!(buf, "  type ipv4_addr . ipv4_addr . ipv4_addr")
-    })?;
-    update.ctr(CtrKind::Set, "need_masquerade6", |buf| {
-        writeln!(buf, "  type ipv6_addr . ipv6_addr . ipv6_addr")
-    })?;
-
-    for (_, svc) in cfg.iter().filter(|(_, svc)| !svc.cluster_ips.is_empty()) {
-        for ep in svc.internal_endpoints().filter(|ep| ep.node_local) {
-            set_need_masquerade_for(&mut update, ep, svc.cluster_ips.iter(), &my_node.ips)?;
-        }
-        for ep in svc.external_endpoints().filter(|ep| ep.node_local) {
-            set_need_masquerade_for(&mut update, ep, svc.external_ips.iter(), &my_node.ips)?;
-        }
-    }
-
-    update.ctr(CtrKind::Chain, "a_hook_dnat_postrouting", |buf| {
-        writeln!(buf, "  type nat hook postrouting priority 0;")?;
-        writeln!(
-            buf,
-            "  ip saddr . ip daddr . ct original ip daddr @need_masquerade masquerade;"
-        )?;
-        writeln!(
-            buf,
-            "  ip6 saddr . ip6 daddr . ct original ip6 daddr @need_masquerade6 masquerade;"
-        )?;
-
-        // do not masq local pods
-        for pod_cidr in &my_node.pod_cidrs {
-            let Some((ip, _)) = pod_cidr.split_once('/') else {
-                continue;
-            };
-            let Ok(ip) = ip.parse::<IpAddr>() else {
-                continue;
-            };
-            let ipv = match ip {
-                IpAddr::V4(_) => "ip",
-                IpAddr::V6(_) => "ip6",
-            };
-            writeln!(buf, "{ipv} saddr {pod_cidr} return;")?;
-            writeln!(buf, "{ipv} daddr {pod_cidr} return;")?;
-        }
-
-        // masq what's marked for masquerading (tldr: anything that was dnat by us)
-        writeln!(buf, "  mark and {MASQ_MARK} == 0 return;")?;
-        writeln!(
-            buf,
-            "  mark set mark xor {MASQ_MARK} masquerade fully-random;"
-        )
-    })?;
-
-    // ----------------------------------------
-    update.finalize()?;
     Ok(())
 }
 
@@ -310,464 +110,534 @@ fn affinity_set(key: &keys::Object, ip_version: char) -> String {
     obj_chain(&format!("affinity{ip_version}"), key)
 }
 
-fn write_service_slices_elements<W: Write>(
-    table: &mut TableUpdater<W>,
-    my_node: &Node,
-    key: &keys::Object,
-    svc: &proxy::Service,
-    ext: bool,
-    slices: &[LocalEndpointSlice],
-) -> eyre::Result<()> {
-    let svc_chain = if ext {
-        svc_chain_ext(key, svc)
-    } else {
-        svc_chain(key)
-    };
+// ---------------------------------------------------------------------------
+// TableSync rendering (pure netlink)
+// ---------------------------------------------------------------------------
 
-    table.ctr(CtrKind::Map, svc_chain.clone(), |buf| {
-        writeln!(buf, "  typeof numgen random mod 1 : verdict")
-    })?;
+const SERVICE_IPS_COMMENT: &str = "ClusterIP, ExternalIP and LoadBalancer IP traffic";
+const SERVICE_NODEPORTS_COMMENT: &str = "NodePort traffic";
+/// `NFT_DATA_VERDICT`: the data type of a verdict map.
+const NFT_DATA_VERDICT: u32 = 0xffffff00;
 
-    match svc.session_affinity {
-        SessionAffinity::None => {}
-        SessionAffinity::ClientIP { timeout } => {
-            for ipv in ['4', '6'] {
-                table.ctr(CtrKind::Set, affinity_set(key, ipv), |buf| {
-                    writeln!(buf, "  type ipv{ipv}_addr . ipv{ipv}_addr")?;
-                    writeln!(buf, "  flags timeout; timeout {timeout}s;")
-                })?;
-            }
-        }
+/// `TYPE_INTEGER` (`nftables/include/datatype.h`): nft's unnamed integer
+/// datatype, the key type a `numgen` result is stored as.
+const TYPE_INTEGER: u32 = 4;
+
+/// The metadata of a per-service endpoint dispatch map: keyed by the `numgen`
+/// result (`typeof numgen random mod 1 : verdict`).
+fn dispatch_map_meta() -> SetMeta {
+    SetMeta {
+        flags: SetFlags::Map,
+        attributes: vec![
+            SetAttribute::KeyType(TYPE_INTEGER),
+            SetAttribute::KeyLen(4),
+            SetAttribute::DataType(NFT_DATA_VERDICT),
+            SetAttribute::DataLen(16),
+            SetAttribute::UserData(userdata::numgen_verdict_map(1)),
+        ],
+        comment: None,
     }
-
-    let mut pre_rules = Vec::new();
-
-    if ext && let Some(ref allow_list) = svc.external_allow_list {
-        let set: Vec<_> = allow_list.iter().map(|ip| ip.to_string()).collect();
-        writeln!(
-            pre_rules,
-            "  ip saddr != {{{set}}} reject",
-            set = set.join(", ")
-        )?;
-    }
-
-    let mut n_ipv4 = 0;
-    let mut n_ipv6 = 0;
-
-    for slice in slices {
-        for ep in &slice.endpoints {
-            for ip in ep.ips() {
-                let (ip_hex, n) = match ip {
-                    IpAddr::V4(ip) => (hex::encode(ip.octets()), &mut n_ipv4),
-                    IpAddr::V6(ip) => (hex::encode(ip.octets()), &mut n_ipv6),
-                };
-
-                let ep_chain = format!("{svc_chain}_ep_{ip_hex}");
-
-                table.ctr(CtrKind::Chain, &ep_chain, |buf| {
-                    match svc.session_affinity {
-                        SessionAffinity::None => {}
-                        SessionAffinity::ClientIP { .. } => {
-                            let affinity_set = affinity_set(
-                                key,
-                                match ip {
-                                    IpAddr::V4(_) => '4',
-                                    IpAddr::V6(_) => '6',
-                                },
-                            );
-                            writeln!(
-                                pre_rules,
-                                "  ip saddr . {ip} @{affinity_set} goto {ep_chain}"
-                            )?;
-                            writeln!(buf, "  update @{affinity_set} {{ ip saddr . {ip} }}")?;
-                        }
-                    };
-
-                    let mut dnat = DnatWriter {
-                        content: buf,
-                        my_ips: &my_node.ips,
-                        slice,
-                        ip,
-                        node_port: false,
-                    };
-
-                    for (port, target_port) in &svc.ports {
-                        dnat.write_port(port, target_port)?;
-                    }
-
-                    dnat.node_port = true;
-                    for (port, target_port) in &svc.node_ports {
-                        dnat.write_port(port, target_port)?;
-                    }
-
-                    Ok(())
-                })?;
-
-                table.map_element(&svc_chain, format!("{n}"), format!("goto {}", ep_chain))?;
-                *n += 1;
-            }
-        }
-    }
-
-    table.ctr(CtrKind::Chain, svc_chain.clone(), |buf| {
-        buf.extend(pre_rules);
-
-        for (n, nfproto) in [(n_ipv4, "ipv4"), (n_ipv6, "ipv6")] {
-            if n == 0 {
-                writeln!(buf, "  meta nfproto {nfproto} reject")?;
-            } else {
-                writeln!(
-                    buf,
-                    "  meta nfproto ipv4 numgen random mod {n} vmap @{svc_chain}"
-                )?;
-            }
-        }
-        Ok(())
-    })?;
-
-    Ok(())
 }
 
-struct DnatWriter<'t> {
-    content: &'t mut Vec<u8>,
-    my_ips: &'t [IpAddr],
-    slice: &'t LocalEndpointSlice,
+/// Renders the whole proxy table for `cfg` as a target [`TableSync`].
+pub fn render(my_node: &Node, cfg: &proxy::State) -> TableSync {
+    Builder::new(my_node, cfg).build()
+}
+
+fn proto_num(protocol: Protocol) -> u8 {
+    match protocol {
+        Protocol::TCP => 6,
+        Protocol::UDP => 17,
+        Protocol::SCTP => 132,
+    }
+}
+
+fn ip_octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+/// The `dnat`/`redirect` rule for endpoint `ip` on service port `port`,
+/// targeting `target` (the slice's target port).
+fn dnat_rule(
     ip: IpAddr,
+    port: &ProtoPort,
+    target: u16,
     node_port: bool,
-}
-
-impl<'t> Write for DnatWriter<'t> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.content.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.content.flush()
-    }
-}
-
-impl<'t> DnatWriter<'t> {
-    fn write_port(&mut self, port: &ProtoPort, port_name: &str) -> io::Result<()> {
-        let Some(target_port) = self.slice.target_ports.get(port_name) else {
-            return Ok(());
-        };
-
-        let ipvx = match self.ip {
-            IpAddr::V4(_) => "ipv4",
-            IpAddr::V6(_) => "ipv6",
-        };
-        let (protocol, port) = port.protocol_port();
-        let protocol = nft_proto(protocol);
-
-        write!(self, "  ")?;
-        if self.node_port {
-            write!(self, "fib daddr type local ")?;
+    my_ips: &[IpAddr],
+) -> Rule {
+    let (proto, port) = port.protocol_port();
+    let family = match ip {
+        IpAddr::V4(_) => Family::V4,
+        IpAddr::V6(_) => Family::V6,
+    };
+    let target = if my_ips.contains(&ip) {
+        Dnat::Redirect(target)
+    } else {
+        Dnat::Masquerade {
+            ip,
+            port: target,
+            mark: MASQ_MARK,
         }
-
-        write!(self, "meta nfproto {ipvx} {protocol} dport {port} ")?;
-
-        let ip = self.ip;
-        if self.my_ips.contains(&ip) {
-            writeln!(self, "redirect to {target_port}")
-        } else {
-            writeln!(
-                self,
-                "mark set mark or {MASQ_MARK} dnat to {ip}:{target_port}"
-            )
-        }
-    }
+    };
+    rules::dnat_rule(family, proto_num(proto), port, node_port, target)
 }
 
-fn set_need_masquerade_for<'t, W: Write>(
-    table: &mut TableUpdater<W>,
+/// Adds the `need_masquerade{,6}` elements for a node-local endpoint whose IP is
+/// not one of the node's own IPs (`ips` are the service's cluster or external
+/// IPs).
+fn add_need_masq<'t>(
+    v4: &mut BTreeSet<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>,
+    v6: &mut BTreeSet<(Ipv6Addr, Ipv6Addr, Ipv6Addr)>,
     ep: &LocalEndpoint,
     ips: impl Iterator<Item = &'t IpAddr>,
     my_ips: &[IpAddr],
-) -> Result<()> {
+) {
     for svc_ip in ips {
-        let (set, ep_ip) = match svc_ip {
-            IpAddr::V4(_) => (NEED_MASQ_V4, ep.ipv4.map(IpAddr::V4)),
-            IpAddr::V6(_) => (NEED_MASQ_V6, ep.ipv6.map(IpAddr::V6)),
-        };
-        let Some(ep_ip) = ep_ip else {
-            continue;
-        };
-        if my_ips.contains(&ep_ip) {
-            continue;
-        };
-        table.set_element(set, format!("{ep_ip} . {ep_ip} . {svc_ip}"))?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum CtrKind {
-    Chain,
-    Set,
-    Map,
-}
-impl std::fmt::Display for CtrKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        use CtrKind::*;
-        f.write_str(match self {
-            Chain => "chain",
-            Set => "set",
-            Map => "map",
-        })
-    }
-}
-
-struct TableTracker {
-    table: String,
-    has_table: bool,
-    ctrs: change::Tracker<(CtrKind, String), u128>,
-    sets: Map<String, change::Tracker<String, ()>>,
-    maps: Map<String, change::Tracker<String, u128>>,
-}
-impl TableTracker {
-    fn new(name: String) -> Self {
-        Self {
-            table: name,
-            has_table: false,
-            ctrs: change::Tracker::new(),
-            sets: Map::new(),
-            maps: Map::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.has_table = false;
-        self.ctrs.clear();
-        self.sets.clear();
-        self.maps.clear();
-    }
-
-    pub fn update<'t, W: Write>(&'t mut self, nft: &'t mut W) -> TableUpdater<'t, W> {
-        TableUpdater::new(self, nft)
-    }
-
-    pub fn update_done(&mut self) {
-        self.has_table = true;
-
-        for (kind, key) in self.ctrs.deleted() {
-            match kind {
-                CtrKind::Set => {
-                    self.sets.remove(key);
-                }
-                CtrKind::Map => {
-                    self.maps.remove(key);
-                }
-                _ => {}
-            }
-        }
-
-        self.ctrs.update_done();
-        for map in self.maps.values_mut() {
-            map.update_done();
-        }
-        for set in self.sets.values_mut() {
-            set.update_done();
-        }
-    }
-
-    pub fn update_failed(&mut self) {
-        self.ctrs.update_failed();
-        for map in self.maps.values_mut() {
-            map.update_failed();
-        }
-        for set in self.sets.values_mut() {
-            set.update_failed();
-        }
-    }
-}
-
-struct TableUpdater<'t, W>
-where
-    W: Write,
-{
-    tracker: &'t mut TableTracker,
-    nft: &'t mut W,
-    buf: Vec<u8>,
-    maps_to_define: Map<String, Vec<u8>>,
-}
-
-impl<'t, W: Write> TableUpdater<'t, W> {
-    pub fn new(tracker: &'t mut TableTracker, nft: &'t mut W) -> Self {
-        Self {
-            tracker,
-            nft,
-            buf: Vec::with_capacity(1024),
-            maps_to_define: Map::new(),
-        }
-    }
-
-    fn prepare(&mut self) -> io::Result<()> {
-        if self.tracker.has_table {
-            return Ok(());
-        }
-
-        let table = &self.tracker.table;
-        info!("assuming no table, will recreate table {table}");
-
-        writeln!(self.nft, "table {table} {{}};")?;
-        writeln!(self.nft, "delete table {table};")?;
-        writeln!(self.nft, "table {table} {{}};")?;
-        Ok(())
-    }
-
-    fn finalize(self) -> Result<()> {
-        let table = &self.tracker.table;
-        for (kind, ctr_name) in self.tracker.ctrs.current_keys() {
-            let deleted: Box<dyn Iterator<Item = &String>> = match kind {
-                CtrKind::Set => Box::new(self.tracker.sets[ctr_name].deleted()),
-                CtrKind::Map => Box::new(self.tracker.maps[ctr_name].deleted()),
-                _ => {
+        match svc_ip {
+            IpAddr::V4(svc_ip) => {
+                let Some(ep_ip) = ep.ipv4 else {
+                    continue;
+                };
+                if my_ips.contains(&IpAddr::V4(ep_ip)) {
                     continue;
                 }
-            };
-
-            for key in deleted {
-                writeln!(self.nft, "delete element {table} {ctr_name} {{ {key} }}")?;
+                v4.insert((ep_ip, ep_ip, *svc_ip));
+            }
+            IpAddr::V6(svc_ip) => {
+                let Some(ep_ip) = ep.ipv6 else {
+                    continue;
+                };
+                if my_ips.contains(&IpAddr::V6(ep_ip)) {
+                    continue;
+                }
+                v6.insert((ep_ip, ep_ip, *svc_ip));
             }
         }
+    }
+}
 
-        for (kind, name) in self.tracker.ctrs.deleted() {
-            writeln!(self.nft, "delete {kind} {table} {name};")?;
+/// Accumulates the sets and chains of one proxy table.
+struct Builder<'a> {
+    my_node: &'a Node,
+    cfg: &'a proxy::State,
+    sets: Map<String, SetSync>,
+    chains: Map<String, ChainSync>,
+}
+
+impl<'a> Builder<'a> {
+    fn new(my_node: &'a Node, cfg: &'a proxy::State) -> Self {
+        Self {
+            my_node,
+            cfg,
+            sets: Map::new(),
+            chains: Map::new(),
         }
-
-        Ok(())
     }
 
-    // set a contrainer, writing to its content. Returns false if unchanged, true otherwise.
-    fn ctr<F>(&mut self, kind: CtrKind, name: impl ToString, write_value: F) -> io::Result<bool>
-    where
-        F: FnOnce(&mut Vec<u8>) -> io::Result<()>,
-    {
-        self.buf.clear();
-        write_value(&mut self.buf)?;
+    fn build(mut self) -> TableSync {
+        self.service_ips_map();
+        self.service_nodeports_map();
+        self.need_masquerade();
 
-        let h = hash(&self.buf);
+        let cfg = self.cfg;
+        for (key, svc) in cfg.iter() {
+            self.service(key, svc);
+        }
 
-        let name = name.to_string();
+        self.dispatch();
+        self.hooks();
 
-        let Some(change) = self.tracker.ctrs.check((kind.clone(), name.clone()), &h) else {
-            // there's an nft bug when writing chains with map refs: the map must be defined in the
-            // script otherwise it fails (even if the map was defined in a previous iteration).
-            self.maps_to_define.insert(name.clone(), self.buf.clone());
-            return Ok(false);
-        };
+        TableSync {
+            chains: self.chains,
+            sets: self.sets,
+        }
+    }
 
-        let nft = &mut self.nft;
-        let table = &self.tracker.table;
-
-        match change.kind {
-            change::Kind::Created => match kind {
-                CtrKind::Set => {
-                    self.tracker
-                        .sets
-                        .insert(name.clone(), change::Tracker::new());
-                }
-                CtrKind::Map => {
-                    self.tracker
-                        .maps
-                        .insert(name.clone(), change::Tracker::new());
-                }
-                _ => {}
+    fn add_chain(&mut self, name: impl Into<String>, rules: Vec<Rule>, anon_sets: Vec<SetSync>) {
+        self.chains.insert(
+            name.into(),
+            ChainSync {
+                base: None,
+                rules,
+                anon_sets,
             },
-            change::Kind::Modified => {
-                writeln!(nft, "flush {kind} {table} {name};")?;
+        );
+    }
+
+    fn add_base_chain(
+        &mut self,
+        name: &str,
+        chain_type: ChainType,
+        hook: InetHookNumber,
+        priority: i32,
+        rules: Vec<Rule>,
+    ) {
+        self.chains.insert(
+            name.into(),
+            ChainSync {
+                base: Some(BaseChain {
+                    chain_type,
+                    hook,
+                    priority,
+                    policy: chain::ACCEPT,
+                }),
+                rules,
+                anon_sets: Vec::new(),
+            },
+        );
+    }
+
+    fn service_ips_map(&mut self) {
+        let mut entries = Vec::new();
+        for (key, svc) in self
+            .cfg
+            .iter()
+            .filter(|(_, svc)| !svc.cluster_ips.is_empty())
+        {
+            let svc_chain = svc_chain(key);
+            let svc_chain_ext = svc_chain_ext(key, svc);
+
+            for (port, _) in &svc.ports {
+                let (proto, port) = port.protocol_port();
+                let proto = proto_num(proto);
+                for ip in &svc.cluster_ips {
+                    if let IpAddr::V4(ip) = ip {
+                        entries.push(((*ip, proto, port), Verdict::Goto(svc_chain.clone())));
+                    }
+                }
+                for ip in &svc.external_ips {
+                    if let IpAddr::V4(ip) = ip {
+                        entries.push(((*ip, proto, port), Verdict::Goto(svc_chain_ext.clone())));
+                    }
+                }
             }
         }
 
-        // redefine maps to workaround nft bug
-        for token in self.buf.split(|b| b" ;\t\n".contains(b)) {
-            let Some(name) = token.strip_prefix(b"@") else {
-                continue; // word is not a ref
-            };
-            let name = String::from_utf8_lossy(name).to_string();
-            let Some(def) = self.maps_to_define.get(&name) else {
-                continue; // not a ref to a map
-            };
-            writeln!(nft, "map {table} {name} {{")?;
-            nft.write_all(def)?;
-            writeln!(nft, "}}")?;
-            self.maps_to_define.remove(&name);
+        self.sets.insert(
+            SERVICE_IPS.into(),
+            SetSync::verdict_map(entries, Some(SERVICE_IPS_COMMENT.into())),
+        );
+    }
+
+    fn service_nodeports_map(&mut self) {
+        let mut entries = Vec::new();
+        for (key, svc) in self
+            .cfg
+            .iter()
+            .filter(|(_, svc)| !svc.cluster_ips.is_empty())
+        {
+            let svc_chain_ext = svc_chain_ext(key, svc);
+            for (port, _) in &svc.node_ports {
+                let (proto, port) = port.protocol_port();
+                entries.push((
+                    (proto_num(proto), port),
+                    Verdict::Goto(svc_chain_ext.clone()),
+                ));
+            }
         }
 
-        // write the container & its content
-        writeln!(nft, "{kind} {table} {name} {{")?;
-        nft.write_all(&self.buf)?;
-        writeln!(nft, "}};")?;
-
-        change.set(h);
-        Ok(true)
+        self.sets.insert(
+            SERVICE_NODEPORTS.into(),
+            SetSync::verdict_map(entries, Some(SERVICE_NODEPORTS_COMMENT.into())),
+        );
     }
 
-    fn map_element(&mut self, map_name: &str, key: String, value: String) -> Result<()> {
-        let h = xxhash_rust::xxh3::xxh3_128(value.as_bytes());
-        let Some(change) = (self.tracker.maps.get_mut(map_name))
-            .ok_or_else(|| format_err!("'ctr(Map, {map_name:?})' must be called before"))?
-            .check(key, &h)
-        else {
-            return Ok(());
-        };
+    fn need_masquerade(&mut self) {
+        let mut v4 = BTreeSet::new();
+        let mut v6 = BTreeSet::new();
 
-        let table = &self.tracker.table;
-        let key = change.key();
-
-        match change.kind {
-            change::Kind::Created => {}
-            change::Kind::Modified => {
-                writeln!(self.nft, "delete element {table} {map_name} {{ {key} }}")?;
+        for (_, svc) in self
+            .cfg
+            .iter()
+            .filter(|(_, svc)| !svc.cluster_ips.is_empty())
+        {
+            for ep in svc.internal_endpoints().filter(|ep| ep.node_local) {
+                add_need_masq(
+                    &mut v4,
+                    &mut v6,
+                    ep,
+                    svc.cluster_ips.iter(),
+                    &self.my_node.ips,
+                );
             }
-        };
-        writeln!(
-            self.nft,
-            "add element {table} {map_name} {{ {key} : {value} }}"
-        )?;
+            for ep in svc.external_endpoints().filter(|ep| ep.node_local) {
+                add_need_masq(
+                    &mut v4,
+                    &mut v6,
+                    ep,
+                    svc.external_ips.iter(),
+                    &self.my_node.ips,
+                );
+            }
+        }
 
-        change.set(h);
-
-        Ok(())
+        self.sets
+            .insert(NEED_MASQ_V4.into(), SetSync::simple(v4, None));
+        self.sets
+            .insert(NEED_MASQ_V6.into(), SetSync::simple(v6, None));
     }
 
-    fn set_element(&mut self, set_name: &str, key: String) -> Result<()> {
-        let Some(change) = (self.tracker.sets.get_mut(set_name))
-            .ok_or_else(|| format_err!("'ctr(Set, {set_name:?})' must be called before"))?
-            .check(key, &())
-        else {
-            return Ok(());
-        };
-
-        let table = &self.tracker.table;
-        let key = change.key();
-
-        match change.kind {
-            change::Kind::Created => {
-                writeln!(self.nft, "add element {table} {set_name} {{ {key} }}")?;
-            }
-            change::Kind::Modified => {
-                unreachable!();
-            }
-        };
-
-        change.set(());
-
-        Ok(())
+    fn dispatch(&mut self) {
+        self.add_chain(
+            "dispatch",
+            vec![
+                rules::ip_daddr_ip_proto_dport_vmap(SERVICE_IPS),
+                rules::fib_daddr_local_ip_proto_dport_vmap(SERVICE_NODEPORTS),
+            ],
+            Vec::new(),
+        );
     }
+
+    fn hooks(&mut self) {
+        self.add_base_chain(
+            "a_hook_dnat_prerouting",
+            ChainType::Nat,
+            InetHookNumber::PreRouting,
+            0,
+            vec![vec![rules::jump("dispatch")]],
+        );
+        self.add_base_chain(
+            "a_hook_dnat_output",
+            ChainType::Nat,
+            InetHookNumber::LocalOut,
+            0,
+            vec![vec![rules::jump("dispatch")]],
+        );
+
+        let mut post = vec![
+            rules::ct_masquerade(Family::V4, NEED_MASQ_V4),
+            rules::ct_masquerade(Family::V6, NEED_MASQ_V6),
+        ];
+
+        for cidr in &self.my_node.pod_cidrs {
+            if let Ok(cidr) = cidr.parse::<IpCidr>() {
+                let (family, prefix, network) = match &cidr {
+                    IpCidr::V4(c) => (
+                        Family::V4,
+                        c.network_length(),
+                        c.first_address().octets().to_vec(),
+                    ),
+                    IpCidr::V6(c) => (
+                        Family::V6,
+                        c.network_length(),
+                        c.first_address().octets().to_vec(),
+                    ),
+                };
+                for dir in [Dir::Src, Dir::Dst] {
+                    let mut rule = rules::ip_prefix(family, dir, prefix, network.clone(), false);
+                    rule.push(rules::verdict(RuleVerdict::Return));
+                    post.push(rule);
+                }
+            }
+        }
+
+        let mut mark_return = rules::mark_and_eq_zero(Register::Reg1, MASQ_MARK);
+        mark_return.push(rules::verdict(RuleVerdict::Return));
+        post.push(mark_return);
+
+        let mut masq = rules::mark_xor(Register::Reg1, MASQ_MARK);
+        masq.push(rules::masquerade(true));
+        post.push(masq);
+
+        self.add_base_chain(
+            "a_hook_dnat_postrouting",
+            ChainType::Nat,
+            InetHookNumber::PostRouting,
+            0,
+            post,
+        );
+    }
+
+    fn service(&mut self, key: &keys::Object, svc: &proxy::Service) {
+        self.service_slices(key, svc, false, &svc.internal_slices);
+        if svc.needs_ext_chain() {
+            self.service_slices(key, svc, true, svc.external_slices());
+        }
+    }
+
+    /// Renders one endpoint-dispatch map (named after the chain it feeds) and
+    /// its chain, for either the internal or the external slices.
+    fn service_slices(
+        &mut self,
+        key: &keys::Object,
+        svc: &proxy::Service,
+        ext: bool,
+        slices: &[LocalEndpointSlice],
+    ) {
+        let svc_chain = if ext {
+            svc_chain_ext(key, svc)
+        } else {
+            svc_chain(key)
+        };
+
+        let affinity = match svc.session_affinity {
+            SessionAffinity::ClientIP { timeout } => Some(timeout),
+            SessionAffinity::None => None,
+        };
+        if let Some(timeout) = affinity {
+            let ms = timeout as u64 * 1000;
+            let meta4 = SetMeta::from_elem::<(Ipv4Addr, Ipv4Addr)>(None).with_timeout(ms);
+            self.sets.entry(affinity_set(key, '4')).or_insert_with(|| {
+                SetSync::simple_with_meta::<(Ipv4Addr, Ipv4Addr)>(meta4, std::iter::empty())
+            });
+            let meta6 = SetMeta::from_elem::<(Ipv6Addr, Ipv6Addr)>(None).with_timeout(ms);
+            self.sets.entry(affinity_set(key, '6')).or_insert_with(|| {
+                SetSync::simple_with_meta::<(Ipv6Addr, Ipv6Addr)>(meta6, std::iter::empty())
+            });
+        }
+
+        let mut anon_sets = Vec::new();
+        let mut pre_rules: Vec<Rule> = Vec::new();
+        if ext && let Some(allow) = &svc.external_allow_list {
+            pre_rules.extend(allow_list_rules(&mut anon_sets, allow));
+        }
+
+        let mut entries: Vec<(u32, Verdict)> = Vec::new();
+        let mut n4 = 0u32;
+        let mut n6 = 0u32;
+
+        for slice in slices {
+            for ep in &slice.endpoints {
+                for ip in ep.ips() {
+                    let family = match ip {
+                        IpAddr::V4(_) => Family::V4,
+                        IpAddr::V6(_) => Family::V6,
+                    };
+                    let ep_chain = format!("{svc_chain}_ep_{}", hex::encode(ip_octets(ip)));
+
+                    let mut rules = Vec::new();
+                    if affinity.is_some() {
+                        let aff = affinity_set(key, if family == Family::V4 { '4' } else { '6' });
+                        rules.push(rules::affinity_update(family, &aff, ip));
+                        pre_rules.push(rules::affinity_goto(family, &aff, ip, &ep_chain));
+                    }
+
+                    for (port, name) in &svc.ports {
+                        if let Some(&target) = slice.target_ports.get(name) {
+                            rules.push(dnat_rule(ip, port, target, false, &self.my_node.ips));
+                        }
+                    }
+                    for (port, name) in &svc.node_ports {
+                        if let Some(&target) = slice.target_ports.get(name) {
+                            rules.push(dnat_rule(ip, port, target, true, &self.my_node.ips));
+                        }
+                    }
+
+                    self.add_chain(ep_chain.clone(), rules, Vec::new());
+
+                    let n = match family {
+                        Family::V4 => &mut n4,
+                        Family::V6 => &mut n6,
+                    };
+                    entries.push((*n, Verdict::Goto(ep_chain)));
+                    *n += 1;
+                }
+            }
+        }
+
+        // An affinity set referenced by an `update` rule must carry
+        // `NFT_SET_EVAL` (`dynamic`); one with no endpoint of its family is
+        // only `timeout`. nft normally derives this while parsing the script.
+        for (family, n) in [(Family::V4, n4), (Family::V6, n6)] {
+            if affinity.is_some() && n > 0 {
+                let name = affinity_set(key, if family == Family::V4 { '4' } else { '6' });
+                if let Some(set) = self.sets.get_mut(&name) {
+                    set.meta_mut().flags |= SetFlags::Eval;
+                }
+            }
+        }
+
+        let mut rules = pre_rules;
+        for (family, n) in [(Family::V4, n4), (Family::V6, n6)] {
+            if n == 0 {
+                rules.push(rules::nfproto_reject(family));
+            } else {
+                rules.push(rules::numgen_vmap(family, n, &svc_chain));
+            }
+        }
+        self.add_chain(svc_chain.clone(), rules, anon_sets);
+
+        // A `numgen` result is a host-endian 4-byte integer; key the map the
+        // same way so the lookup matches.
+        let entries = entries
+            .into_iter()
+            .map(|(n, verdict)| (n.to_ne_bytes().to_vec(), verdict));
+        self.sets.insert(
+            svc_chain,
+            SetSync::verdict_map_raw(dispatch_map_meta(), entries),
+        );
+    }
+}
+
+/// The rules rejecting traffic not originating from `allow` (an external
+/// Service's `loadBalancerSourceRanges`): a singleton CIDR becomes an inline
+/// prefix match, several become the anonymous interval set nft would build.
+fn allow_list_rules(anon_sets: &mut Vec<SetSync>, allow: &BTreeSet<String>) -> Vec<Rule> {
+    let mut v4: Vec<(u8, Ipv4Addr, RangeInclusive<Ipv4Addr>)> = Vec::new();
+    let mut v6: Vec<(u8, Ipv6Addr, RangeInclusive<Ipv6Addr>)> = Vec::new();
+
+    for cidr in allow {
+        match cidr.parse::<IpCidr>() {
+            Ok(IpCidr::V4(c)) => v4.push((
+                c.network_length(),
+                c.first_address(),
+                c.first_address()..=c.last_address(),
+            )),
+            Ok(IpCidr::V6(c)) => v6.push((
+                c.network_length(),
+                c.first_address(),
+                c.first_address()..=c.last_address(),
+            )),
+            Err(_) => {}
+        }
+    }
+
+    let mut rules = Vec::new();
+    if v4.len() == 1 {
+        let (prefix, first, _) = &v4[0];
+        let mut rule =
+            rules::ip_prefix(Family::V4, Dir::Src, *prefix, first.octets().to_vec(), true);
+        rule.push(rules::reject_icmp(Family::V4));
+        rules.push(rule);
+    } else if !v4.is_empty() {
+        let ranges: Vec<_> = v4.iter().map(|(_, _, r)| r.clone()).collect();
+        rules.push(anon_range_rule(
+            anon_sets,
+            Family::V4,
+            SetSync::interval(ranges, None),
+        ));
+    }
+
+    if v6.len() == 1 {
+        let (prefix, first, _) = &v6[0];
+        let mut rule =
+            rules::ip_prefix(Family::V6, Dir::Src, *prefix, first.octets().to_vec(), true);
+        rule.push(rules::reject_icmp(Family::V6));
+        rules.push(rule);
+    } else if !v6.is_empty() {
+        let ranges: Vec<_> = v6.iter().map(|(_, _, r)| r.clone()).collect();
+        rules.push(anon_range_rule(
+            anon_sets,
+            Family::V6,
+            SetSync::interval(ranges, None),
+        ));
+    }
+
+    rules
+}
+
+fn anon_range_rule(anon_sets: &mut Vec<SetSync>, family: Family, mut set: SetSync) -> Rule {
+    set.set_anonymous();
+    let index = anon_sets.len() as u32;
+    anon_sets.push(set);
+
+    let mut rule = rules::ip_set_anon(family, Dir::Src, index, true);
+    rule.push(rules::reject_icmp(family));
+    rule
 }
 
 #[cfg(test)]
 mod tests;
-
-fn nft_proto(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::TCP => "tcp",
-        Protocol::UDP => "udp",
-        Protocol::SCTP => "sctp",
-    }
-}
-
-fn hash(content: &Vec<u8>) -> u128 {
-    use xxhash_rust::xxh3;
-    xxh3::xxh3_128(content.as_slice())
-}

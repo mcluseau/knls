@@ -20,15 +20,17 @@ use crate::netlink::netfilter::{self, NetlinkExt as _};
 
 use super::{
     Message,
-    chain::{Chain, InetHookNumber, Rule},
+    chain::{Chain, ChainType, InetHookNumber, Rule},
     set::{self, Data, Elem, MapElem, Verdict, VerdictElem},
     table,
 };
 
-/// The base-chain descriptor a chain is created with: the hook, type, priority
-/// and policy.
+/// The base-chain descriptor a chain is created with: the chain type, the hook,
+/// the priority and the policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseChain {
+    /// The chain type (`filter` or `nat`).
+    pub chain_type: ChainType,
     /// The `inet` hook the chain is attached to.
     pub hook: InetHookNumber,
     /// The hook priority.
@@ -90,6 +92,14 @@ impl SetMeta {
     /// comment (a comment-only change is not structural).
     pub fn same_structure(&self, other: &Self) -> bool {
         self.flags == other.flags && self.attributes == other.attributes
+    }
+
+    /// Sets the set's `NFTA_SET_TIMEOUT` (in milliseconds) and its `Timeout`
+    /// flag.
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.flags |= SetFlags::Timeout;
+        self.attributes.push(SetAttribute::Timeout(timeout_ms));
+        self
     }
 }
 
@@ -216,6 +226,30 @@ impl SetSync {
                 .into_iter()
                 .map(|(k, v)| (k.elem_data(), v))
                 .collect(),
+        })
+    }
+
+    /// A set of keys with caller-supplied metadata.
+    ///
+    /// The escape hatch for sets whose metadata is not expressible through
+    /// [`Data`] (e.g. a `timeout`-flagged set, or a `numgen`-keyed map).
+    pub fn simple_with_meta<K: Data>(meta: SetMeta, keys: impl IntoIterator<Item = K>) -> Self {
+        Self::Set(SetSpec {
+            meta,
+            keys: keys.into_iter().map(|k| k.elem_data()).collect(),
+        })
+    }
+
+    /// A verdict map from raw key bytes with caller-supplied metadata, for keys
+    /// whose encoding is not expressible through [`Data`] (e.g. the host-endian
+    /// integer a `numgen` result is looked up with).
+    pub fn verdict_map_raw(
+        meta: SetMeta,
+        entries: impl IntoIterator<Item = (Vec<u8>, Verdict)>,
+    ) -> Self {
+        Self::VerdictMap(VerdictMapSpec {
+            meta,
+            entries: entries.into_iter().collect(),
         })
     }
 }
@@ -413,7 +447,7 @@ fn create_set_msg(table: &str, name: &str, id: u32, set: &SetSync) -> Message {
 fn create_chain_msg(table: &str, name: &str, chain: &ChainSync) -> Message {
     let c = Chain::new(table, name);
     match chain.base {
-        Some(base) => c.create_base(base.hook, base.priority, base.policy),
+        Some(base) => c.create_base_with(base.chain_type, base.hook, base.priority, base.policy),
         None => c.create(),
     }
 }

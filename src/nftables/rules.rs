@@ -4,10 +4,12 @@
 //! loading a header field into a register, comparing it, looking a value up in a
 //! set/map, and applying a verdict (including `reject`).
 
+use netlink_packet_core::DefaultNla;
 use netlink_packet_netfilter::nftables::{
     Bitwise, Cmp, DataAttribute, ExpressionAttribute, Expressions, Immediate, ListAttribute,
     Lookup, Meta, MetaKey, Operator, Payload, Register, Verdict as NlVerdict, VerdictAttribute,
 };
+use std::net::IpAddr;
 
 /// A single rule expression (see [`Rule`](super::chain::Rule)).
 pub type Expr = ListAttribute<ExpressionAttribute>;
@@ -260,6 +262,15 @@ impl Family {
         }]
     }
 
+    /// The `NFPROTO_*` value as a `u32`, for netlink attributes that carry it
+    /// as a big-endian word (e.g. the `nat` expression's family).
+    fn nfproto_u32(self) -> u32 {
+        match self {
+            Self::V4 => 2,
+            Self::V6 => 10,
+        }
+    }
+
     /// The address length in bytes.
     fn len(self) -> u32 {
         match self {
@@ -439,6 +450,449 @@ pub fn l4proto_eq(proto: u8) -> Vec<Expr> {
     vec![
         meta(MetaKey::L4Proto, Register::Reg1),
         eq(Register::Reg1, vec![proto]),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Builders for the proxy (kube-proxy replacement): expressions the crate does
+// not model, emitted as `Expressions::Other` with the exact attributes nft
+// produces (verified against a kernel dump).
+// ---------------------------------------------------------------------------
+
+/// A raw netlink attribute with `kind` and an already-encoded `value`.
+fn nla(kind: u16, value: Vec<u8>) -> DefaultNla {
+    DefaultNla::new(kind, value)
+}
+
+/// An expression the crate does not model, addressed by its nft type name.
+fn other(expression_type: &str, attributes: Vec<DefaultNla>) -> Expr {
+    Expressions::Other {
+        expression_type: expression_type.into(),
+        attributes,
+    }
+    .into()
+}
+
+fn be32(value: u32) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn be64(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// A 32-bit `nft` integer datatype value (`mark`, a `fib` result) as it sits in
+/// a register: host byte order, unlike the big-endian wire attributes.
+fn ne32(value: u32) -> Vec<u8> {
+    value.to_ne_bytes().to_vec()
+}
+
+/// `reg = <value>` (an immediate load).
+pub fn load_immediate(reg: Register, value: impl Into<Vec<u8>>) -> Expr {
+    Expressions::Immediate(vec![
+        Immediate::DestinationRegister(reg),
+        Immediate::Data(DataAttribute::Value(value.into())),
+    ])
+    .into()
+}
+
+/// `meta <key> = reg` (a store).
+pub fn meta_store(key: MetaKey, reg: Register) -> Expr {
+    Expressions::Meta(vec![Meta::Key(key), Meta::SourceRegister(reg)]).into()
+}
+
+/// `reg = reg | value`, encoded as nft's `bitwise(!value, value)`.
+pub fn bitwise_or(reg: Register, len: u32, value: Vec<u8>) -> Expr {
+    let mask = value.iter().map(|b| !b).collect();
+    bitwise(reg, len, mask, value)
+}
+
+/// `reg = reg ^ value`.
+pub fn bitwise_xor(reg: Register, len: u32, value: Vec<u8>) -> Expr {
+    bitwise(reg, len, vec![0xff; len as usize], value)
+}
+
+/// `reg = reg & value`.
+pub fn bitwise_and(reg: Register, len: u32, value: Vec<u8>) -> Expr {
+    bitwise(reg, len, value, vec![0u8; len as usize])
+}
+
+/// The register a concatenated-key field starting at byte `offset` with field
+/// length `len` loads into, as nft lays concat fields out: a 16-byte field
+/// aligned on a 16-byte boundary uses a legacy 16-byte register (`Reg1`, `Reg2`,
+/// …); every other field uses a 32-bit register at its byte offset.
+pub fn concat_register(offset: u32, len: u32) -> Register {
+    if offset == 0 {
+        Register::Reg1
+    } else if len == 16 && offset.is_multiple_of(16) {
+        Register::from(offset / 16 + 1)
+    } else {
+        Register::from(8 + offset / 4)
+    }
+}
+
+/// Tracks the byte offset of the next concatenated field and hands out its
+/// register.
+#[derive(Default)]
+struct Concat {
+    offset: u32,
+}
+
+impl Concat {
+    fn add(&mut self, len: u32) -> Register {
+        let reg = concat_register(self.offset, len);
+        self.offset += len.div_ceil(4) * 4;
+        reg
+    }
+}
+
+/// `fib daddr type local` into `reg`, followed by the `== RTN_LOCAL` compare.
+pub fn fib_daddr_type_local(reg: Register) -> Vec<Expr> {
+    const NFTA_FIB_DREG: u16 = 1;
+    const NFTA_FIB_RESULT: u16 = 2;
+    const NFTA_FIB_FLAGS: u16 = 3;
+    const NFT_FIB_RESULT_ADDRTYPE: u32 = 3;
+    const NFT_FIB_F_DADDR: u32 = 2;
+    const RTN_LOCAL: u32 = 2;
+
+    vec![
+        other(
+            "fib",
+            vec![
+                nla(NFTA_FIB_DREG, be32(reg.into())),
+                nla(NFTA_FIB_RESULT, be32(NFT_FIB_RESULT_ADDRTYPE)),
+                nla(NFTA_FIB_FLAGS, be32(NFT_FIB_F_DADDR)),
+            ],
+        ),
+        cmp(reg, Operator::Equal, ne32(RTN_LOCAL)),
+    ]
+}
+
+/// `numgen random mod <modulus>` into `reg`.
+pub fn numgen_random(reg: Register, modulus: u32) -> Expr {
+    const NFTA_NGEN_DREG: u16 = 1;
+    const NFTA_NGEN_MODULUS: u16 = 2;
+    const NFTA_NGEN_TYPE: u16 = 3;
+    const NFTA_NGEN_OFFSET: u16 = 4;
+    const NFT_NG_RANDOM: u32 = 1;
+
+    other(
+        "numgen",
+        vec![
+            nla(NFTA_NGEN_DREG, be32(reg.into())),
+            nla(NFTA_NGEN_MODULUS, be32(modulus)),
+            nla(NFTA_NGEN_TYPE, be32(NFT_NG_RANDOM)),
+            nla(NFTA_NGEN_OFFSET, be32(0)),
+        ],
+    )
+}
+
+/// `ct original ip daddr` (v4) / `ip6 daddr` (v6) into `reg`.
+pub fn ct_original_daddr(family: Family, reg: Register) -> Expr {
+    const NFTA_CT_DREG: u16 = 1;
+    const NFTA_CT_KEY: u16 = 2;
+    const NFTA_CT_DIRECTION: u16 = 3;
+    const NFT_CT_DST_IP: u32 = 20;
+    const NFT_CT_DST_IP6: u32 = 22;
+    const IP_CT_DIR_ORIGINAL: u8 = 0;
+
+    let key = match family {
+        Family::V4 => NFT_CT_DST_IP,
+        Family::V6 => NFT_CT_DST_IP6,
+    };
+    other(
+        "ct",
+        vec![
+            nla(NFTA_CT_DREG, be32(reg.into())),
+            nla(NFTA_CT_KEY, be32(key)),
+            nla(NFTA_CT_DIRECTION, vec![IP_CT_DIR_ORIGINAL]),
+        ],
+    )
+}
+
+/// `dnat <family> to <addr>:<port>`, the address and port taken from
+/// `addr_reg` and `port_reg`.
+pub fn dnat(family: Family, addr: Register, port: Register) -> Expr {
+    const NFTA_NAT_TYPE: u16 = 1;
+    const NFTA_NAT_FAMILY: u16 = 2;
+    const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
+    const NFTA_NAT_REG_ADDR_MAX: u16 = 4;
+    const NFTA_NAT_REG_PROTO_MIN: u16 = 5;
+    const NFTA_NAT_REG_PROTO_MAX: u16 = 6;
+    const NFTA_NAT_FLAGS: u16 = 7;
+    const NFT_NAT_DNAT: u32 = 1;
+
+    other(
+        "nat",
+        vec![
+            nla(NFTA_NAT_TYPE, be32(NFT_NAT_DNAT)),
+            nla(NFTA_NAT_FAMILY, be32(family.nfproto_u32())),
+            nla(NFTA_NAT_REG_ADDR_MIN, be32(addr.into())),
+            nla(NFTA_NAT_REG_ADDR_MAX, be32(addr.into())),
+            nla(NFTA_NAT_REG_PROTO_MIN, be32(port.into())),
+            nla(NFTA_NAT_REG_PROTO_MAX, be32(port.into())),
+            nla(NFTA_NAT_FLAGS, be32(3)),
+        ],
+    )
+}
+
+/// `redirect to <port>`, the port taken from `port_reg`.
+pub fn redirect(port: Register) -> Expr {
+    const NFTA_REDIR_REG_PROTO_MIN: u16 = 1;
+    const NFTA_REDIR_REG_PROTO_MAX: u16 = 2;
+    const NFTA_REDIR_FLAGS: u16 = 3;
+
+    other(
+        "redir",
+        vec![
+            nla(NFTA_REDIR_REG_PROTO_MIN, be32(port.into())),
+            nla(NFTA_REDIR_REG_PROTO_MAX, be32(port.into())),
+            nla(NFTA_REDIR_FLAGS, be32(2)),
+        ],
+    )
+}
+
+/// `masquerade` (or `masquerade fully-random`).
+pub fn masquerade(fully_random: bool) -> Expr {
+    const NFTA_MASQ_FLAGS: u16 = 1;
+    const NF_NAT_RANGE_PROTO_RANDOM_FULLY: u32 = 0x10;
+
+    let attributes = if fully_random {
+        vec![nla(NFTA_MASQ_FLAGS, be32(NF_NAT_RANGE_PROTO_RANDOM_FULLY))]
+    } else {
+        Vec::new()
+    };
+    other("masq", attributes)
+}
+
+/// `update @set { key }`, adding/updating an element from packet data.
+pub fn dynset_update(set: &str, key: Register) -> Expr {
+    const NFTA_DYNSET_SET_NAME: u16 = 1;
+    const NFTA_DYNSET_OP: u16 = 3;
+    const NFTA_DYNSET_SREG_KEY: u16 = 4;
+    const NFTA_DYNSET_TIMEOUT: u16 = 6;
+    const NFTA_DYNSET_FLAGS: u16 = 9;
+    const NFT_DYNSET_OP_UPDATE: u32 = 1;
+
+    let mut name = set.as_bytes().to_vec();
+    name.push(0);
+
+    other(
+        "dynset",
+        vec![
+            nla(NFTA_DYNSET_SET_NAME, name),
+            nla(NFTA_DYNSET_OP, be32(NFT_DYNSET_OP_UPDATE)),
+            nla(NFTA_DYNSET_SREG_KEY, be32(key.into())),
+            nla(NFTA_DYNSET_TIMEOUT, be64(0)),
+            nla(NFTA_DYNSET_FLAGS, be32(0)),
+        ],
+    )
+}
+
+/// `reject with icmp port-unreachable` (v4) / `icmpv6 port-unreachable` (v6),
+/// the family-specific reject nft emits inside an `ip`/`ip6` match.
+pub fn reject_icmp(family: Family) -> Expr {
+    const NFTA_REJECT_TYPE: u16 = 1;
+    const NFTA_REJECT_ICMP_CODE: u16 = 2;
+    const NFT_REJECT_ICMP_UNREACH: u32 = 0;
+
+    let code = match family {
+        Family::V4 => 3,
+        Family::V6 => 4,
+    };
+    other(
+        "reject",
+        vec![
+            nla(NFTA_REJECT_TYPE, be32(NFT_REJECT_ICMP_UNREACH)),
+            nla(NFTA_REJECT_ICMP_CODE, vec![code]),
+        ],
+    )
+}
+
+/// `ip daddr . ip protocol . th dport vmap @map` (IPv4 service dispatch).
+pub fn ip_daddr_ip_proto_dport_vmap(map: &str) -> Vec<Expr> {
+    let mut c = Concat::default();
+    let daddr = c.add(4);
+    let proto = c.add(1);
+    let dport = c.add(2);
+
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, Family::V4.nfproto()),
+        payload(daddr, NETWORK_HEADER, 16, 4),
+        payload(proto, NETWORK_HEADER, 9, 1),
+        payload(dport, TRANSPORT_HEADER, 2, 2),
+        lookup_vmap(Register::Reg1, map),
+    ]
+}
+
+/// `fib daddr type local ip protocol . th dport vmap @map` (NodePort
+/// dispatch; the `fib` guard restricts to locally-destined packets).
+pub fn fib_daddr_local_ip_proto_dport_vmap(map: &str) -> Vec<Expr> {
+    let mut c = Concat::default();
+    let proto = c.add(1);
+    let dport = c.add(2);
+
+    let mut exprs = fib_daddr_type_local(Register::Reg1);
+    exprs.push(meta_nfproto(Register::Reg1));
+    exprs.push(eq(Register::Reg1, Family::V4.nfproto()));
+    exprs.push(payload(proto, NETWORK_HEADER, 9, 1));
+    exprs.push(payload(dport, TRANSPORT_HEADER, 2, 2));
+    exprs.push(lookup_vmap(Register::Reg1, map));
+    exprs
+}
+
+/// `meta nfproto <family> numgen random mod <modulus> vmap @map` (endpoint
+/// selection).
+pub fn numgen_vmap(family: Family, modulus: u32, map: &str) -> Vec<Expr> {
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        numgen_random(Register::Reg1, modulus),
+        lookup_vmap(Register::Reg1, map),
+    ]
+}
+
+/// `ip|ip6 saddr . daddr . ct original <addr> @set masquerade`.
+pub fn ct_masquerade(family: Family, set: &str) -> Vec<Expr> {
+    let (saddr, daddr, len) = match family {
+        Family::V4 => (12, 16, 4),
+        Family::V6 => (8, 24, 16),
+    };
+
+    let mut c = Concat::default();
+    let s = c.add(len);
+    let d = c.add(len);
+    let ct = c.add(len);
+
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        payload(s, NETWORK_HEADER, saddr, len),
+        payload(d, NETWORK_HEADER, daddr, len),
+        ct_original_daddr(family, ct),
+        lookup_set(Register::Reg1, set),
+        masquerade(false),
+    ]
+}
+
+/// `meta mark & <mask> == 0`.
+pub fn mark_and_eq_zero(reg: Register, mask: u32) -> Vec<Expr> {
+    vec![
+        meta(MetaKey::Mark, reg),
+        bitwise_and(reg, 4, ne32(mask)),
+        eq(reg, vec![0u8; 4]),
+    ]
+}
+
+/// `meta mark set meta mark ^ <mask>`.
+pub fn mark_xor(reg: Register, mask: u32) -> Vec<Expr> {
+    vec![
+        meta(MetaKey::Mark, reg),
+        bitwise_xor(reg, 4, ne32(mask)),
+        meta_store(MetaKey::Mark, reg),
+    ]
+}
+
+/// The address a `dnat`/`redirect` statement targets.
+pub enum Dnat {
+    /// `redirect to <port>` (the endpoint is on this node).
+    Redirect(u16),
+    /// `mark set mark | <mark> dnat to <ip>:<port>` (the endpoint is remote).
+    Masquerade { ip: IpAddr, port: u16, mark: u32 },
+}
+
+/// `[fib daddr type local] meta nfproto <family> <proto> dport <port>` followed
+/// by the `redirect`/`dnat` statement of `target`.
+pub fn dnat_rule(family: Family, proto: u8, port: u16, node_port: bool, target: Dnat) -> Vec<Expr> {
+    let mut exprs = Vec::new();
+    if node_port {
+        exprs.extend(fib_daddr_type_local(Register::Reg1));
+    }
+    exprs.push(meta_nfproto(Register::Reg1));
+    exprs.push(eq(Register::Reg1, family.nfproto()));
+    exprs.push(meta(MetaKey::L4Proto, Register::Reg1));
+    exprs.push(eq(Register::Reg1, vec![proto]));
+    exprs.push(payload(Register::Reg1, TRANSPORT_HEADER, 2, 2));
+    exprs.push(eq(Register::Reg1, port.to_be_bytes().to_vec()));
+
+    match target {
+        Dnat::Redirect(target) => {
+            exprs.push(load_immediate(
+                Register::Reg1,
+                target.to_be_bytes().to_vec(),
+            ));
+            exprs.push(redirect(Register::Reg1));
+        }
+        Dnat::Masquerade { ip, port, mark } => {
+            exprs.push(meta(MetaKey::Mark, Register::Reg1));
+            exprs.push(bitwise_or(Register::Reg1, 4, ne32(mark)));
+            exprs.push(meta_store(MetaKey::Mark, Register::Reg1));
+            exprs.push(load_immediate(Register::Reg1, ip_bytes(ip)));
+            exprs.push(load_immediate(Register::Reg2, port.to_be_bytes().to_vec()));
+            exprs.push(dnat(family, Register::Reg1, Register::Reg2));
+        }
+    }
+    exprs
+}
+
+fn ip_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+/// `meta nfproto <family> reject` — a family-specific reject for a chain that
+/// has no endpoints of that family.
+pub fn nfproto_reject(family: Family) -> Vec<Expr> {
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        reject_icmp(family),
+    ]
+}
+
+/// `ip|ip6 saddr . <addr> @set goto <chain>` — the session-affinity match that
+/// pins a client to an endpoint.
+pub fn affinity_goto(family: Family, set: &str, addr: IpAddr, chain: &str) -> Vec<Expr> {
+    let (offset, len) = match family {
+        Family::V4 => (12, 4),
+        Family::V6 => (8, 16),
+    };
+
+    let mut c = Concat::default();
+    let saddr = c.add(len);
+    let addr_reg = c.add(len);
+
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        payload(saddr, NETWORK_HEADER, offset, len),
+        load_immediate(addr_reg, ip_bytes(addr)),
+        lookup_set(Register::Reg1, set),
+        goto(chain),
+    ]
+}
+
+/// `update @set { ip|ip6 saddr . <addr> }` — records the client/endpoint pair
+/// in the session-affinity set.
+pub fn affinity_update(family: Family, set: &str, addr: IpAddr) -> Vec<Expr> {
+    let (offset, len) = match family {
+        Family::V4 => (12, 4),
+        Family::V6 => (8, 16),
+    };
+
+    let mut c = Concat::default();
+    let saddr = c.add(len);
+    let addr_reg = c.add(len);
+
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        payload(saddr, NETWORK_HEADER, offset, len),
+        load_immediate(addr_reg, ip_bytes(addr)),
+        dynset_update(set, Register::Reg1),
     ]
 }
 
