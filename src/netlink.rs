@@ -5,9 +5,10 @@ use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable,
 };
 use netlink_proto::{ConnectionHandle, Error, new_connection, sys::AsyncSocket, sys::SocketAddr};
-use nix::sys::socket::{getsockopt, sockopt};
+use nix::sys::socket::{getsockopt, setsockopt, sockopt};
 use std::fmt::Debug;
 use std::io;
+use std::os::fd::AsFd;
 
 pub mod netfilter;
 pub mod wireguard;
@@ -16,18 +17,41 @@ pub mod wireguard;
 /// (`sk_sndbuf - 32` in `netlink_sendmsg`) plus a small headroom.
 const SNDBUF_MARGIN: usize = 32 + 1024;
 
-/// Upper bound on the derived batch size, so a host with a huge `SO_SNDBUF`
-/// does not create datagrams larger than necessary (they must be copied through
-/// the socket anyway).
-const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// nft's batch page size (`BATCH_PAGE_SIZE` in `nftables/src/mnl.c`).
+///
+/// nft sizes a batch in pages of this size and raises the socket send buffer to
+/// `pages * BATCH_PAGE_SIZE` before sending (`mnl_set_sndbuffer`). We raise
+/// `SO_SNDBUF` to one page and cap a datagram at one page; larger streams are
+/// split across transactions as before.
+const BATCH_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// Conservative fallback when `SO_SNDBUF` cannot be read.
 const FALLBACK_BATCH_BYTES: usize = 132 * 1024;
 
 /// The datagram cap derived from the socket's real send buffer, with the
-/// kernel's own accounting and a small headroom subtracted, bounded above.
+/// kernel's own accounting and a small headroom subtracted, bounded by one nft
+/// batch page.
 fn batch_bytes_for(sndbuf: usize) -> usize {
-    sndbuf.saturating_sub(SNDBUF_MARGIN).min(MAX_BATCH_BYTES)
+    sndbuf.saturating_sub(SNDBUF_MARGIN).min(BATCH_PAGE_SIZE)
+}
+
+/// Raise the socket's send buffer to at least `target`.
+///
+/// Mirrors nft's `mnl_set_sndbuffer`: leave the buffer alone when the current
+/// value already suffices, otherwise prefer `SO_SNDBUFFORCE` (which ignores
+/// `net.core.wmem_max` and needs `CAP_NET_ADMIN`) and fall back to `SO_SNDBUF`.
+fn raise_sndbuf(socket: &impl AsFd, target: usize) {
+    if let Ok(cur) = getsockopt(socket, sockopt::SndBuf)
+        && cur >= target
+    {
+        return;
+    }
+
+    if let Err(force) = setsockopt(socket, sockopt::SndBufForce, &target)
+        && let Err(err) = setsockopt(socket, sockopt::SndBuf, &target)
+    {
+        warn!("failed to raise netlink SO_SNDBUF to {target}: {err} (force: {force})");
+    }
 }
 
 /// Iterator splitting messages into datagrams bounded by their cumulative
@@ -91,9 +115,10 @@ fn batches<T: NetlinkSerializable>(
 /// A netlink connection together with the derived maximum datagram size.
 ///
 /// The connection runs on a spawned task; this type only keeps the handle and
-/// the destination. The maximum datagram size is read from the socket's real
-/// `SO_SNDBUF` at creation, since `netlink_sendmsg` rejects any datagram larger
-/// than `sk_sndbuf - 32` with `EMSGSIZE` (fatal to the whole connection).
+/// the destination. At creation the socket's `SO_SNDBUF` is raised to one nft
+/// batch page (`mnl_set_sndbuffer`), and the maximum datagram size is read back
+/// from it: `netlink_sendmsg` rejects any datagram larger than `sk_sndbuf - 32`
+/// with `EMSGSIZE` (fatal to the whole connection).
 pub struct Netlink<T: Debug> {
     handle: ConnectionHandle<T>,
     dest: SocketAddr,
@@ -107,6 +132,10 @@ where
     /// Open a netlink connection for `protocol` and spawn its task.
     pub fn new(protocol: isize) -> io::Result<Self> {
         let (mut conn, handle, _) = new_connection::<T>(protocol)?;
+
+        // size the send buffer like nft (`mnl_set_sndbuffer`) before handing the
+        // connection to the task, then read the value it ended up with
+        raise_sndbuf(conn.socket_mut().socket_ref(), BATCH_PAGE_SIZE);
 
         // read the real send buffer before handing the connection to the task
         let max_batch_bytes = match getsockopt(conn.socket_mut().socket_ref(), sockopt::SndBuf) {
@@ -292,8 +321,13 @@ mod tests {
     fn sndbuf_cap_derivation() {
         // a typical default: 208 KiB -> margin applied
         assert_eq!(batch_bytes_for(212_992), 212_992 - (32 + 1024));
-        // never above the ceiling
-        assert_eq!(batch_bytes_for(64 * 1024 * 1024), MAX_BATCH_BYTES);
+        // one nft batch page, minus the kernel's accounting and headroom
+        assert_eq!(
+            batch_bytes_for(BATCH_PAGE_SIZE),
+            BATCH_PAGE_SIZE - (32 + 1024)
+        );
+        // never above one nft batch page
+        assert_eq!(batch_bytes_for(64 * 1024 * 1024), BATCH_PAGE_SIZE);
         // saturates at zero for tiny values
         assert_eq!(batch_bytes_for(16), 0);
     }
