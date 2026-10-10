@@ -15,7 +15,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use super::{Message, nft_header};
+use super::{Message, nft_header, userdata};
 
 /// A named set of single keys.
 pub type SimpleSet<'t, T> = Set<'t, T>;
@@ -681,7 +681,18 @@ impl<'t> Raw<'t> {
             attrs.push(SetAttribute::Flags(self.flags));
         }
         if let Some(comment) = self.comment {
-            attrs.push(SetAttribute::UserData(set_comment(comment)));
+            // `nft` writes a set's `typeof` annotation and its comment into a
+            // single `NFTA_SET_USERDATA` stream, the comment last. Fold it into
+            // the annotation a set attribute may already carry rather than
+            // emitting a second attribute (the kernel keeps only one).
+            let tlv = userdata::comment_tlv(comment);
+            match attrs.iter_mut().find_map(|attr| match attr {
+                SetAttribute::UserData(bytes) => Some(bytes),
+                _ => None,
+            }) {
+                Some(bytes) => bytes.extend_from_slice(&tlv),
+                None => attrs.push(SetAttribute::UserData(tlv)),
+            }
         }
 
         let msg = NfTablesMessage::NewSet(SetMessage { attributes: attrs });
@@ -744,22 +755,6 @@ where
         buf: Vec::new(),
         bytes: 0,
     }
-}
-
-/// `NFTNL_UDATA_SET_COMMENT`: nft's userdata type for a set comment.
-const UDATA_SET_COMMENT: u8 = 7;
-
-/// Encodes `comment` as nft's userdata for `NFTA_SET_USERDATA`: a TLV of
-/// `[type: u8][len: u8][string with trailing NUL]`, as `nftnl_udata_put_strz`
-/// writes it.
-fn set_comment(comment: &str) -> Vec<u8> {
-    let bytes = comment.as_bytes();
-    let mut udata = Vec::with_capacity(bytes.len() + 3);
-    udata.push(UDATA_SET_COMMENT);
-    udata.push((bytes.len() + 1) as u8);
-    udata.extend_from_slice(bytes);
-    udata.push(0); // strz
-    udata
 }
 
 fn fill_msgs<'a, T, I>(
@@ -974,7 +969,10 @@ mod tests {
     where
         T: Elem,
     {
-        let msg = test_set::<T>().create(None);
+        new_set_attrs_of(test_set::<T>().create(None))
+    }
+
+    fn new_set_attrs_of(msg: Message) -> Vec<SetAttribute> {
         let NetlinkPayload::InnerMessage(NetfilterMessage {
             inner: NetfilterMessageInner::NfTables(NfTablesMessage::NewSet(m)),
             ..
@@ -1127,6 +1125,46 @@ mod tests {
             elems,
             vec![(vec![10, 0, 0, 1], SetElementFlags::empty(), false)]
         );
+    }
+
+    /// The `NFTA_SET_USERDATA` blobs of a `NewSet`'s attributes.
+    fn userdata_attrs(attrs: &[SetAttribute]) -> Vec<&[u8]> {
+        attrs
+            .iter()
+            .filter_map(|a| match a {
+                SetAttribute::UserData(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comment_folds_into_existing_userdata() {
+        // A set already carrying userdata (e.g. a `typeof` annotation) and a
+        // comment ends up with a single `NFTA_SET_USERDATA`, comment last.
+        let annotation = userdata::SetUdata::new()
+            .key_byte_order(userdata::ByteOrder::HostEndian)
+            .build();
+        let attrs = new_set_attrs_of(
+            Raw {
+                table: "t",
+                name: "s".into(),
+                id: 1,
+                flags: SetFlags::empty(),
+                attributes: &[SetAttribute::UserData(annotation.clone())],
+                comment: Some("hello"),
+            }
+            .create(),
+        );
+
+        let udata = userdata_attrs(&attrs);
+        let mut expected = annotation;
+        expected.extend(userdata::comment_tlv("hello"));
+        assert_eq!(udata, vec![expected.as_slice()]);
+
+        // A comment-only set still gets its own (comment) userdata blob.
+        let attrs = new_set_attrs_of(test_set::<Ipv4Addr>().create(Some("hello".into())));
+        assert_eq!(userdata_attrs(&attrs), vec![&b"\x07\x06hello\x00"[..]]);
     }
 
     /// Extracts the `(key, data)` attributes of the first element produced.

@@ -126,6 +126,14 @@ const TYPE_INTEGER: u32 = 4;
 /// The metadata of a per-service endpoint dispatch map: keyed by the `numgen`
 /// result (`typeof numgen random mod 1 : verdict`).
 fn dispatch_map_meta() -> SetMeta {
+    let udata = userdata::SetUdata::new()
+        .key_byte_order(userdata::ByteOrder::HostEndian)
+        .data_byte_order(userdata::ByteOrder::Invalid)
+        .key_typeof(userdata::Typeof::numgen_random(1))
+        .data_typeof(userdata::Typeof::Verdict)
+        .data_interval(false)
+        .build();
+
     SetMeta {
         flags: SetFlags::Map,
         attributes: vec![
@@ -133,7 +141,7 @@ fn dispatch_map_meta() -> SetMeta {
             SetAttribute::KeyLen(4),
             SetAttribute::DataType(NFT_DATA_VERDICT),
             SetAttribute::DataLen(16),
-            SetAttribute::UserData(userdata::numgen_verdict_map(1)),
+            SetAttribute::UserData(udata),
         ],
         comment: None,
     }

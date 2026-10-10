@@ -21,10 +21,11 @@ netlink, captured with a throwaway dumper) and are now pinned by the goldens:
   unnameable (renders as `type 0`), `mark` renders hex, and `gid`/`uid`/`realm`/
   `classid`/`nf_proto`/… reject a `numgen` key (datatype mismatch) — so the
   `typeof` annotation is the only way to get a decimal integer key, carried in
-  `NFTA_SET_USERDATA`. `nftables/userdata.rs` *builds* that TLV tree from
-  `#[repr]` enums mirroring the nft/libnftnl ones (`SetUdata`, `TypeofUdata`,
-  `NumgenUdata`, `ExprType`, `NgType`, `ByteOrder`) rather than hardcoding
-  bytes; a unit test pins it against the captured dump.
+  `NFTA_SET_USERDATA`. `nftables/userdata.rs` builds that TLV tree with a
+  `UdataBuf` (mirroring libnftnl's `nftnl_udata_buf`) and a typed `SetUdata`
+  builder, over `#[repr]` enums mirroring the nft/libnftnl ones (`SetAttr`,
+  `TypeofAttr`, `NumgenAttr`, `ExprType`, `NgType`, `ByteOrder`) rather than
+  hardcoding bytes; unit tests pin it against the captured dump.
 - An affinity set referenced by an `update` rule must be created with
   `NFT_SET_EVAL` (`dynamic`); nft normally adds it while parsing the script.
   It is only added when the map's family has at least one endpoint.
