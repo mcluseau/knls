@@ -1,0 +1,66 @@
+# A named port resolves against the *destination* pod: with two selected pods
+# exposing the same named port on different container ports, each pod IP is
+# paired with its own port (`10.0.0.1 . tcp . 80`, `10.0.0.2 . tcp . 8080`),
+# rather than the union of the two ports.
+- !ingest
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: x1, namespace: x, labels: { app: a } }
+      spec:
+        nodeName: n1
+        containers:
+          - name: c
+            ports:
+              - { name: serve-80-tcp, containerPort: 80, protocol: TCP }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: x2, namespace: x, labels: { app: a } }
+      spec:
+        nodeName: n1
+        containers:
+          - name: c
+            ports:
+              - { name: serve-80-tcp, containerPort: 8080, protocol: TCP }
+      status: { podIPs: [{ ip: 10.0.0.2 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: np, namespace: x }
+      spec:
+        podSelector: { matchLabels: { app: a } }
+        policyTypes: [Ingress]
+        ingress:
+          - ports:
+              - { protocol: TCP, port: serve-80-tcp }
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_x_x1, 10.0.0.2 : goto ingress_pod_x_x2 }
+    }
+
+    chain ingress_netpol_x_np {
+    	ip daddr . meta l4proto . th dport { 10.0.0.1 . tcp . 80, 10.0.0.2 . tcp . 8080 } accept
+    }
+
+    chain ingress_pod_x_x1 {
+    	jump ingress_netpol_x_np
+    	reject
+    }
+
+    chain ingress_pod_x_x2 {
+    	jump ingress_netpol_x_np
+    	reject
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ct state established,related accept
+    	ip daddr vmap @pods_ingress
+    }

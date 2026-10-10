@@ -1,0 +1,59 @@
+# A peer with a `podSelector` and no `namespaceSelector` is scoped to the
+# policy's namespace: the peer set must only contain same-namespace pods.
+- !ingest
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: x1, namespace: x, labels: { app: b } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: x2, namespace: x, labels: { app: a } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.2 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: y1, namespace: y, labels: { app: b } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.3 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: np, namespace: x }
+      spec:
+        podSelector: { matchLabels: { app: a } }
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector: { matchLabels: { app: b } }
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    set np_x_np_i_1_pods_v4 {
+    	type ipv4_addr
+    	elements = { 10.0.0.1 }
+    }
+
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.2 : goto ingress_pod_x_x2 }
+    }
+
+    chain ingress_netpol_x_np {
+    	ip saddr @np_x_np_i_1_pods_v4 accept
+    }
+
+    chain ingress_pod_x_x2 {
+    	jump ingress_netpol_x_np
+    	reject
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ct state established,related accept
+    	ip daddr vmap @pods_ingress
+    }

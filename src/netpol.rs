@@ -3,7 +3,7 @@ pub mod nftables;
 use crate::{
     memstore::KeyValueFrom,
     selector::Selector,
-    state::{Pod, keys},
+    state::{Pod, Protocol, keys},
 };
 
 use cidr::IpCidr;
@@ -46,56 +46,44 @@ impl RejectAction {
     }
 }
 
-/// A layer-4 protocol a netpol may constrain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum L4Proto {
-    Tcp,
-    Udp,
-    Sctp,
-}
-
-impl L4Proto {
-    /// The IP protocol number (`IPPROTO_*`).
-    pub fn ip_proto(&self) -> u8 {
-        match self {
-            Self::Tcp => 6,
-            Self::Udp => 17,
-            Self::Sctp => 132,
-        }
-    }
-}
-
-impl TryFrom<Option<&str>> for L4Proto {
-    type Error = eyre::Error;
-
-    fn try_from(protocol: Option<&str>) -> Result<Self> {
-        match protocol.unwrap_or("TCP").to_lowercase().as_str() {
-            "tcp" => Ok(Self::Tcp),
-            "udp" => Ok(Self::Udp),
-            "sctp" => Ok(Self::Sctp),
-            other => Err(eyre!("unsupported protocol {other:?}")),
-        }
-    }
-}
-
 /// A pre-parsed [`NetworkPolicyPort`].
-///
-/// `port` is `None` for an any-port match (only the protocol is constrained).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyPort {
-    proto: L4Proto,
-    port: Option<RangeInclusive<u16>>,
+    proto: Protocol,
+    port: PortSelect,
+}
+
+/// The port selector of a [`PolicyPort`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PortSelect {
+    /// Any port (only the protocol is constrained).
+    Any,
+    /// An inclusive numeric range.
+    Range(RangeInclusive<u16>),
+    /// A named container port, resolved against the pods at render time.
+    Named(String),
 }
 
 impl PolicyPort {
     /// The constrained protocol.
-    pub fn proto(&self) -> L4Proto {
+    pub fn proto(&self) -> Protocol {
         self.proto
     }
 
-    /// The constrained port range, or `None` for an any-port match.
+    /// The constrained numeric port range, if any.
     pub fn port(&self) -> Option<&RangeInclusive<u16>> {
-        self.port.as_ref()
+        match &self.port {
+            PortSelect::Range(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The named port, if any.
+    pub fn named(&self) -> Option<&str> {
+        match &self.port {
+            PortSelect::Named(name) => Some(name),
+            _ => None,
+        }
     }
 }
 
@@ -103,17 +91,15 @@ impl TryFrom<&NetworkPolicyPort> for PolicyPort {
     type Error = eyre::Error;
 
     fn try_from(port: &NetworkPolicyPort) -> Result<Self> {
-        let proto = L4Proto::try_from(port.protocol.as_deref())?;
+        let proto = Protocol::try_from(&port.protocol)?;
 
         let port = match port.port.as_ref() {
-            None => None,
-            Some(IntOrString::String(name)) => {
-                return Err(eyre!("named port {name:?} is not supported"));
-            }
+            None => PortSelect::Any,
+            Some(IntOrString::String(name)) => PortSelect::Named(name.clone()),
             Some(IntOrString::Int(start)) => {
                 let start = *start as u16;
                 let end = port.end_port.map_or(start, |end| end as u16);
-                Some(start..=end)
+                PortSelect::Range(start..=end)
             }
         };
 

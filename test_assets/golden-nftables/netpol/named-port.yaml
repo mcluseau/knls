@@ -1,0 +1,50 @@
+# A NetworkPolicy named port resolves to the matching named container port
+# (`serve-80-tcp` -> tcp/80) of the selected pods.
+- !ingest
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: x1, namespace: x, labels: { app: a } }
+      spec:
+        nodeName: n1
+        containers:
+          - name: c
+            ports:
+              - { name: serve-80-tcp, containerPort: 80, protocol: TCP }
+              - { name: serve-81-tcp, containerPort: 81, protocol: TCP }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: np, namespace: x }
+      spec:
+        podSelector: { matchLabels: { app: a } }
+        policyTypes: [Ingress]
+        ingress:
+          - ports:
+              - { protocol: TCP, port: serve-80-tcp }
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_x_x1 }
+    }
+
+    chain ingress_netpol_x_np {
+    	ip daddr . meta l4proto . th dport { 10.0.0.1 . tcp . 80 } accept
+    }
+
+    chain ingress_pod_x_x1 {
+    	jump ingress_netpol_x_np
+    	reject
+    }
+
+    chain pods_filter {
+    	type filter hook forward priority filter; policy accept;
+    	ct state established,related accept
+    	ip daddr vmap @pods_ingress
+    }

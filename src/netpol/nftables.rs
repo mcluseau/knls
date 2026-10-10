@@ -8,6 +8,7 @@ use crate::{
         set::{Data, Verdict},
         table_sync::{BaseChain, ChainSync, SetSync, TableState, TableSync},
     },
+    selector::Selector,
     state::{Namespace, Pod},
 };
 use cidr::IpCidr;
@@ -204,11 +205,20 @@ impl<'t> Builder<'t> {
                 continue;
             }
 
+            // A named port in an ingress rule is a container port of a *target*
+            // pod, so named-port resolution needs the policy's selected pods.
+            let target_pods: Vec<&Pod> = (state.pods.iter())
+                .filter(|(k, p)| np.matches_pod(k, p))
+                .map(|(_, p)| p)
+                .collect();
+
             if np.is_ingress() {
                 let chain = format!("ingress_netpol_{ns}_{name}");
                 let (rules, anon_sets) = {
                     let mut helper = Helper {
                         state,
+                        policy_ns: ns,
+                        target_pods: &target_pods,
                         named: &mut self.sets,
                         prefix: format!("np_{ns}_{name}_i"),
                         idx: 0,
@@ -229,6 +239,8 @@ impl<'t> Builder<'t> {
                 let (rules, anon_sets) = {
                     let mut helper = Helper {
                         state,
+                        policy_ns: ns,
+                        target_pods: &target_pods,
                         named: &mut self.sets,
                         prefix: format!("np_{ns}_{name}_e"),
                         idx: 0,
@@ -318,6 +330,12 @@ fn action_rule(pod: &Pod, annotation: &str, default: RejectAction) -> Rule {
 /// sets.
 struct Helper<'a> {
     state: &'a State,
+    /// The namespace of the policy being rendered; a peer without a
+    /// `namespaceSelector` is scoped to it.
+    policy_ns: &'a str,
+    /// The pods the policy selects: a named port in an *ingress* rule is a
+    /// container port of one of these (the traffic's destination).
+    target_pods: &'a [&'a Pod],
     /// Named peer sets, added to the table.
     named: &'a mut BTreeMap<String, SetSync>,
     prefix: String,
@@ -328,7 +346,14 @@ struct Helper<'a> {
     anon: Vec<SetSync>,
 }
 
-impl Helper<'_> {
+/// A peer clause: its address family (for pairing with a named-port predicate;
+/// `None` when the rule matches any peer) and its expressions.
+type Clause = (Option<Family>, Vec<Expr>);
+
+/// A rule's peer clauses and the pods its selector peers matched.
+type Peers<'a> = (Vec<Clause>, Vec<&'a Pod>);
+
+impl<'a> Helper<'a> {
     /// Registers a fresh anonymous set and returns its position, which a rule
     /// references via [`rules::lookup_anon`].
     fn push_anon(&mut self, mut set: SetSync) -> u32 {
@@ -371,11 +396,28 @@ impl Helper<'_> {
     fn rule(&mut self, rule: &PolicyRule, dir: Dir) -> Vec<Rule> {
         self.idx += 1;
 
-        let peer_clauses = self.peers(dir, rule.peers());
+        let (peer_clauses, peer_pods) = self.peers(dir, rule.peers());
+        // A named port is a container port of the traffic's *destination*: the
+        // target pod for ingress, the peer pod for egress. With no peer
+        // specified, an egress rule allows any destination, so resolve against
+        // every pod. Only a named port reads this, so the (possibly large)
+        // every-pod set is built lazily.
+        let has_named = rule.ports().iter().any(|p| p.named().is_some());
+        let all_pods: Vec<&Pod>;
+        let dst_pods: &[&Pod] = if dir == Dir::Src {
+            self.target_pods
+        } else if !rule.peers().is_empty() {
+            &peer_pods
+        } else if has_named {
+            all_pods = (self.state.pods.iter()).map(|(_, pod)| pod).collect();
+            &all_pods
+        } else {
+            &[]
+        };
 
         let mut out = Vec::new();
-        for clause in &peer_clauses {
-            for mut pred in self.port_preds(rule.ports()) {
+        for (family, clause) in &peer_clauses {
+            for mut pred in self.port_preds(rule.ports(), *family, dst_pods) {
                 pred.extend(clause.iter().cloned());
                 pred.push(rules::accept());
                 out.push(pred);
@@ -387,94 +429,184 @@ impl Helper<'_> {
     /// One predicate per port alternative; no ports (or none specified) matches
     /// all, as an empty predicate.
     ///
-    /// The specific port/range alternatives become a fresh anonymous
-    /// `inet_proto . inet_service` concat set (printed inline by nft). An
+    /// The numeric/range alternatives become a fresh anonymous
+    /// `inet_proto . inet_service` concat set (printed inline by nft); an
     /// alternative without a port is a full `0-65535` range so it can join the
-    /// same set, rather than a separate protocol-only predicate.
-    fn port_preds(&mut self, ports: &[PolicyPort]) -> Vec<Vec<Expr>> {
+    /// same set, rather than a separate protocol-only predicate. A *named*
+    /// alternative is resolved against the destination pods and becomes an
+    /// `inet_family . inet_proto . inet_service` set (`<daddr> . <proto> .
+    /// <port>`), so each pod is matched on its own container port. `family`
+    /// restricts the address family to the peer clause's (or both when the rule
+    /// applies to any peer).
+    fn port_preds(
+        &mut self,
+        ports: &[PolicyPort],
+        family: Option<Family>,
+        dst_pods: &[&Pod],
+    ) -> Vec<Vec<Expr>> {
         if ports.is_empty() {
             return vec![Vec::new()];
         }
 
-        let mut ranges: Vec<RangeInclusive<(u8, u16)>> = Vec::with_capacity(ports.len());
+        let mut out = Vec::new();
 
+        // the numeric/range alternatives share one family-agnostic concat set
+        let mut numeric: Vec<RangeInclusive<(u8, u16)>> = Vec::new();
         for port in ports {
-            let proto = port.proto().ip_proto();
+            if port.named().is_some() {
+                continue;
+            }
+            let ip_proto = port.proto().ip_proto();
             match port.port() {
-                // any port: the full range
-                None => ranges.push((proto, 0)..=(proto, u16::MAX)),
-                Some(port) => {
-                    ranges.push((proto, port.start().to_owned())..=(proto, port.end().to_owned()));
-                }
+                Some(range) => numeric.push((ip_proto, *range.start())..=(ip_proto, *range.end())),
+                None => numeric.push((ip_proto, 0)..=(ip_proto, u16::MAX)),
             }
         }
-
-        let index = self.push_anon_ports(ranges);
-        vec![rules::l4proto_dport_anon(index)]
-    }
-
-    /// One clause per peer (OR'd by the caller); none specified matches all.
-    fn peers(&mut self, dir: Dir, peers: &[Peer]) -> Vec<Vec<Expr>> {
-        if peers.is_empty() {
-            return vec![Vec::new()];
+        if !numeric.is_empty() {
+            let index = self.push_anon_ports(numeric);
+            out.push(rules::l4proto_dport_anon(index));
         }
 
-        let mut clauses = Vec::new();
-        let mut ipsv4: Set<Ipv4Addr> = Set::new();
-        let mut ipsv6: Set<Ipv6Addr> = Set::new();
-
-        for peer in peers {
-            match peer {
-                Peer::IpBlock { cidr, except } => {
-                    // match the block's prefix inline, then exclude the `except`
-                    // ranges via an anonymous interval set (`!= { … }`)
-                    let mut clause = ip_prefix_clause(cidr, dir);
-                    clause.extend(self.except_clause(except, dir));
-                    clauses.push(clause);
-                }
-                Peer::Selector { namespace, pod } => {
-                    let ns_filter: Option<Set<&str>> = namespace.as_ref().map(|sel| {
-                        (self.state.nses.iter())
-                            .filter(|(_, ns)| sel.matches(&ns.labels))
-                            .map(|(ns, _)| ns.as_str())
-                            .collect()
-                    });
-
-                    for (key, pod_state) in self.state.pods.iter() {
-                        if let Some(ref ns_filter) = ns_filter
-                            && !ns_filter.contains(key.namespace.as_str())
-                        {
-                            continue;
+        // each named alternative resolves per `(destination pod IP, container
+        // port)`; an unresolvable name contributes nothing (fails closed)
+        let families: &[Family] = match family {
+            Some(Family::V4) => &[Family::V4],
+            Some(Family::V6) => &[Family::V6],
+            None => &[Family::V4, Family::V6],
+        };
+        for port in ports {
+            let Some(name) = port.named() else { continue };
+            let proto = port.proto();
+            let ip_proto = proto.ip_proto();
+            for &family in families {
+                match family {
+                    Family::V4 => {
+                        let mut ranges = Vec::new();
+                        for pod in dst_pods {
+                            for (n, p, num) in &pod.ports {
+                                if n == name && *p == proto {
+                                    for ip in &pod.ipsv4 {
+                                        ranges.push((*ip, ip_proto, *num)..=(*ip, ip_proto, *num));
+                                    }
+                                }
+                            }
                         }
-
-                        if let Some(filter) = pod
-                            && !filter.matches(&pod_state.labels)
-                        {
-                            continue;
+                        if !ranges.is_empty() {
+                            let index = self.push_anon(SetSync::interval(ranges, None));
+                            out.push(rules::addr_l4proto_dport_anon(Family::V4, index));
                         }
-
-                        ipsv4.extend(&pod_state.ipsv4);
-                        ipsv6.extend(&pod_state.ipsv6);
+                    }
+                    Family::V6 => {
+                        let mut ranges = Vec::new();
+                        for pod in dst_pods {
+                            for (n, p, num) in &pod.ports {
+                                if n == name && *p == proto {
+                                    for ip in &pod.ipsv6 {
+                                        ranges.push((*ip, ip_proto, *num)..=(*ip, ip_proto, *num));
+                                    }
+                                }
+                            }
+                        }
+                        if !ranges.is_empty() {
+                            let index = self.push_anon(SetSync::interval(ranges, None));
+                            out.push(rules::addr_l4proto_dport_anon(Family::V6, index));
+                        }
                     }
                 }
             }
         }
 
+        out
+    }
+
+    /// One clause per peer (OR'd by the caller); none specified matches all.
+    ///
+    /// Returns each clause tagged with its address family (for pairing with a
+    /// named-port predicate) plus the pods the selector peers matched (the
+    /// named-port destinations for egress).
+    fn peers(&mut self, dir: Dir, peers: &[Peer]) -> Peers<'a> {
+        if peers.is_empty() {
+            return (vec![(None, Vec::new())], Vec::new());
+        }
+
+        let mut clauses = Vec::new();
+
+        // `ipBlock` peers, in order.
+        for peer in peers {
+            if let Peer::IpBlock { cidr, except } = peer {
+                let family = match cidr {
+                    IpCidr::V4(_) => Family::V4,
+                    IpCidr::V6(_) => Family::V6,
+                };
+                let mut clause = ip_prefix_clause(cidr, dir);
+                clause.extend(self.except_clause(except, dir));
+                clauses.push((Some(family), clause));
+            }
+        }
+
+        // Selector peers, resolved in a single pass over the pods so a pod
+        // matched by several peers is neither duplicated nor dropped. A peer
+        // without a `namespaceSelector` selects the policy's own namespace; an
+        // explicit (even empty) one selects namespaces.
+        let selectors: Vec<(&Option<Selector>, Set<&str>)> = (peers.iter())
+            .filter_map(|peer| match peer {
+                Peer::Selector { namespace, pod } => Some((
+                    pod,
+                    match namespace {
+                        Some(sel) => (self.state.nses.iter())
+                            .filter(|(_, ns)| sel.matches(&ns.labels))
+                            .map(|(ns, _)| ns.as_str())
+                            .collect(),
+                        None => Set::from([self.policy_ns]),
+                    },
+                )),
+                Peer::IpBlock { .. } => None,
+            })
+            .collect();
+
+        let mut pods = Vec::new();
+        let mut ipsv4: Set<Ipv4Addr> = Set::new();
+        let mut ipsv6: Set<Ipv6Addr> = Set::new();
+        for (key, pod_state) in self.state.pods.iter() {
+            let matched = selectors.iter().any(|(pod, ns_filter)| {
+                ns_filter.contains(key.namespace.as_str())
+                    && pod
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches(&pod_state.labels))
+            });
+            if !matched {
+                continue;
+            }
+
+            ipsv4.extend(&pod_state.ipsv4);
+            ipsv6.extend(&pod_state.ipsv6);
+            pods.push(pod_state);
+        }
+
         if !ipsv4.is_empty() {
             let name = format!("{}_{}_pods_v4", self.prefix, self.idx);
             self.push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
-            clauses.push(rules::ip_set(Family::V4, dir, &name, false));
+            clauses.push((
+                Some(Family::V4),
+                rules::ip_set(Family::V4, dir, &name, false),
+            ));
         }
         if !ipsv6.is_empty() {
             let name = format!("{}_{}_pods_v6", self.prefix, self.idx);
             self.push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
-            clauses.push(rules::ip_set(Family::V6, dir, &name, false));
+            clauses.push((
+                Some(Family::V6),
+                rules::ip_set(Family::V6, dir, &name, false),
+            ));
         }
 
         if clauses.is_empty() {
-            vec![Vec::new()] // everything filtered out: match all, safest
+            // Selector peers that matched no pod yield no clause: the caller
+            // then emits no rule at all for this peer list, i.e. it matches
+            // nothing (fails closed) rather than allowing everything.
+            (vec![], pods)
         } else {
-            clauses
+            (clauses, pods)
         }
     }
 
@@ -896,6 +1028,7 @@ mod tests {
             ipsv4: Vec::new(),
             ipsv6: Vec::new(),
             host_network: false,
+            ports: Vec::new(),
         };
         p.annotations.insert(ANN_REJECT.into(), "drop".into());
         let rule = action_rule(&p, ANN_REJECT, RejectAction::Reject);

@@ -409,11 +409,19 @@ impl From<&Option<String>> for TrafficPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum Protocol {
-    TCP,
-    UDP,
-    SCTP,
+    TCP = 6,
+    UDP = 17,
+    SCTP = 132,
+}
+
+impl Protocol {
+    /// The IP protocol number (`IPPROTO_*`).
+    pub fn ip_proto(self) -> u8 {
+        self as u8
+    }
 }
 
 impl TryFrom<&Option<String>> for Protocol {
@@ -600,6 +608,9 @@ pub struct Pod {
     pub ipsv4: Vec<Ipv4Addr>,
     pub ipsv6: Vec<Ipv6Addr>,
     pub host_network: bool,
+    /// Named container ports: `(name, protocol, container port)`, used to
+    /// resolve NetworkPolicy named ports.
+    pub ports: Vec<(String, Protocol, u16)>,
 }
 impl memstore::KeyValueFrom<core::Pod> for Pod {
     type Key = keys::Object;
@@ -639,6 +650,14 @@ impl memstore::KeyValueFrom<core::Pod> for Pod {
             ipsv4,
             ipsv6,
             host_network: spec.host_network.unwrap_or(false),
+            ports: (spec.containers.iter())
+                .flat_map(|c| c.ports.iter().flatten())
+                .filter_map(|p| {
+                    let name = p.name.clone()?;
+                    let proto = Protocol::try_from(&p.protocol).ok()?;
+                    Some((name, proto, p.container_port as u16))
+                })
+                .collect(),
             labels: pod.labels().clone(),
             annotations: Map::from_iter(
                 (pod.annotations().iter())

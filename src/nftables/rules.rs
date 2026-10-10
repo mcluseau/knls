@@ -443,6 +443,32 @@ pub fn l4proto_dport_anon(index: u32) -> Vec<Expr> {
     ]
 }
 
+/// `ip|ip6 daddr . meta l4proto . th dport @anon#index`, a lookup in an
+/// `ipv4_addr|ipv6_addr . inet_proto . inet_service` concat set.
+///
+/// Unlike [`l4proto_dport_anon`], the port is bound to a destination address, so
+/// a named port resolves per destination pod instead of to the union of every
+/// pod's container ports.
+pub fn addr_l4proto_dport_anon(family: Family, index: u32) -> Vec<Expr> {
+    let (daddr_off, daddr_len) = match family {
+        Family::V4 => (16, 4),
+        Family::V6 => (24, 16),
+    };
+    let mut c = Concat::default();
+    let daddr = c.add(daddr_len);
+    let proto = c.add(1);
+    let dport = c.add(2);
+
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        payload(daddr, NETWORK_HEADER, daddr_off, daddr_len),
+        meta(MetaKey::L4Proto, proto),
+        payload(dport, TRANSPORT_HEADER, 2, 2),
+        lookup_anon(Register::Reg1, index),
+    ]
+}
+
 /// `meta l4proto == <proto>`, a protocol-only match (no port constraint).
 ///
 /// A 1-byte compare, as nft emits it.
