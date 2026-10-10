@@ -1,3 +1,4 @@
+use crate::store::IntoKey;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use std::cmp::Ordering;
 use std::fmt;
@@ -125,42 +126,76 @@ where
 }
 
 pub trait WithParent {
-    fn parent(&self) -> String;
+    /// The parent this object belongs to, or `None` when it has none.
+    fn parent(&self) -> Option<String>;
 }
 
-impl<T> From<&T> for ByParent
+impl<T> IntoKey<T> for ByParent
 where
     T: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
     T: WithParent,
 {
-    fn from(v: &T) -> Self {
+    fn into_key(v: &T) -> Option<Self> {
         let k = Obj::from(v);
-        Self::Child {
+        Some(Self::Child {
             parent: Obj {
                 ns: k.ns,
-                name: v.parent(),
+                name: v.parent()?,
             },
             name: k.name,
-        }
+        })
     }
 }
 
 impl WithParent for EndpointSlice {
-    fn parent(&self) -> String {
-        (self.metadata.owner_references.iter().flatten())
-            .find_map(|o| (o.kind == "Service").then_some(o.name.clone()))
-            .or_else(|| {
-                (self.metadata.labels.as_ref())
-                    .and_then(|l| l.get("kubernetes.io/service-name").cloned())
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "EndpointSlice {:?}/{:?} must be owned by a Service",
-                    self.metadata.namespace.as_deref().unwrap_or("?"),
-                    self.metadata.name.as_deref().unwrap_or("?")
-                )
-            })
+    fn parent(&self) -> Option<String> {
+        (self.metadata.labels.as_ref()).and_then(|l| l.get("kubernetes.io/service-name").cloned())
     }
+}
+
+#[test]
+fn endpointslice_parent_resolution() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+
+    fn slice(name: &str, service_label: Option<&str>, owner_kind: Option<&str>) -> EndpointSlice {
+        EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                namespace: Some("ns".into()),
+                labels: service_label
+                    .map(|s| [("kubernetes.io/service-name".to_string(), s.to_string())].into()),
+                owner_references: owner_kind.map(|kind| {
+                    vec![OwnerReference {
+                        api_version: "v1".into(),
+                        kind: kind.into(),
+                        name: "owner".into(),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // the canonical `kubernetes.io/service-name` label is the association
+    let labelled = slice("a", Some("svc"), None);
+    assert_eq!(labelled.parent().as_deref(), Some("svc"));
+    assert!(ByParent::into_key(&labelled).is_some());
+
+    // ownerReferences are not an association, even a Service one
+    let owned = slice("b", None, Some("Service"));
+    assert_eq!(owned.parent(), None);
+    assert!(ByParent::into_key(&owned).is_none());
+
+    // a non-Service owner is not a parent either
+    let other = slice("c", None, Some("ReplicaSet"));
+    assert_eq!(other.parent(), None);
+
+    // no label: skipped, never a panic
+    let bare = slice("d", None, None);
+    assert_eq!(bare.parent(), None);
+    assert!(ByParent::into_key(&bare).is_none());
 }
 
 #[test]

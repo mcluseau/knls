@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::{kube_watch, memstore};
+use crate::{keys::WithParent as _, kube_watch, memstore};
 
 pub mod keys;
 pub mod proxy;
@@ -480,12 +480,7 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
     fn key_from(eps: &discovery::EndpointSlice) -> Option<Self::Key> {
         Some(Self::Key {
             namespace: eps.metadata.namespace.clone()?,
-            service_name: eps
-                .metadata
-                .labels
-                .as_ref()?
-                .get("kubernetes.io/service-name")?
-                .clone(),
+            service_name: eps.parent()?,
             name: eps.metadata.name.clone()?,
         })
     }

@@ -3,6 +3,17 @@ use core::ops::RangeBounds;
 use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map, hash_map::Entry};
 use std::hash::Hash;
 
+/// Fallible conversion of a watched object into a [`Store`] key.
+///
+/// Not every watched object maps to a key — an EndpointSlice without the
+/// `kubernetes.io/service-name` label has no key — so unlike [`Into`] this may
+/// yield `None`; such objects are skipped by [`Store::ingest`].
+pub trait IntoKey<T> {
+    fn into_key(t: &T) -> Option<Self>
+    where
+        Self: Sized;
+}
+
 pub struct Store<K, V> {
     ready: bool,
     map: BTreeMap<K, V>,
@@ -27,9 +38,17 @@ impl<K: Ord, V> Store<K, V> {
     }
 
     /// ingest a watcher event
+    ///
+    /// Objects that do not convert to a key (e.g. an EndpointSlice without the
+    /// `kubernetes.io/service-name` label) are skipped.
+    ///
+    /// This assumes a key, once derivable, stays derivable: a keyless object
+    /// that later gains a key is handled (it is inserted), but a keyed object
+    /// that later loses its key is not (its old entry is left behind, since the
+    /// old key cannot be recovered from the new object).
     pub fn ingest<T>(&mut self, event: &Change<T>)
     where
-        for<'t> &'t T: Into<K>,
+        K: IntoKey<T>,
         for<'t> &'t T: Into<V>,
     {
         use Change::*;
@@ -41,10 +60,14 @@ impl<K: Ord, V> Store<K, V> {
                 self.ready = true;
             }
             InitApply(o) | Apply(o) => {
-                self.map.insert(o.as_ref().into(), o.as_ref().into());
+                if let Some(key) = K::into_key(o.as_ref()) {
+                    self.map.insert(key, o.as_ref().into());
+                }
             }
             Delete(o) => {
-                self.map.remove(&o.as_ref().into());
+                if let Some(key) = K::into_key(o.as_ref()) {
+                    self.map.remove(&key);
+                }
             }
         }
     }
@@ -138,5 +161,45 @@ where
                 self.remove(&o.as_ref().into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// An object whose key conversion can fail, like an EndpointSlice not owned
+    /// by a Service.
+    struct Item(Option<u32>);
+
+    impl IntoKey<Item> for u32 {
+        fn into_key(i: &Item) -> Option<u32> {
+            i.0
+        }
+    }
+
+    impl From<&Item> for u32 {
+        fn from(i: &Item) -> u32 {
+            i.0.unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn ingest_skips_unconvertible() {
+        let mut store: Store<u32, u32> = Store::new();
+
+        store.ingest(&Change::InitApply(Arc::new(Item(Some(1)))));
+        store.ingest(&Change::Apply(Arc::new(Item(Some(2)))));
+        assert_eq!(store.get(&1), Some(&1));
+        assert_eq!(store.get(&2), Some(&2));
+
+        // an unconvertible object is skipped, not inserted
+        store.ingest(&Change::Apply(Arc::new(Item(None))));
+        assert_eq!(store.range(..).count(), 2);
+
+        // deleting an unconvertible object is a no-op
+        store.ingest(&Change::Delete(Arc::new(Item(None))));
+        assert_eq!(store.range(..).count(), 2);
     }
 }
