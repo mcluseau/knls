@@ -55,6 +55,110 @@ fn ready_state() -> crate::state::State {
     state
 }
 
+/// A ready state with one ClusterIP service and the given local endpoint IPs.
+fn state_with_eps(ips: &[&str]) -> crate::state::State {
+    let mut state = crate::state::State::new("n1".into());
+    state.ingest(&Event::MyNode(Change::InitApply(Arc::new(node()))));
+    state.ingest(&Event::MyNode(Change::InitDone));
+    state.ingest(&Event::Service(Change::InitApply(Arc::new(service()))));
+
+    let endpoints: Vec<serde_json::Value> = ips
+        .iter()
+        .map(|ip| {
+            serde_json::json!({
+                "addresses": [ip],
+                "conditions": { "ready": true },
+                "nodeName": "n1",
+            })
+        })
+        .collect();
+    let slice: discovery::EndpointSlice = serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "web-abc",
+            "namespace": "default",
+            "labels": { "kubernetes.io/service-name": "web" },
+        },
+        "addressType": "IPv4",
+        "endpoints": endpoints,
+        "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }],
+    }))
+    .expect("slice");
+
+    state.ingest(&Event::EndpointSlice(Change::InitApply(Arc::new(slice))));
+    state.ingest(&Event::Service(Change::InitDone));
+    state.ingest(&Event::EndpointSlice(Change::InitDone));
+    state
+}
+
+/// The dispatch map's `n -> endpoint chain`, for assertions.
+fn dispatch_map(table: &TableSync) -> std::collections::BTreeMap<u32, String> {
+    let SetSync::VerdictMap(vm) = &table.sets["svc_default_web"] else {
+        panic!("not a verdict map");
+    };
+    vm.entries
+        .iter()
+        .map(|(key, verdict)| {
+            let n = u32::from_ne_bytes(key.as_slice().try_into().expect("4-byte key"));
+            let Verdict::Goto(chain) = verdict else {
+                panic!("not a goto");
+            };
+            (n, chain.clone())
+        })
+        .collect()
+}
+
+/// Adding an endpoint appends a slot and removing one is swap-removed, so
+/// existing endpoints keep their `numgen` index across renders.
+#[test]
+fn dispatch_indices_are_stable_across_renders() {
+    let mut dispatch = DispatchIndices::default();
+    let render_eps = |eps: &[&str], dispatch: &mut DispatchIndices| {
+        let state = state_with_eps(eps);
+        let cfg = proxy::from_state(&state, false).expect("ready");
+        let node = state.my_node.get().expect("node");
+        render(node, &cfg, dispatch)
+    };
+
+    let a = render_eps(&["10.244.0.5", "10.244.0.6"], &mut dispatch);
+    let m = dispatch_map(&a);
+    assert_eq!(
+        m.get(&0).map(String::as_str),
+        Some("svc_default_web_ep_0af40005")
+    );
+    assert_eq!(
+        m.get(&1).map(String::as_str),
+        Some("svc_default_web_ep_0af40006")
+    );
+
+    // adding an endpoint keeps the existing indices and appends the new one
+    let b = render_eps(&["10.244.0.5", "10.244.0.6", "10.244.0.7"], &mut dispatch);
+    let m = dispatch_map(&b);
+    assert_eq!(
+        m.get(&0).map(String::as_str),
+        Some("svc_default_web_ep_0af40005")
+    );
+    assert_eq!(
+        m.get(&1).map(String::as_str),
+        Some("svc_default_web_ep_0af40006")
+    );
+    assert_eq!(
+        m.get(&2).map(String::as_str),
+        Some("svc_default_web_ep_0af40007")
+    );
+
+    // removing the slot-0 endpoint moves the last endpoint into it
+    let c = render_eps(&["10.244.0.6", "10.244.0.7"], &mut dispatch);
+    let m = dispatch_map(&c);
+    assert_eq!(
+        m.get(&0).map(String::as_str),
+        Some("svc_default_web_ep_0af40007")
+    );
+    assert_eq!(
+        m.get(&1).map(String::as_str),
+        Some("svc_default_web_ep_0af40006")
+    );
+}
+
 /// Renders the same state twice: the two `TableSync`s are structurally equal,
 /// and diffing one against the other emits nothing.
 #[test]
@@ -63,8 +167,8 @@ fn render_is_deterministic_and_a_noop_syncs_nothing() {
     let cfg = proxy::from_state(&state, false).expect("ready");
     let node = state.my_node.get().expect("node");
 
-    let a = render(node, &cfg);
-    let b = render(node, &cfg);
+    let a = render(node, &cfg, &mut DispatchIndices::default());
+    let b = render(node, &cfg, &mut DispatchIndices::default());
 
     let prev = a.reference("t");
     assert_eq!(prev, b.reference("t"));
@@ -77,7 +181,11 @@ fn render_is_deterministic_and_a_noop_syncs_nothing() {
 fn render_has_base_chains_and_dispatch() {
     let state = ready_state();
     let cfg = proxy::from_state(&state, false).expect("ready");
-    let table = render(state.my_node.get().expect("node"), &cfg);
+    let table = render(
+        state.my_node.get().expect("node"),
+        &cfg,
+        &mut DispatchIndices::default(),
+    );
 
     for name in [
         "dispatch",
@@ -100,6 +208,7 @@ fn render_has_base_chains_and_dispatch() {
 struct NetlinkSystem {
     state: crate::state::State,
     table: TableState,
+    dispatch: DispatchIndices,
 }
 
 impl test_harness::System for NetlinkSystem {
@@ -107,6 +216,7 @@ impl test_harness::System for NetlinkSystem {
         Self {
             state: crate::state::State::new("n1".into()),
             table: TableState::new(table),
+            dispatch: DispatchIndices::default(),
         }
     }
 
@@ -118,7 +228,7 @@ impl test_harness::System for NetlinkSystem {
         let my_node = self.state.my_node.get().cloned().expect("my node");
         let cfg = proxy::from_state(&self.state, false).expect("state not ready");
         self.table
-            .update(render(&my_node, &cfg))
+            .update(render(&my_node, &cfg, &mut self.dispatch))
             .await
             .expect("apply");
     }

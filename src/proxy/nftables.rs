@@ -46,6 +46,7 @@ const NEED_MASQ_V6: &str = "need_masquerade6";
 pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventReceiver) -> Result<()> {
     let mut table = TableState::new(cfg.table.clone());
     let mut state = State::new(ctx.node_name.clone());
+    let mut dispatch = DispatchIndices::default();
 
     let mut ct_state = conntrack::State::new().await?;
 
@@ -74,7 +75,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             continue;
         };
 
-        if let Err(e) = table.update(render(my_node, &svc)).await {
+        if let Err(e) = table.update(render(my_node, &svc, &mut dispatch)).await {
             error!("proxy table update failed: {e}");
         }
 
@@ -147,9 +148,70 @@ fn dispatch_map_meta() -> SetMeta {
     }
 }
 
+/// Stable `numgen` indices for the per-service endpoint dispatch maps.
+///
+/// The dispatch map is keyed by the `numgen` result (`0..N`), so the index an
+/// endpoint gets is semantically arbitrary — but it must be *stable* across
+/// renders: otherwise adding or removing one endpoint renumbers the rest and
+/// the whole map is rewritten. New endpoints append; a removed endpoint's slot
+/// is filled by the last endpoint (`swap_remove`), so a change touches only a
+/// couple of entries, and slots stay `0..N-1` to match `numgen random mod N`.
+#[derive(Default)]
+pub struct DispatchIndices {
+    /// Per dispatch map name (`svc_{ns}_{name}[_ext]`), the slot assignment.
+    maps: Map<String, Families>,
+}
+
+#[derive(Default)]
+struct Families {
+    v4: Slots,
+    v6: Slots,
+}
+
+#[derive(Default)]
+struct Slots {
+    /// Slot -> endpoint (the forward direction `swap_remove` needs).
+    ips: Vec<IpAddr>,
+    /// Endpoint -> slot.
+    index: Map<IpAddr, u32>,
+}
+
+impl Slots {
+    /// Reconciles the assignment against the endpoints present this render, in
+    /// place: gone endpoints are dropped (the last endpoint replaces each freed
+    /// slot) and new ones are appended, so slots stay `0..N-1`.
+    fn reconcile(&mut self, present: &BTreeSet<IpAddr>) {
+        let mut i = 0;
+        while i < self.ips.len() {
+            if present.contains(&self.ips[i]) {
+                i += 1;
+                continue;
+            }
+
+            self.index.remove(&self.ips[i]);
+            self.ips.swap_remove(i);
+            if i < self.ips.len() {
+                // the former last endpoint moved into the freed slot
+                self.index.insert(self.ips[i], i as u32);
+            }
+            // re-check the moved endpoint at `i`; don't advance
+        }
+
+        for ip in present {
+            if !self.index.contains_key(ip) {
+                self.index.insert(*ip, self.ips.len() as u32);
+                self.ips.push(*ip);
+            }
+        }
+    }
+}
+
 /// Renders the whole proxy table for `cfg` as a target [`TableSync`].
-pub fn render(my_node: &Node, cfg: &proxy::State) -> TableSync {
-    Builder::new(my_node, cfg).build()
+///
+/// `dispatch` is the previous render's endpoint slot assignment, reconciled in
+/// place (see [`DispatchIndices`]).
+pub fn render(my_node: &Node, cfg: &proxy::State, dispatch: &mut DispatchIndices) -> TableSync {
+    Builder::new(my_node, cfg).build(dispatch)
 }
 
 fn proto_num(protocol: Protocol) -> u8 {
@@ -245,18 +307,21 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build(mut self) -> TableSync {
+    fn build(mut self, dispatch: &mut DispatchIndices) -> TableSync {
         self.service_ips_map();
         self.service_nodeports_map();
         self.need_masquerade();
 
         let cfg = self.cfg;
         for (key, svc) in cfg.iter() {
-            self.service(key, svc);
+            self.service(key, svc, dispatch);
         }
 
         self.dispatch();
         self.hooks();
+
+        // drop slot assignments for services that no longer exist
+        dispatch.maps.retain(|name, _| self.sets.contains_key(name));
 
         TableSync {
             chains: self.chains,
@@ -459,10 +524,10 @@ impl<'a> Builder<'a> {
         );
     }
 
-    fn service(&mut self, key: &keys::Object, svc: &proxy::Service) {
-        self.service_slices(key, svc, false, &svc.internal_slices);
+    fn service(&mut self, key: &keys::Object, svc: &proxy::Service, dispatch: &mut DispatchIndices) {
+        self.service_slices(key, svc, false, &svc.internal_slices, dispatch);
         if svc.needs_ext_chain() {
-            self.service_slices(key, svc, true, svc.external_slices());
+            self.service_slices(key, svc, true, svc.external_slices(), dispatch);
         }
     }
 
@@ -474,6 +539,7 @@ impl<'a> Builder<'a> {
         svc: &proxy::Service,
         ext: bool,
         slices: &[LocalEndpointSlice],
+        dispatch: &mut DispatchIndices,
     ) {
         let svc_chain = if ext {
             svc_chain_ext(key, svc)
@@ -503,46 +569,63 @@ impl<'a> Builder<'a> {
             pre_rules.extend(allow_list_rules(&mut anon_sets, allow));
         }
 
-        let mut entries: Vec<(u32, Verdict)> = Vec::new();
-        let mut n4 = 0u32;
-        let mut n6 = 0u32;
-
+        // Per endpoint IP, the union of the target ports over every slice the IP
+        // appears in (an IP may appear in several EndpointSlices, each carrying a
+        // subset of the service ports), plus the set of IPs present per family.
+        let mut targets: Map<IpAddr, Map<String, u16>> = Map::new();
+        let mut present4: BTreeSet<IpAddr> = BTreeSet::new();
+        let mut present6: BTreeSet<IpAddr> = BTreeSet::new();
         for slice in slices {
             for ep in &slice.endpoints {
                 for ip in ep.ips() {
-                    let family = match ip {
-                        IpAddr::V4(_) => Family::V4,
-                        IpAddr::V6(_) => Family::V6,
+                    match ip {
+                        IpAddr::V4(_) => present4.insert(ip),
+                        IpAddr::V6(_) => present6.insert(ip),
                     };
-                    let ep_chain = format!("{svc_chain}_ep_{}", hex::encode(ip_octets(ip)));
-
-                    let mut rules = Vec::new();
-                    if affinity.is_some() {
-                        let aff = affinity_set(key, if family == Family::V4 { '4' } else { '6' });
-                        rules.push(rules::affinity_update(family, &aff, ip));
-                        pre_rules.push(rules::affinity_goto(family, &aff, ip, &ep_chain));
+                    for (name, &target) in &slice.target_ports {
+                        targets
+                            .entry(ip)
+                            .or_default()
+                            .entry(name.clone())
+                            .or_insert(target);
                     }
-
-                    for (port, name) in &svc.ports {
-                        if let Some(&target) = slice.target_ports.get(name) {
-                            rules.push(dnat_rule(ip, port, target, false, &self.my_node.ips));
-                        }
-                    }
-                    for (port, name) in &svc.node_ports {
-                        if let Some(&target) = slice.target_ports.get(name) {
-                            rules.push(dnat_rule(ip, port, target, true, &self.my_node.ips));
-                        }
-                    }
-
-                    self.add_chain(ep_chain.clone(), rules, Vec::new());
-
-                    let n = match family {
-                        Family::V4 => &mut n4,
-                        Family::V6 => &mut n6,
-                    };
-                    entries.push((*n, Verdict::Goto(ep_chain)));
-                    *n += 1;
                 }
+            }
+        }
+
+        // Assign stable slots per family, then emit in slot order so map keys
+        // stay `0..N-1` and match `numgen random mod N`.
+        let families = dispatch.maps.entry(svc_chain.clone()).or_default();
+        families.v4.reconcile(&present4);
+        families.v6.reconcile(&present6);
+        let n4 = families.v4.ips.len() as u32;
+        let n6 = families.v6.ips.len() as u32;
+
+        let mut entries: Vec<(u32, Verdict)> = Vec::new();
+        for (family, slots) in [(Family::V4, &families.v4), (Family::V6, &families.v6)] {
+            for (i, &ip) in slots.ips.iter().enumerate() {
+                let ep_chain = format!("{svc_chain}_ep_{}", hex::encode(ip_octets(ip)));
+
+                let mut rules = Vec::new();
+                if affinity.is_some() {
+                    let aff = affinity_set(key, if family == Family::V4 { '4' } else { '6' });
+                    rules.push(rules::affinity_update(family, &aff, ip));
+                    pre_rules.push(rules::affinity_goto(family, &aff, ip, &ep_chain));
+                }
+
+                for (port, name) in &svc.ports {
+                    if let Some(&target) = targets.get(&ip).and_then(|m| m.get(name)) {
+                        rules.push(dnat_rule(ip, port, target, false, &self.my_node.ips));
+                    }
+                }
+                for (port, name) in &svc.node_ports {
+                    if let Some(&target) = targets.get(&ip).and_then(|m| m.get(name)) {
+                        rules.push(dnat_rule(ip, port, target, true, &self.my_node.ips));
+                    }
+                }
+
+                self.add_chain(ep_chain.clone(), rules, Vec::new());
+                entries.push((i as u32, Verdict::Goto(ep_chain)));
             }
         }
 

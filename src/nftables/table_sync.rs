@@ -768,7 +768,15 @@ impl TableState {
     /// out-of-band edit) is retried as a full recreate. On success `current` is
     /// updated; on failure it is left unset so the next update recreates.
     pub async fn update(&mut self, next: TableSync) -> Result<()> {
-        let nl = netfilter::new_link()?;
+        let nl = match netfilter::new_link() {
+            Ok(nl) => nl,
+            Err(e) => {
+                // can't even reach the kernel: drop the tracked state so the
+                // next update rebuilds from scratch
+                self.current = None;
+                return Err(e.into());
+            }
+        };
 
         let messages = sync(&self.table, self.current.as_ref(), &next);
         if nl.send_as_transactions(messages.into_iter()).await.is_ok() {
