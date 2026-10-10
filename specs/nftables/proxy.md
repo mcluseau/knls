@@ -65,7 +65,9 @@ dynamic sets, verdict maps, concatenated keys).
 - Conntrack cleanup (`src/proxy/conntrack.rs`), which is already netlink-native
   and independent.
 - A kernel-table reader (`from_kernel`) to bootstrap `prev`; `TableState` keeps
-  its own reference. (A follow-up, see `table-sync.md`.)
+  its own reference. This is deliberately dropped, see `table-sync.md`. A
+  failed/out-of-band sync rebuilds from scratch, so the kernel need never be
+  read.
 - Reworking the random-endpoint `numgen` scheme into something simpler. It is
   reproduced as-is first; simplifying is a possible later change.
 

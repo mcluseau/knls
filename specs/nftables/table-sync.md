@@ -8,7 +8,8 @@ Every nftables subsystem today rebuilds its table from scratch on each update:
 
 - `netpol` (`src/netpol/nftables.rs`) emits `table::recreate()` then
   create+fills every set and every chain, every time.
-- `firewall` (`src/firewall.rs`) does the same in three steps.
+- `firewall` (`src/firewall.rs`) does the same in three steps; it is out of
+  scope here (see Non-goals).
 - `proxy` (`src/proxy/nftables.rs`) already tracks changes in userspace
   (`TableTracker` + `change::Tracker`) but renders an nft **script** and pipes
   it to the `nft` binary; it is the only subsystem that does incremental
@@ -32,16 +33,25 @@ handle the "no previous state" (first apply) case.
   flushes/refills, deletes — in an order the kernel accepts (sets before rules
   that reference them, chains before verdict maps that jump to them, etc).
 - Contents stored as raw key/value bytes (`Vec<u8>`), so a set is diffable
-  without knowing its nft type, and the kernel can dump itself into the same
-  shape for a future "adopt existing table" path.
-- Netlink-native (consistent with `src/nftables/`); no `nft` CLI, no script
-  strings.
+  without knowing its nft type.
+- Netlink-native (consistent with `src/nftables/`); the migrated subsystems
+  (`netpol`, `proxy`) use no `nft` CLI and no script strings. `firewall` is a
+  deliberate exception (see Non-goals).
 
 ## Non-goals
 
-- Reading the live kernel table to bootstrap `prev`. `sync` takes `prev` from
-  the caller; the first sync is `sync(table, None, next)` (a full create). A
-  `from_kernel` reader is a possible follow-up, not this spec.
+- Reading the live kernel table to bootstrap `prev` (`from_kernel`). `sync`
+  takes `prev` from the caller; the first sync is `sync(table, None, next)` (a
+  full create). A `from_kernel` reader is deliberately **not** planned: the
+  kernel is never the source of truth, so there is nothing to adopt. A failed
+  incremental sync already rebuilds from scratch (`TableState::update`, see
+  Applying), and a process restart starts from a full create again — either
+  recovers from a bug or an out-of-band edit without reading the kernel.
+- Migrating `firewall` to `TableSync`. `firewall` (`src/firewall.rs`) exists to
+  let the operator write **full nft syntax** as opaque chain rules; parsing that
+  into `rules.rs` builders would only ever be a lossy subset. It keeps its
+  `nftables::apply_script` path (and thus the `nft` CLI). Its sets stay
+  netlink-native; its chains do not.
 - Changing the rule/expression builders (`rules.rs`). The table stores the
   netlink `Message`s those produce.
 - Multi-table management; one `TableSync` and one `sync` call per `inet` table.
@@ -240,11 +250,11 @@ existing builders map onto this directly:
 - `netpol`: `Builder::into_messages` becomes `Builder::into_table() ->
   TableSync`; the `NamedSets` struct fills `TableSync::sets` and each anonymous
   set is attached to its chain.
-- `firewall`: sets become `TableSync::sets`; the free-form chain scripts must be
-  replaced by `rules.rs` builders (a prerequisite, since `TableSync` stores
-  `Rule`s, not strings).
 - `proxy`: `write_service_slices_elements` / `ctr` become typed builders. This
   is the big one; it is where the current text-based tracker is replaced.
+
+`firewall` is not a `TableSync` renderer (see Non-goals): its operator-authored
+chains stay script-based.
 
 The target state must be **deterministic in names and content**: an unchanged
 state renders an equal `TableSync` (same names, same `BTree` contents) and
@@ -380,7 +390,7 @@ impl TableState {
 Because `current` is a `TableSyncRef` (per-chain hashes, sets in full),
 holding it between updates is cheap: no chain's rules are retained.
 
-`netpol` and `firewall` each own one `TableState` per table. When `sync` decides
+`netpol` and `proxy` each own one `TableState` per table. When `sync` decides
 the change is structural (a set's metadata, a base chain's hook), it emits a
 full recreate instead of a diff; `TableState` treats that identically — the
 whole table is rebuilt and `current` replaced.
