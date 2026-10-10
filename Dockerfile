@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------
-from rust:1.98.1-alpine3.24 as build
+from rust:1.99.0-alpine3.24 as build
 
-run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git libmnl-dev libnftnl-dev
+run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git
 
 workdir /app
 copy . .
@@ -11,7 +11,7 @@ run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry 
   cargo install --locked --path . --root /dist
 
 # ------------------------------------------------------------------------
-from alpine:3.24.1 as assets
+from alpine:3.24.2 as assets
 run apk add --no-cache zstd
 
 run wget https://downloads.pingoo.io/geoip.mmdb.zst
@@ -22,7 +22,7 @@ workdir /assets
 run unzstd -o country_ips.db /country_ips.db.zst
 
 # ------------------------------------------------------------------------
-from alpine:3.24.1
+from alpine:3.24.2
 entrypoint ["knls"]
 run apk add --no-cache nftables wireguard-tools
 copy --from=assets /assets/ /assets/
