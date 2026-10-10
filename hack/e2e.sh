@@ -67,10 +67,10 @@ mkdir -p "$artifacts"
 # Ginkgo CLI flags. Ginkgo v2's default timeout is 1h; e2e runs need more, so
 # upstream's hack/ginkgo-e2e.sh hardcodes 24h.
 ginkgo_args=(
-	#"--timeout=24h"
+	"--timeout=24h"
 	#"--no-color"
-	#"--poll-progress-after=60m"
-	#"--poll-progress-interval=5m"
+	"--poll-progress-after=60m"
+	"--poll-progress-interval=5m"
     #"--dry-run"
     #"-v"
 )

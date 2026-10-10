@@ -587,6 +587,37 @@ pub fn numgen_random(reg: Register, modulus: u32) -> Expr {
     )
 }
 
+/// `ct state` loaded into `reg`.
+pub fn ct_state(reg: Register) -> Expr {
+    const NFTA_CT_DREG: u16 = 1;
+    const NFTA_CT_KEY: u16 = 2;
+    const NFT_CT_STATE: u32 = 0;
+
+    other(
+        "ct",
+        vec![
+            nla(NFTA_CT_DREG, be32(reg.into())),
+            nla(NFTA_CT_KEY, be32(NFT_CT_STATE)),
+        ],
+    )
+}
+
+/// `ct state established,related`: whether the packet belongs to an
+/// already-established flow.
+///
+/// `ct state` is a 4-byte host-endian bitmask on `ct->status`; the bits are
+/// `NF_CT_STATE_BIT(ctinfo) = 1 << (ctinfo % IP_CT_IS_REPLY + 1)`, so
+/// `established` (0) is `1 << 1` and `related` (1) is `1 << 2`.
+pub fn ct_state_established_related(reg: Register) -> Vec<Expr> {
+    const ESTABLISHED_RELATED: u32 = (1 << 1) | (1 << 2);
+
+    vec![
+        ct_state(reg),
+        bitwise_and(reg, 4, ne32(ESTABLISHED_RELATED)),
+        cmp(reg, Operator::NotEqual, vec![0u8; 4]),
+    ]
+}
+
 /// `ct original ip daddr` (v4) / `ip6 daddr` (v6) into `reg`.
 pub fn ct_original_daddr(family: Family, reg: Register) -> Expr {
     const NFTA_CT_DREG: u16 = 1;

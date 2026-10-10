@@ -14,6 +14,7 @@ use cidr::IpCidr;
 use eyre::Result;
 use k8s_openapi::{api::core::v1 as core, api::networking::v1 as networking};
 use log::error;
+use netlink_packet_netfilter::nftables::Register;
 use std::collections::{BTreeMap, BTreeSet as Set};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
@@ -265,6 +266,16 @@ impl<'t> Builder<'t> {
             if self.sets.contains_key(map) {
                 rules.push(rules::ip_vmap(family, dir, map));
             }
+        }
+
+        // Netpol only constrains *new* connections. Accept the reply/related
+        // traffic of already-allowed flows up front, otherwise the lookups below
+        // drop the replies of an allowed flow whenever the opposite direction
+        // also has a policy (netpol is stateful, per the API).
+        if !rules.is_empty() {
+            let mut established = rules::ct_state_established_related(Register::Reg1);
+            established.push(rules::accept());
+            rules.insert(0, established);
         }
 
         self.chains.insert(

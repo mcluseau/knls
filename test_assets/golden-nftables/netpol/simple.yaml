@@ -62,5 +62,6 @@
 
     chain pods_filter {
     	type filter hook forward priority filter; policy accept;
+    	ct state established,related accept
     	ip daddr vmap @pods_ingress
     }
