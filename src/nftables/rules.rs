@@ -594,6 +594,32 @@ pub fn fib_daddr_type_local(reg: Register) -> Vec<Expr> {
     ]
 }
 
+/// `fib saddr type local` into `reg`, followed by the `== RTN_LOCAL` compare.
+///
+/// Matches packets whose *source* address is one of this host's addresses, i.e.
+/// locally-originated traffic (used for the `Local` external-traffic-policy
+/// short-circuit).
+pub fn fib_saddr_type_local(reg: Register) -> Vec<Expr> {
+    const NFTA_FIB_DREG: u16 = 1;
+    const NFTA_FIB_RESULT: u16 = 2;
+    const NFTA_FIB_FLAGS: u16 = 3;
+    const NFT_FIB_RESULT_ADDRTYPE: u32 = 3;
+    const NFT_FIB_F_SADDR: u32 = 1;
+    const RTN_LOCAL: u32 = 2;
+
+    vec![
+        other(
+            "fib",
+            vec![
+                nla(NFTA_FIB_DREG, be32(reg.into())),
+                nla(NFTA_FIB_RESULT, be32(NFT_FIB_RESULT_ADDRTYPE)),
+                nla(NFTA_FIB_FLAGS, be32(NFT_FIB_F_SADDR)),
+            ],
+        ),
+        cmp(reg, Operator::Equal, ne32(RTN_LOCAL)),
+    ]
+}
+
 /// `numgen random mod <modulus>` into `reg`.
 pub fn numgen_random(reg: Register, modulus: u32) -> Expr {
     const NFTA_NGEN_DREG: u16 = 1;

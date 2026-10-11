@@ -159,6 +159,80 @@ fn dispatch_indices_are_stable_across_renders() {
     );
 }
 
+/// Updating an EndpointSlice to carry the `service.kubernetes.io/headless`
+/// label drops its endpoints (the Service is headless), so the dispatch map
+/// ends up empty and the service chain rejects.
+#[test]
+fn headless_slice_label_drops_endpoints() {
+    let state = ready_state();
+    let cfg = proxy::from_state(&state, false).expect("ready");
+    let before = render(
+        state.my_node.get().expect("node"),
+        &cfg,
+        &mut DispatchIndices::default(),
+    );
+    assert!(!dispatch_map(&before).is_empty(), "endpoint dispatched");
+
+    let mut state2 = ready_state();
+    let mut updated = slice();
+    updated
+        .metadata
+        .labels
+        .as_mut()
+        .expect("labels")
+        .insert("service.kubernetes.io/headless".into(), "".into());
+    state2.ingest(&Event::EndpointSlice(Change::Apply(Arc::new(updated))));
+
+    let cfg2 = proxy::from_state(&state2, false).expect("ready");
+    let after = render(
+        state2.my_node.get().expect("node"),
+        &cfg2,
+        &mut DispatchIndices::default(),
+    );
+    assert!(dispatch_map(&after).is_empty(), "endpoints dropped");
+    assert!(after.sets.contains_key("svc_default_web"));
+}
+
+/// Only Ready node-local endpoints count towards a Service's health-check
+/// NodePort; terminating (serving but not Ready) and remote endpoints do not.
+#[test]
+fn local_ready_endpoint_count_ignores_terminating_and_remote() {
+    let mut state = crate::state::State::new("n1".into());
+    state.ingest(&Event::MyNode(Change::InitApply(Arc::new(node()))));
+    state.ingest(&Event::MyNode(Change::InitDone));
+    state.ingest(&Event::Service(Change::InitApply(Arc::new(service()))));
+
+    let slice: discovery::EndpointSlice = serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "web-abc",
+            "namespace": "default",
+            "labels": { "kubernetes.io/service-name": "web" },
+        },
+        "addressType": "IPv4",
+        "endpoints": [
+            { "addresses": ["10.244.0.5"], "conditions": { "ready": true }, "nodeName": "n1" },
+            {
+                "addresses": ["10.244.0.6"],
+                "conditions": { "ready": false, "serving": true, "terminating": true },
+                "nodeName": "n1",
+            },
+            { "addresses": ["10.244.0.7"], "conditions": { "ready": true }, "nodeName": "n2" },
+        ],
+        "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }],
+    }))
+    .expect("slice");
+
+    state.ingest(&Event::EndpointSlice(Change::InitApply(Arc::new(slice))));
+    state.ingest(&Event::Service(Change::InitDone));
+    state.ingest(&Event::EndpointSlice(Change::InitDone));
+
+    let key = crate::state::keys::Object {
+        namespace: "default".into(),
+        name: "web".into(),
+    };
+    assert_eq!(state.local_ready_endpoint_count(&key), 1);
+}
+
 /// Renders the same state twice: the two `TableSync`s are structurally equal,
 /// and diffing one against the other emits nothing.
 #[test]

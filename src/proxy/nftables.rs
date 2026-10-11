@@ -29,7 +29,7 @@ fn default_table() -> String {
     "kube-proxy".into()
 }
 
-use super::conntrack;
+use super::{conntrack, healthcheck, metrics};
 use crate::kube_watch::{EventReceiver, ingest_events};
 use crate::state::{
     LocalEndpoint, LocalEndpointSlice, Node, ProtoPort, Protocol, SessionAffinity, State, keys,
@@ -49,6 +49,11 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let mut dispatch = DispatchIndices::default();
 
     let mut ct_state = conntrack::State::new().await?;
+
+    tokio::spawn(metrics::serve());
+    let proxy_health = metrics::Health::new();
+    tokio::spawn(metrics::serve_healthz(proxy_health.clone()));
+    let mut health = healthcheck::HealthChecks::new();
 
     loop {
         use std::ops::ControlFlow::*;
@@ -75,8 +80,20 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             continue;
         };
 
-        if let Err(e) = table.update(render(my_node, &svc, &mut dispatch)).await {
-            error!("proxy table update failed: {e}");
+        // kube-proxy's admin API: keep one health-check listener per Service
+        // that has a healthCheckNodePort, reporting its Ready local endpoints.
+        health.update(svc.iter().filter_map(|(key, s)| {
+            let port = s.health_check_node_port?;
+            Some((key.clone(), port, state.local_ready_endpoint_count(key)))
+        }));
+
+        debug!("proxy: applying table for {} services", svc.len());
+        match table.update(render(my_node, &svc, &mut dispatch)).await {
+            Ok(()) => {
+                debug!("proxy: table applied");
+                proxy_health.updated();
+            }
+            Err(e) => error!("proxy table update failed: {e}"),
         }
 
         if !ct_state.is_ready() {
@@ -101,7 +118,7 @@ fn svc_chain(key: &keys::Object) -> String {
 
 fn svc_chain_ext(key: &keys::Object, svc: &proxy::Service) -> String {
     let mut base = svc_chain(key);
-    if svc.needs_ext_chain() {
+    if svc.needs_ext_chain {
         base.push_str("_ext")
     }
     base
@@ -230,21 +247,27 @@ fn ip_octets(ip: IpAddr) -> Vec<u8> {
 }
 
 /// The `dnat`/`redirect` rule for endpoint `ip` on service port `port`,
-/// targeting `target` (the slice's target port).
+/// targeting `target` (the slice's target port). `preserve_source` forces a
+/// plain `dnat` (no masquerade mark), used by the `Local` policy's
+/// short-circuit path.
 fn dnat_rule(
     ip: IpAddr,
     port: &ProtoPort,
     target: u16,
     node_port: bool,
     my_ips: &[IpAddr],
+    preserve_source: bool,
 ) -> Rule {
     let (proto, port) = port.protocol_port();
     let family = match ip {
         IpAddr::V4(_) => Family::V4,
         IpAddr::V6(_) => Family::V6,
     };
-    let target = if my_ips.contains(&ip) {
-        Dnat::Redirect(target)
+    let target = if preserve_source || my_ips.contains(&ip) {
+        // endpoint on this node: DNAT straight to its address (no masquerade,
+        // source preserved). `redirect` would target the local address, which a
+        // hostNetwork endpoint bound only to the node IP would miss.
+        Dnat::Local { ip, port: target }
     } else {
         Dnat::Masquerade {
             ip,
@@ -526,7 +549,7 @@ impl<'a> Builder<'a> {
 
     fn service(&mut self, key: &keys::Object, svc: &proxy::Service, dispatch: &mut DispatchIndices) {
         self.service_slices(key, svc, false, &svc.internal_slices, dispatch);
-        if svc.needs_ext_chain() {
+        if svc.needs_ext_chain {
             self.service_slices(key, svc, true, svc.external_slices(), dispatch);
         }
     }
@@ -541,10 +564,11 @@ impl<'a> Builder<'a> {
         slices: &[LocalEndpointSlice],
         dispatch: &mut DispatchIndices,
     ) {
+        let cluster_chain = svc_chain(key);
         let svc_chain = if ext {
             svc_chain_ext(key, svc)
         } else {
-            svc_chain(key)
+            cluster_chain.clone()
         };
 
         let affinity = match svc.session_affinity {
@@ -563,10 +587,26 @@ impl<'a> Builder<'a> {
             });
         }
 
+        // The `Local` external policy's short-circuit (see below) reuses the
+        // internal chain, so that chain's endpoints must not set the masquerade
+        // mark: the short-circuited packet's source is a local address and must
+        // be preserved.
+        let preserve_source = !ext && svc.external_policy_local;
+
         let mut anon_sets = Vec::new();
         let mut pre_rules: Vec<Rule> = Vec::new();
         if ext && let Some(allow) = &svc.external_allow_list {
             pre_rules.extend(allow_list_rules(&mut anon_sets, allow));
+        }
+        // With `externalTrafficPolicy: Local`, traffic originating from this
+        // node itself (a local source address) short-circuits to the cluster
+        // endpoints: it is subject to neither policy, and is not masqueraded, so
+        // the source address is preserved. NodePorts to a node without local
+        // endpoints still work for the node itself this way.
+        if ext && svc.external_policy_local {
+            let mut rule = rules::fib_saddr_type_local(Register::Reg1);
+            rule.push(rules::goto(cluster_chain.clone()));
+            pre_rules.push(rule);
         }
 
         // Per endpoint IP, the union of the target ports over every slice the IP
@@ -615,12 +655,26 @@ impl<'a> Builder<'a> {
 
                 for (port, name) in &svc.ports {
                     if let Some(&target) = targets.get(&ip).and_then(|m| m.get(name)) {
-                        rules.push(dnat_rule(ip, port, target, false, &self.my_node.ips));
+                        rules.push(dnat_rule(
+                            ip,
+                            port,
+                            target,
+                            false,
+                            &self.my_node.ips,
+                            preserve_source,
+                        ));
                     }
                 }
                 for (port, name) in &svc.node_ports {
                     if let Some(&target) = targets.get(&ip).and_then(|m| m.get(name)) {
-                        rules.push(dnat_rule(ip, port, target, true, &self.my_node.ips));
+                        rules.push(dnat_rule(
+                            ip,
+                            port,
+                            target,
+                            true,
+                            &self.my_node.ips,
+                            preserve_source,
+                        ));
                     }
                 }
 

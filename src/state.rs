@@ -69,6 +69,24 @@ impl State {
         slices
     }
 
+    /// The number of distinct node-local Ready endpoint IPs for a Service.
+    ///
+    /// This is kube-proxy's health-check predicate (`LocalReadyEndpoints`): the
+    /// per-Service health-check NodePort reports healthy iff at least one Ready
+    /// endpoint is local to this node. Terminating (serving but not Ready)
+    /// endpoints do not count, even though they still serve traffic.
+    pub fn local_ready_endpoint_count(&self, service_key: &keys::Object) -> u16 {
+        let mut ips = Set::new();
+        for slice in self.local_slices(service_key) {
+            for ep in &slice.endpoints {
+                if ep.ready {
+                    ips.extend(ep.ips());
+                }
+            }
+        }
+        ips.len() as u16
+    }
+
     fn local_slices<'a>(&'a self, service_key: &'a keys::Object) -> Vec<LocalEndpointSlice> {
         self.service_slices(service_key)
             .filter_map(|slice| {
@@ -271,6 +289,9 @@ pub enum SessionAffinity {
 #[derive(Serialize, Clone)]
 pub struct Service {
     pub is_load_balancer: bool,
+    /// The allocated `healthCheckNodePort`, if any (only set for
+    /// `type: LoadBalancer` with `externalTrafficPolicy: Local`).
+    pub health_check_node_port: Option<u16>,
     pub target: ServiceTarget,
     pub ports: Vec<(ProtoPort, String)>,
     pub node_ports: Vec<(ProtoPort, String)>,
@@ -292,6 +313,7 @@ impl memstore::KeyValueFrom<core::Service> for Service {
         let Some(ref spec) = svc.spec else {
             return Some(Self {
                 is_load_balancer: false,
+                health_check_node_port: None,
                 target: ServiceTarget::None,
                 ports: Vec::new(),
                 node_ports: Vec::new(),
@@ -366,6 +388,10 @@ impl memstore::KeyValueFrom<core::Service> for Service {
 
         Some(Self {
             is_load_balancer: spec.type_.as_deref() == Some("LoadBalancer"),
+            health_check_node_port: spec
+                .health_check_node_port
+                .filter(|&port| port > 0)
+                .map(|port| port as u16),
             target,
             ports,
             node_ports,

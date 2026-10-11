@@ -71,7 +71,7 @@
     }
 
     chain svc_default_lb_ep_0af40005 {
-    	meta nfproto ipv4 tcp dport 80 meta mark set meta mark | 0x00004000 dnat ip to 10.244.0.5:8080
+    	meta nfproto ipv4 tcp dport 80 dnat ip to 10.244.0.5:8080
     }
 
     chain svc_default_lb {
@@ -85,6 +85,7 @@
 
     chain svc_default_lb_ext {
     	ip saddr != 203.0.113.0/24 reject with icmp port-unreachable
+    	fib saddr type local goto svc_default_lb
     	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_lb_ext
     	reject with icmpv6 port-unreachable
     }
