@@ -16,6 +16,11 @@ pub fn recreate(table: &str) -> [NetlinkMessage<NetfilterMessage>; 3] {
     [new_table(table), delete_table(table), new_table(table)]
 }
 
+/// The message creating `table` if it does not exist yet (a no-op otherwise).
+pub fn ensure(table: &str) -> NetlinkMessage<NetfilterMessage> {
+    new_table(table)
+}
+
 fn new_table(table: &str) -> NetlinkMessage<NetfilterMessage> {
     let mut header = NetlinkHeader::default();
     // No NLM_F_EXCL: creating an existing table is not an error.

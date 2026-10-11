@@ -719,6 +719,25 @@ pub fn dnat(family: Family, addr: Register, port: Register) -> Expr {
     )
 }
 
+/// `snat <family> to <addr>`, the address taken from `addr_reg`.
+pub fn snat(family: Family, addr: Register) -> Expr {
+    const NFTA_NAT_TYPE: u16 = 1;
+    const NFTA_NAT_FAMILY: u16 = 2;
+    const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
+    const NFTA_NAT_REG_ADDR_MAX: u16 = 4;
+    const NFT_NAT_SNAT: u32 = 0;
+
+    other(
+        "nat",
+        vec![
+            nla(NFTA_NAT_TYPE, be32(NFT_NAT_SNAT)),
+            nla(NFTA_NAT_FAMILY, be32(family.nfproto_u32())),
+            nla(NFTA_NAT_REG_ADDR_MIN, be32(addr.into())),
+            nla(NFTA_NAT_REG_ADDR_MAX, be32(addr.into())),
+        ],
+    )
+}
+
 /// `masquerade` (or `masquerade fully-random`).
 pub fn masquerade(fully_random: bool) -> Expr {
     const NFTA_MASQ_FLAGS: u16 = 1;

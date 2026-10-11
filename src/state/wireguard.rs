@@ -51,6 +51,12 @@ pub struct Node {
     pub endpoint_from: Option<Map<String, Endpoint>>,
     pub pod_cidrs: Vec<IpCidr>,
     pub external_ips: Set<IpAddr>,
+    /// All IP addresses of the node (from `status.addresses`). Advertised in the
+    /// peer's WireGuard `allowed_ips` so node-sourced traffic (e.g. the proxy's
+    /// `Local` external-policy short-circuit) survives the cryptokey-routing
+    /// ingress filter.
+    #[serde(default)]
+    pub ips: Set<IpAddr>,
 }
 impl Node {
     pub fn new() -> Self {
@@ -104,6 +110,16 @@ impl memstore::KeyValueFrom<core::Node> for Node {
             .and_then(|addrs| addrs.first())
             .and_then(|addr| addr.address.parse().ok());
 
+        let ips: Set<IpAddr> = (n.status.as_ref())
+            .and_then(|st| st.addresses.as_ref())
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .filter_map(|addr| addr.address.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let listen_port = anns.get(ANN_LISTEN_PORT).and_then(|p| p.parse().ok());
 
         let ext_ip_from_ann = (anns.get(ANN_EXT_IP).into_iter())
@@ -145,6 +161,7 @@ impl memstore::KeyValueFrom<core::Node> for Node {
                 .chain(ext_ip_from_labels)
                 .filter_map(|ip| ip.trim_ascii().parse().ok())
                 .collect(),
+            ips,
         })
     }
 }

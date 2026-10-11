@@ -12,17 +12,25 @@ use netlink_packet_route::{
 use nix::errno::Errno;
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::netlink::netfilter::{self, NetlinkExt as _};
 use crate::netlink::wireguard::{self as nlwg, Peer as WgPeer};
+use crate::nftables::{
+    chain::{self, Chain, ChainType, InetHookNumber},
+    rules,
+    rules::{Dir, Family, Verdict},
+    table,
+};
 use crate::rtnl_exts::ErrorExt;
 use crate::state::wireguard::{Key, Node, decode_key, encode_key};
 use crate::{
     actions, change, keys, kube_watch::EventReceiver, memstore::KeyValueFrom, patch_params,
 };
+use netlink_packet_netfilter::nftables::{MetaKey, Register};
 
 crate::multimap!(
     State{
@@ -79,6 +87,8 @@ pub struct Config {
     manual_node: Option<Node>,
     /// Link MTU to set
     mtu: Option<u16>,
+    /// Chain the CNI `portmap` plugin so pods' `hostPort`s are reachable.
+    host_ports: bool,
 }
 
 impl Default for Config {
@@ -90,6 +100,7 @@ impl Default for Config {
             on_create: Vec::new(),
             manual_node: None,
             mtu: None,
+            host_ports: false,
         }
     }
 }
@@ -163,7 +174,9 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
     let ifname = cfg.ifname;
     let key_path = cfg.key_path;
-    let cni_config_path = cfg.cni_config;
+    // containerd keys the CNI config *format* off the file extension: a plugin
+    // list must be named `*.conflist`, a single plugin `*.conf`.
+    let (cni_config_path, cni_config_stale) = cni_config_paths(cfg.host_ports, &cfg.cni_config);
 
     let default_port = 51820u16;
 
@@ -256,9 +269,7 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         if_addrs.sync(&vpn_ips).await?;
 
         // CNI config
-        let cni_config = CniConfig {
-            cni_version: "0.3.1",
-            name: "knls",
+        let ptp = CniPtp {
             r#type: "ptp",
             ipam: CniIpam {
                 r#type: "host-local",
@@ -278,11 +289,18 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
                 .unwrap_or(1420),
         };
 
+        let cni_config = cni_config(cfg.host_ports, ptp);
+
         if cfg.manual_node.is_none() {
             if prev_cni_config.as_ref() != Some(&cni_config) {
                 let value = serde_json::to_vec(&cni_config)?;
-                std::fs::write(&cni_config_path, value).map_err(|e| {
-                    format_err!("failed to write CNI config ({cni_config_path}): {e}")
+                // remove the other-format file so containerd loads only one
+                let _ = fs::remove_file(&cni_config_stale).await;
+                fs::write(&cni_config_path, value).await.map_err(|e| {
+                    format_err!(
+                        "failed to write CNI config ({}): {e}",
+                        cni_config_path.display()
+                    )
                 })?;
                 prev_cni_config = Some(cni_config);
             }
@@ -329,7 +347,13 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
             let peer = Peer {
                 endpoint: node.get_endpoint_from(&my_node.zone, default_port),
-                allowed_ips: node.pod_cidrs.clone(),
+                allowed_ips: (node.pod_cidrs.iter().copied())
+                    // Also allow the peer's own node addresses, so node-sourced
+                    // traffic is not dropped by WireGuard's cryptokey-routing
+                    // ingress filter (the proxy's `Local` policy short-circuit
+                    // keeps the local node address as source).
+                    .chain(node.ips.iter().copied().map(IpCidr::new_host))
+                    .collect(),
             };
 
             if let Some(change) = peers.check(pubkey, &peer) {
@@ -384,59 +408,77 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         {
             let my_ext_ips = &my_node.external_ips;
 
-            let mut chain = String::new();
-            chain.push_str("chain inet knls wireguard-external-ips {}\n");
-            chain.push_str("delete chain inet knls wireguard-external-ips\n");
-            chain.push_str("chain inet knls wireguard-external-ips {\n");
-            // priority 100 = srcnat
-            chain.push_str("  type nat hook postrouting priority srcnat; policy accept;\n");
-            chain.push_str(&format!("  oif {ifname} return;\n"));
-            for (k, pod) in state.pods.iter() {
-                let comment = format!("comment \"{k}\"");
+            let mut chain = Chain::new("knls", "wireguard-external-ips");
 
-                if let Some(ref v4) = pod.external_ipv4
-                    && my_ext_ips.contains(v4)
+            // Leave traffic already egressing the wireguard interface alone:
+            // node-to-node traffic is handled by the wg routes.
+            chain.push(vec![
+                rules::meta(MetaKey::Oif, Register::Reg1),
+                rules::eq(Register::Reg1, link_id.to_ne_bytes().to_vec()),
+                rules::verdict(Verdict::Return),
+            ]);
+
+            for (k, pod) in state.pods.iter() {
+                let comment = k.to_string();
+
+                if let Some(v4) = pod.external_ipv4
+                    && my_ext_ips.contains(&v4)
                 {
-                    let ips = (pod.ips.iter())
-                        .filter(|ip| ip.is_ipv4())
-                        .map(|ip| ip.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    chain.push_str(&format!("  ip saddr {{{ips}}} snat to {v4} {comment}\n"));
+                    for ip in pod.ips.iter().filter(|ip| ip.is_ipv4()) {
+                        chain.push_commented(snat_rule(*ip, v4), Some(&comment));
+                    }
                 }
-                if let Some(ref v6) = pod.external_ipv6
-                    && my_ext_ips.contains(v6)
+                if let Some(v6) = pod.external_ipv6
+                    && my_ext_ips.contains(&v6)
                 {
-                    let ips = pod
-                        .ips
-                        .iter()
-                        .filter(|ip| ip.is_ipv6())
-                        .map(|ip| ip.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    chain.push_str(&format!("  ip6 saddr {{{ips}}} snat to {v6} {comment}\n"));
+                    for ip in pod.ips.iter().filter(|ip| ip.is_ipv6()) {
+                        chain.push_commented(snat_rule(*ip, v6), Some(&comment));
+                    }
                 }
             }
-            chain.push_str("}\n");
 
-            // FIXME duplicate of duplicate...
-            let mut nft = tokio::process::Command::new("nft")
-                .args(["-f", "-"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()?;
+            // Recreate the chain (created first so the `delete` cannot fail)
+            // and add the fresh rules, priority 100 = srcnat. Merged in a single
+            // transaction so the chain is never left empty.
+            let msgs = [
+                table::ensure("knls"),
+                chain.create(),
+                chain.delete(),
+                chain.create_base_with(
+                    ChainType::Nat,
+                    InetHookNumber::PostRouting,
+                    100,
+                    chain::ACCEPT,
+                ),
+            ]
+            .into_iter()
+            .chain(chain.rules().iter().cloned());
 
-            let stdin = nft.stdin.as_mut().expect("stdin must exist");
-            stdin.write_all(chain.as_bytes()).await?;
-
-            let status = nft.wait().await?;
-            if !status.success() {
-                error!("nft failed");
-                for (i, line) in chain.lines().enumerate() {
-                    eprintln!("  {:3}: {line}", i + 1);
-                }
+            if let Err(e) = netfilter::new_link()?.send_as_transactions(msgs).await {
+                error!("failed to update the external-IP snat chain: {e}");
                 continue;
             }
         }
+    }
+}
+
+/// `ip|ip6 saddr <saddr> snat to <ext>`.
+fn snat_rule(saddr: IpAddr, ext: IpAddr) -> chain::Rule {
+    let (family, prefix) = match ext {
+        IpAddr::V4(_) => (Family::V4, 32),
+        IpAddr::V6(_) => (Family::V6, 128),
+    };
+
+    let mut rule = rules::ip_prefix(family, Dir::Src, prefix, octets(saddr), false);
+    rule.push(rules::load_immediate(Register::Reg1, octets(ext)));
+    rule.push(rules::snat(family, Register::Reg1));
+    rule
+}
+
+fn octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
     }
 }
 
@@ -569,15 +611,102 @@ struct Peer {
     allowed_ips: Vec<IpCidr>,
 }
 
+/// The CNI config file's contents. Without `host_ports`, a single `ptp` plugin
+/// config; with it, a plugin list chaining `portmap` so pod `hostPort`s get
+/// DNATed on the node.
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+enum CniConfig<'t> {
+    Single(CniSingle<'t>),
+    Conflist(CniConflist<'t>),
+}
+
+/// Builds the CNI config for `ptp`, chaining the `portmap` plugin when
+/// `host_ports` is set.
+fn cni_config<'t>(host_ports: bool, ptp: CniPtp<'t>) -> CniConfig<'t> {
+    if host_ports {
+        CniConfig::Conflist(CniConflist {
+            cni_version: "0.3.1",
+            name: "knls",
+            plugins: vec![
+                CniPlugin::Ptp(ptp),
+                CniPlugin::Portmap(CniPortmap {
+                    r#type: "portmap",
+                    capabilities: CniCapabilities {
+                        port_mappings: true,
+                    },
+                }),
+            ],
+        })
+    } else {
+        CniConfig::Single(CniSingle {
+            cni_version: "0.3.1",
+            name: "knls",
+            plugin: ptp,
+        })
+    }
+}
+
+/// The CNI config file path for the current format, and the path of the
+/// other-format file to remove (so containerd does not load both).
+fn cni_config_paths(host_ports: bool, base: &str) -> (PathBuf, PathBuf) {
+    let base = Path::new(base);
+    let conflist = base.with_extension("conflist");
+    if host_ports {
+        (conflist, base.to_owned())
+    } else {
+        (base.to_owned(), conflist)
+    }
+}
+
+/// A single-plugin CNI config (`{cniVersion, name, type, …}`).
 #[derive(Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CniConfig<'t> {
+struct CniSingle<'t> {
     cni_version: &'t str,
     name: &'t str,
+    #[serde(flatten)]
+    plugin: CniPtp<'t>,
+}
+
+/// A CNI plugin list (`{cniVersion, name, plugins: […]}`).
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniConflist<'t> {
+    cni_version: &'t str,
+    name: &'t str,
+    plugins: Vec<CniPlugin<'t>>,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+enum CniPlugin<'t> {
+    Ptp(CniPtp<'t>),
+    Portmap(CniPortmap),
+}
+
+/// The `ptp` (point-to-point) plugin configuring the pod interface.
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniPtp<'t> {
     r#type: &'t str,
     ipam: CniIpam<'t>,
     dns: CniDns,
     mtu: u32,
+}
+
+/// The `portmap` plugin, which DNATs node `hostPort`s to the pod.
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniPortmap {
+    r#type: &'static str,
+    capabilities: CniCapabilities,
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CniCapabilities {
+    port_mappings: bool,
 }
 
 #[derive(Eq, PartialEq, serde::Serialize)]
@@ -621,5 +750,129 @@ impl CniRoute {
         Self {
             dst: cidr.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ptp() -> CniPtp<'static> {
+        CniPtp {
+            r#type: "ptp",
+            ipam: CniIpam {
+                r#type: "host-local",
+                ranges: vec![vec![CniRange {
+                    subnet: "10.244.0.0/24".into(),
+                }]],
+                routes: vec![CniRoute {
+                    dst: "0.0.0.0/0".into(),
+                }],
+            },
+            dns: CniDns {
+                nameservers: vec!["10.244.0.1".into()],
+            },
+            mtu: 1420,
+        }
+    }
+
+    /// Without `host_ports`, the config is the single `ptp` plugin (unchanged).
+    #[test]
+    fn cni_config_without_host_ports_is_single_plugin() {
+        let v = serde_json::to_value(cni_config(false, ptp())).expect("serialize");
+        assert_eq!(v["type"], "ptp");
+        assert_eq!(v["ipam"]["type"], "host-local");
+        assert!(v.get("plugins").is_none());
+    }
+
+    /// With `host_ports`, `portmap` is chained after `ptp`.
+    #[test]
+    fn cni_config_with_host_ports_chains_portmap() {
+        let v = serde_json::to_value(cni_config(true, ptp())).expect("serialize");
+        let plugins = v["plugins"].as_array().expect("plugins");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0]["type"], "ptp");
+        assert_eq!(plugins[1]["type"], "portmap");
+        assert_eq!(plugins[1]["capabilities"]["portMappings"], true);
+    }
+
+    /// containerd keys the format off the extension, so a plugin list must be
+    /// written to `*.conflist`, and the other-format file removed.
+    #[test]
+    fn cni_config_paths_switch_extension_with_host_ports() {
+        let conf = "/etc/cni/net.d/10-knls.conf";
+        let conflist = "/etc/cni/net.d/10-knls.conflist";
+        assert_eq!(
+            cni_config_paths(false, conf),
+            (PathBuf::from(conf), PathBuf::from(conflist))
+        );
+        assert_eq!(
+            cni_config_paths(true, conf),
+            (PathBuf::from(conflist), PathBuf::from(conf))
+        );
+    }
+
+    /// A [`test_harness::System`] rendering the external-IP
+    /// `wireguard-external-ips` chain as pure netlink messages.
+    struct ExternalIpsSystem {
+        table: String,
+    }
+
+    impl crate::nftables::test_harness::System for ExternalIpsSystem {
+        fn new(table: String) -> Self {
+            Self { table }
+        }
+
+        fn render(&mut self) -> Vec<crate::nftables::Message> {
+            let mut chain = Chain::new(&self.table, "wireguard-external-ips");
+
+            chain.push(vec![
+                rules::meta(MetaKey::Oif, Register::Reg1),
+                rules::eq(Register::Reg1, 7u32.to_ne_bytes().to_vec()),
+                rules::verdict(Verdict::Return),
+            ]);
+            chain.push_commented(
+                snat_rule(
+                    "10.0.0.1".parse().expect("ip"),
+                    "203.0.113.5".parse().expect("ip"),
+                ),
+                Some("default/pod"),
+            );
+            chain.push_commented(
+                snat_rule(
+                    "2001:db8::1".parse().expect("ip"),
+                    "fd00::1".parse().expect("ip"),
+                ),
+                Some("default/pod6"),
+            );
+
+            [
+                table::ensure(&self.table),
+                chain.create(),
+                chain.delete(),
+                chain.create_base_with(
+                    ChainType::Nat,
+                    InetHookNumber::PostRouting,
+                    100,
+                    chain::ACCEPT,
+                ),
+            ]
+            .into_iter()
+            .chain(chain.rules().iter().cloned())
+            .collect()
+        }
+    }
+
+    /// Golden test for the external-IP snat chain.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
+    #[tokio::test]
+    async fn external_ips_golden() {
+        crate::nftables::test_harness::golden_dir::<ExternalIpsSystem>(
+            "test_assets/golden-nftables/wireguard",
+            "knls-test-wg-",
+        )
+        .await;
     }
 }

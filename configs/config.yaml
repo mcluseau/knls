@@ -5,6 +5,8 @@ connectivity: !wireguard
   manual_node:
     pod_cidrs:
     - "192.168.242.0/28"
+  # chain the CNI `portmap` plugin so pods' `hostPort`s are reachable
+  # host_ports: true
   on_create:
   - !nft_chain
     table: knls

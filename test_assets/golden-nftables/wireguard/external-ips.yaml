@@ -1,0 +1,17 @@
+# The wireguard connectivity's external-IP snat chain, rendered as pure netlink.
+# Verified twice: the second apply re-runs on the already-populated table, the
+# way the watch loop rebuilds the chain on every state change.
+- !verify |
+    chain wireguard-external-ips {
+    	type nat hook postrouting priority srcnat; policy accept;
+    	oif 7 return
+    	ip saddr 10.0.0.1 snat ip to 203.0.113.5 comment "default/pod"
+    	ip6 saddr 2001:db8::1 snat ip6 to fd00::1 comment "default/pod6"
+    }
+- !verify |
+    chain wireguard-external-ips {
+    	type nat hook postrouting priority srcnat; policy accept;
+    	oif 7 return
+    	ip saddr 10.0.0.1 snat ip to 203.0.113.5 comment "default/pod"
+    	ip6 saddr 2001:db8::1 snat ip6 to fd00::1 comment "default/pod6"
+    }

@@ -103,7 +103,13 @@ impl<'t> Chain<'t> {
 
     /// Appends a rule and updates the hash from its message.
     pub fn push(&mut self, rule: Rule) {
-        let mut msg = rule_msg(self.table, &self.chain, rule);
+        self.push_commented(rule, None);
+    }
+
+    /// Appends a rule carrying nft's `comment` (rule userdata) and updates the
+    /// hash from its message.
+    pub fn push_commented(&mut self, rule: Rule, comment: Option<&str>) {
+        let mut msg = rule_msg(self.table, &self.chain, rule, comment);
         msg.finalize();
         hash_message(&mut self.hasher, &msg);
         self.rules.push(msg);
@@ -216,19 +222,43 @@ fn rule_msg(
     table: &str,
     chain: &str,
     expressions: impl IntoIterator<Item = ListAttribute<ExpressionAttribute>>,
+    comment: Option<&str>,
 ) -> Message {
     let mut header = NetlinkHeader::default();
     header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
 
-    let msg = NfTablesMessage::NewRule(RuleMessage {
-        attributes: vec![
-            RuleAttribute::Table(table.to_string()),
-            RuleAttribute::Chain(chain.to_string()),
-            RuleAttribute::Expressions(expressions.into_iter().collect()),
-        ],
-    });
+    let mut attributes = vec![
+        RuleAttribute::Table(table.to_string()),
+        RuleAttribute::Chain(chain.to_string()),
+        RuleAttribute::Expressions(expressions.into_iter().collect()),
+    ];
+    if let Some(comment) = comment {
+        attributes.push(RuleAttribute::UserData(comment_userdata(comment)));
+    }
+
+    let msg = NfTablesMessage::NewRule(RuleMessage { attributes });
 
     NetlinkMessage::new(header, NetfilterMessage::new(nft_header(), msg).into())
+}
+
+/// nft's rule `comment` userdata: a udata TLV, `[type][len][comment][NUL]` with
+/// `type` 0 (`NFTNL_UDATA_RULE_COMMENT`) and `len` the comment length including
+/// its terminating NUL.
+fn comment_userdata(comment: &str) -> Vec<u8> {
+    // `len` is a single byte covering the comment and its NUL, so the comment is
+    // capped at 254 bytes (on a char boundary).
+    let mut end = comment.len().min(254);
+    while !comment.is_char_boundary(end) {
+        end -= 1;
+    }
+    let comment = &comment[..end];
+
+    let mut udata = Vec::with_capacity(comment.len() + 3);
+    udata.push(0);
+    udata.push((comment.len() + 1) as u8);
+    udata.extend_from_slice(comment.as_bytes());
+    udata.push(0);
+    udata
 }
 
 /// A hasher seeded with the table and chain names.
