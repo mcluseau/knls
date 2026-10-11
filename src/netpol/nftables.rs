@@ -14,7 +14,7 @@ use crate::{
 use cidr::IpCidr;
 use eyre::Result;
 use k8s_openapi::{api::core::v1 as core, api::networking::v1 as networking};
-use log::error;
+use log::{debug, error};
 use netlink_packet_netfilter::nftables::Register;
 use std::collections::{BTreeMap, BTreeSet as Set};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -64,8 +64,10 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
             continue;
         }
 
-        if let Err(e) = table.update(render(&state, &cfg, node_name)).await {
-            error!("netpol update failed: {e}");
+        debug!("netpol: applying table");
+        match table.update(render(&state, &cfg, node_name)).await {
+            Ok(()) => debug!("netpol: table applied"),
+            Err(e) => error!("netpol update failed: {e}"),
         }
     }
 }

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use eyre::Result;
+use log::debug;
 use netlink_packet_core::Emitable as _;
 use netlink_packet_netfilter::nftables::{
     ExpressionAttribute, Expressions, ListAttribute, Lookup, SetAttribute, SetFlags,
@@ -637,6 +638,12 @@ fn full_create(table: &str, next: &TableSync) -> Vec<Message> {
     for (name, chain) in &next.chains {
         out.push(create_chain_msg(table, name, chain));
     }
+    debug!(
+        "{table}: recreate pass 1: {} empty containers created ({} sets, {} chains)",
+        next.sets.len() + next.chains.len(),
+        next.sets.len(),
+        next.chains.len()
+    );
 
     // pass 2: fill the named sets/maps, then the chains. Every chain already
     // exists, so a verdict-map entry that `goto`s one is safe.
@@ -646,6 +653,7 @@ fn full_create(table: &str, next: &TableSync) -> Vec<Message> {
     for (name, chain) in &next.chains {
         out.extend(fill_chain(table, name, chain, &mut id));
     }
+    debug!("{table}: recreate pass 2: {} messages total", out.len());
 
     out
 }
@@ -779,15 +787,27 @@ impl TableState {
         };
 
         let messages = sync(&self.table, self.current.as_ref(), &next);
+        debug!("{}: applying {} messages", self.table, messages.len());
         if nl.send_as_transactions(messages.into_iter()).await.is_ok() {
+            debug!("{}: apply done", self.table);
             self.current = Some(next.reference(&self.table));
             return Ok(());
         }
 
+        debug!(
+            "{}: apply failed, recreating the whole table from scratch",
+            self.table
+        );
         self.current = None;
         let messages = sync(&self.table, None, &next);
+        debug!(
+            "{}: applying {} messages (from scratch)",
+            self.table,
+            messages.len()
+        );
         match nl.send_as_transactions(messages.into_iter()).await {
             Ok(()) => {
+                debug!("{}: recreate done", self.table);
                 self.current = Some(next.reference(&self.table));
                 Ok(())
             }

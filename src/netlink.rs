@@ -1,6 +1,6 @@
 use eyre::{Result, bail};
 use futures::{Stream, StreamExt, stream};
-use log::warn;
+use log::{debug, warn};
 use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable,
 };
@@ -28,6 +28,23 @@ const BATCH_PAGE_SIZE: usize = 2 * 1024 * 1024;
 /// Conservative fallback when `SO_SNDBUF` cannot be read.
 const FALLBACK_BATCH_BYTES: usize = 132 * 1024;
 
+/// The maximum number of inner nft messages in one transaction.
+///
+/// netlink-proto's `request_batch` closes the stream only once *every* message
+/// is acknowledged, and every nft message carries `NLM_F_ACK`. The kernel
+/// queues all those ACKs while processing the batch, synchronously, before
+/// userspace can read any of them; if they exceed the socket's receive buffer
+/// `recvmsg` returns `ENOBUFS` and the batch-end ACK is lost, so the request
+/// stream never completes (a hang). Capping the message count bounds the ACK
+/// volume (see [`ACK_BYTES_PER_MESSAGE`]) so it fits even a default receive
+/// buffer.
+pub(crate) const MAX_TX_MESSAGES: usize = 1024;
+
+/// Per-message receive-buffer budget, mirroring nft's `mnl_batch_talk`
+/// (`rcvbufsiz = num_cmds * 1024`): the receive buffer is sized so a whole
+/// transaction's ACKs fit.
+const ACK_BYTES_PER_MESSAGE: usize = 1024;
+
 /// The datagram cap derived from the socket's real send buffer, with the
 /// kernel's own accounting and a small headroom subtracted, bounded by one nft
 /// batch page.
@@ -51,6 +68,25 @@ fn raise_sndbuf(socket: &impl AsFd, target: usize) {
         && let Err(err) = setsockopt(socket, sockopt::SndBuf, &target)
     {
         warn!("failed to raise netlink SO_SNDBUF to {target}: {err} (force: {force})");
+    }
+}
+
+/// Raise the socket's receive buffer to at least `target`.
+///
+/// The kernel queues one ACK per acknowledged message while processing a batch,
+/// before userspace can read any of them, so the receive buffer must hold a
+/// whole transaction's worth of ACKs.
+fn raise_rcvbuf(socket: &impl AsFd, target: usize) {
+    if let Ok(cur) = getsockopt(socket, sockopt::RcvBuf)
+        && cur >= target
+    {
+        return;
+    }
+
+    if let Err(force) = setsockopt(socket, sockopt::RcvBufForce, &target)
+        && let Err(err) = setsockopt(socket, sockopt::RcvBuf, &target)
+    {
+        warn!("failed to raise netlink SO_RCVBUF to {target}: {err} (force: {force})");
     }
 }
 
@@ -136,6 +172,14 @@ where
         // size the send buffer like nft (`mnl_set_sndbuffer`) before handing the
         // connection to the task, then read the value it ended up with
         raise_sndbuf(conn.socket_mut().socket_ref(), BATCH_PAGE_SIZE);
+        // the receive buffer must hold the ACKs of a whole transaction
+        raise_rcvbuf(
+            conn.socket_mut().socket_ref(),
+            MAX_TX_MESSAGES * ACK_BYTES_PER_MESSAGE,
+        );
+        if let Ok(rcvbuf) = getsockopt(conn.socket_mut().socket_ref(), sockopt::RcvBuf) {
+            debug!("netlink SO_RCVBUF is {rcvbuf}");
+        }
 
         // read the real send buffer before handing the connection to the task
         let max_batch_bytes = match getsockopt(conn.socket_mut().socket_ref(), sockopt::SndBuf) {
@@ -215,10 +259,15 @@ where
     where
         T: Debug + NetlinkSerializable + Send,
     {
-        for tx in txs {
+        for (index, tx) in txs.into_iter().enumerate() {
             if tx.is_empty() {
                 continue;
             }
+
+            debug!(
+                "sending netlink transaction {index} ({} messages)",
+                tx.len()
+            );
 
             let mut responses = match self.handle.request_batch(tx, self.dest) {
                 Ok(responses) => responses,
@@ -232,6 +281,8 @@ where
                     bail!("netlink error: {err:?}");
                 }
             }
+
+            debug!("netlink transaction {index} acked");
         }
 
         Ok(())

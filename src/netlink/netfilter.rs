@@ -1,4 +1,4 @@
-use super::Netlink;
+use super::{MAX_TX_MESSAGES, Netlink};
 use eyre::Result;
 use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage};
 use netlink_packet_netfilter::{
@@ -23,8 +23,12 @@ pub trait NetlinkExt {
 
 impl NetlinkExt for Netlink<NetfilterMessage> {
     async fn send_as_transactions(&self, msgs: impl Iterator<Item = Message> + Send) -> Result<()> {
-        self.send_transactions(Transactions::new(msgs, self.max_batch_bytes()))
-            .await
+        self.send_transactions(Transactions::new(
+            msgs,
+            self.max_batch_bytes(),
+            MAX_TX_MESSAGES,
+        ))
+        .await
     }
 }
 
@@ -33,10 +37,11 @@ struct Transactions<I> {
     cur: Vec<Message>,
     bytes: usize,
     max_bytes: usize,
+    max_messages: usize,
 }
 
 impl<I> Transactions<I> {
-    fn new(msgs: I, max_bytes: usize) -> Self {
+    fn new(msgs: I, max_bytes: usize, max_messages: usize) -> Self {
         // deduct tx overhead (batch begin/end messages) from max_bytes, so max_bytes is the actual
         // inner transaction max size.
         let max_bytes =
@@ -44,6 +49,7 @@ impl<I> Transactions<I> {
         Self {
             msgs,
             max_bytes,
+            max_messages,
             cur: Self::new_tx(),
             bytes: 0,
         }
@@ -70,7 +76,13 @@ impl<I: Iterator<Item = Message>> Iterator for Transactions<I> {
         for msg in self.msgs.by_ref() {
             let len = msg.buffer_len();
 
-            if self.bytes != 0 && self.bytes + len > self.max_bytes {
+            // `cur` starts with the batch-begin message, so `cur.len() - 1` is
+            // the number of inner messages so far and `cur.len() > max` means
+            // the cap is already reached.
+            let count_full = self.cur.len() > self.max_messages;
+            let bytes_full = self.bytes != 0 && self.bytes + len > self.max_bytes;
+
+            if count_full || bytes_full {
                 let tx = self.take_tx();
                 self.bytes += len;
                 self.cur.push(msg);
@@ -139,7 +151,7 @@ mod tests {
             .collect();
         let n = msgs.len();
 
-        let txs: Vec<_> = Transactions::new(msgs.into_iter(), BATCH).collect();
+        let txs: Vec<_> = Transactions::new(msgs.into_iter(), BATCH, usize::MAX).collect();
         assert!(txs.len() >= 2, "expected multiple transactions");
 
         let mut total_msgs = 0;
@@ -155,5 +167,25 @@ mod tests {
 
         // no message is dropped at a transaction boundary
         assert_eq!(total_msgs, n, "messages lost across transactions");
+    }
+
+    /// A transaction is also bounded by its message count, so a batch of many
+    /// tiny messages (each producing a kernel ACK) cannot overflow the socket's
+    /// receive buffer.
+    #[test]
+    fn transactions_are_bounded_by_message_count() {
+        // huge byte budget, small message budget: only the count should split
+        let max_messages = 100;
+        let msgs: Vec<_> = (0..1000).map(|_| batch_begin()).collect();
+
+        let txs: Vec<_> = Transactions::new(msgs.into_iter(), usize::MAX, max_messages).collect();
+        assert_eq!(txs.len(), 10, "1000 messages / 100 per tx");
+
+        for tx in &txs {
+            let inner = tx.len() - 2; // minus batch begin/end
+            assert!(inner <= max_messages, "transaction exceeds message cap");
+            assert!(is_control(&tx[0], true));
+            assert!(is_control(&tx[tx.len() - 1], false));
+        }
     }
 }
