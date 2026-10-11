@@ -719,22 +719,6 @@ pub fn dnat(family: Family, addr: Register, port: Register) -> Expr {
     )
 }
 
-/// `redirect to <port>`, the port taken from `port_reg`.
-pub fn redirect(port: Register) -> Expr {
-    const NFTA_REDIR_REG_PROTO_MIN: u16 = 1;
-    const NFTA_REDIR_REG_PROTO_MAX: u16 = 2;
-    const NFTA_REDIR_FLAGS: u16 = 3;
-
-    other(
-        "redir",
-        vec![
-            nla(NFTA_REDIR_REG_PROTO_MIN, be32(port.into())),
-            nla(NFTA_REDIR_REG_PROTO_MAX, be32(port.into())),
-            nla(NFTA_REDIR_FLAGS, be32(2)),
-        ],
-    )
-}
-
 /// `masquerade` (or `masquerade fully-random`).
 pub fn masquerade(fully_random: bool) -> Expr {
     const NFTA_MASQ_FLAGS: u16 = 1;
@@ -879,8 +863,13 @@ pub fn mark_xor(reg: Register, mask: u32) -> Vec<Expr> {
 
 /// The address a `dnat`/`redirect` statement targets.
 pub enum Dnat {
-    /// `redirect to <port>` (the endpoint is on this node).
-    Redirect(u16),
+    /// `dnat to <ip>:<port>` with no masquerade mark: the endpoint is on this
+    /// node, so the source address is preserved.
+    ///
+    /// A `redirect` would send the packet to the node's *local* address, which
+    /// a hostNetwork endpoint listening on the node IP (not `127.0.0.1`) does
+    /// not accept.
+    Local { ip: IpAddr, port: u16 },
     /// `mark set mark | <mark> dnat to <ip>:<port>` (the endpoint is remote).
     Masquerade { ip: IpAddr, port: u16, mark: u32 },
 }
@@ -900,12 +889,10 @@ pub fn dnat_rule(family: Family, proto: u8, port: u16, node_port: bool, target: 
     exprs.push(eq(Register::Reg1, port.to_be_bytes().to_vec()));
 
     match target {
-        Dnat::Redirect(target) => {
-            exprs.push(load_immediate(
-                Register::Reg1,
-                target.to_be_bytes().to_vec(),
-            ));
-            exprs.push(redirect(Register::Reg1));
+        Dnat::Local { ip, port } => {
+            exprs.push(load_immediate(Register::Reg1, ip_bytes(ip)));
+            exprs.push(load_immediate(Register::Reg2, port.to_be_bytes().to_vec()));
+            exprs.push(dnat(family, Register::Reg1, Register::Reg2));
         }
         Dnat::Masquerade { ip, port, mark } => {
             exprs.push(meta(MetaKey::Mark, Register::Reg1));

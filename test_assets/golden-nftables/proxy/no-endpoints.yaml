@@ -1,0 +1,78 @@
+# A Service with no endpoints: its chain rejects, so its dispatch map (and the
+# per-family affinity sets) are not emitted at all. Sets that are still looked
+# up (`service_ips`, `service_nodeports`, `need_masquerade*`) do stay, empty.
+- !ingest
+  - stream: MyNode
+    event: !init_apply
+      metadata: { name: n1 }
+      spec: { podCIDRs: [10.244.0.0/24] }
+      status:
+        addresses:
+          - { type: InternalIP, address: 192.168.1.10 }
+  - stream: MyNode
+    event: !init_done
+  - stream: Service
+    event: !init_apply
+      metadata: { name: web, namespace: default }
+      spec:
+        type: ClusterIP
+        clusterIPs: [10.96.0.10]
+        sessionAffinity: ClientIP
+        sessionAffinityConfig:
+          clientIP: { timeoutSeconds: 108 }
+        ports:
+          - { name: http, protocol: TCP, port: 80, targetPort: 8080 }
+  - stream: Service
+    event: !init_done
+  - stream: EndpointSlice
+    event: !init_done
+
+- !verify |
+    set need_masquerade {
+    	type ipv4_addr . ipv4_addr . ipv4_addr
+    }
+
+    set need_masquerade6 {
+    	type ipv6_addr . ipv6_addr . ipv6_addr
+    }
+
+    map service_ips {
+    	type ipv4_addr . inet_proto . inet_service : verdict
+    	comment "ClusterIP, ExternalIP and LoadBalancer IP traffic"
+    	elements = { 10.96.0.10 . tcp . 80 : goto svc_default_web }
+    }
+
+    map service_nodeports {
+    	type inet_proto . inet_service : verdict
+    	comment "NodePort traffic"
+    }
+
+    chain a_hook_dnat_output {
+    	type nat hook output priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain a_hook_dnat_postrouting {
+    	type nat hook postrouting priority filter; policy accept;
+    	ip saddr . ip daddr . ct original ip daddr @need_masquerade masquerade
+    	ip6 saddr . ip6 daddr . ct original ip6 daddr @need_masquerade6 masquerade
+    	ip saddr 10.244.0.0/24 return
+    	ip daddr 10.244.0.0/24 return
+    	meta mark & 0x00004000 == 0x00000000 return
+    	meta mark set meta mark ^ 0x00004000 masquerade fully-random
+    }
+
+    chain a_hook_dnat_prerouting {
+    	type nat hook prerouting priority filter; policy accept;
+    	jump dispatch
+    }
+
+    chain dispatch {
+    	ip daddr . ip protocol . th dport vmap @service_ips
+    	fib daddr type local ip protocol . th dport vmap @service_nodeports
+    }
+
+    chain svc_default_web {
+    	reject with icmp port-unreachable
+    	reject with icmpv6 port-unreachable
+    }

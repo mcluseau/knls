@@ -468,6 +468,21 @@ impl<'a> Builder<'a> {
                     &self.my_node.ips,
                 );
             }
+            // NodePort traffic to a local endpoint has one of the node's own
+            // addresses as the original destination (the client dialed
+            // `<nodeIP>:<nodePort>`), so the hairpin masquerade has to match
+            // those too, not just the Service IPs.
+            if !svc.node_ports.is_empty() {
+                for ep in svc.external_endpoints().filter(|ep| ep.node_local) {
+                    add_need_masq(
+                        &mut v4,
+                        &mut v6,
+                        ep,
+                        self.my_node.ips.iter(),
+                        &self.my_node.ips,
+                    );
+                }
+            }
         }
 
         self.sets
@@ -547,7 +562,12 @@ impl<'a> Builder<'a> {
         );
     }
 
-    fn service(&mut self, key: &keys::Object, svc: &proxy::Service, dispatch: &mut DispatchIndices) {
+    fn service(
+        &mut self,
+        key: &keys::Object,
+        svc: &proxy::Service,
+        dispatch: &mut DispatchIndices,
+    ) {
         self.service_slices(key, svc, false, &svc.internal_slices, dispatch);
         if svc.needs_ext_chain {
             self.service_slices(key, svc, true, svc.external_slices(), dispatch);
@@ -575,17 +595,6 @@ impl<'a> Builder<'a> {
             SessionAffinity::ClientIP { timeout } => Some(timeout),
             SessionAffinity::None => None,
         };
-        if let Some(timeout) = affinity {
-            let ms = timeout as u64 * 1000;
-            let meta4 = SetMeta::from_elem::<(Ipv4Addr, Ipv4Addr)>(None).with_timeout(ms);
-            self.sets.entry(affinity_set(key, '4')).or_insert_with(|| {
-                SetSync::simple_with_meta::<(Ipv4Addr, Ipv4Addr)>(meta4, std::iter::empty())
-            });
-            let meta6 = SetMeta::from_elem::<(Ipv6Addr, Ipv6Addr)>(None).with_timeout(ms);
-            self.sets.entry(affinity_set(key, '6')).or_insert_with(|| {
-                SetSync::simple_with_meta::<(Ipv6Addr, Ipv6Addr)>(meta6, std::iter::empty())
-            });
-        }
 
         // The `Local` external policy's short-circuit (see below) reuses the
         // internal chain, so that chain's endpoints must not set the masquerade
@@ -630,6 +639,25 @@ impl<'a> Builder<'a> {
                             .or_insert(target);
                     }
                 }
+            }
+        }
+
+        // An affinity set is only referenced by the per-endpoint affinity rules,
+        // so with no endpoint of a family it is dead weight (and would linger
+        // empty): emit it per family only once that family has an endpoint.
+        if let Some(timeout) = affinity {
+            let ms = timeout as u64 * 1000;
+            if !present4.is_empty() {
+                let meta4 = SetMeta::from_elem::<(Ipv4Addr, Ipv4Addr)>(None).with_timeout(ms);
+                self.sets.entry(affinity_set(key, '4')).or_insert_with(|| {
+                    SetSync::simple_with_meta::<(Ipv4Addr, Ipv4Addr)>(meta4, std::iter::empty())
+                });
+            }
+            if !present6.is_empty() {
+                let meta6 = SetMeta::from_elem::<(Ipv6Addr, Ipv6Addr)>(None).with_timeout(ms);
+                self.sets.entry(affinity_set(key, '6')).or_insert_with(|| {
+                    SetSync::simple_with_meta::<(Ipv6Addr, Ipv6Addr)>(meta6, std::iter::empty())
+                });
             }
         }
 
@@ -706,14 +734,18 @@ impl<'a> Builder<'a> {
         self.add_chain(svc_chain.clone(), rules, anon_sets);
 
         // A `numgen` result is a host-endian 4-byte integer; key the map the
-        // same way so the lookup matches.
-        let entries = entries
-            .into_iter()
-            .map(|(n, verdict)| (n.to_ne_bytes().to_vec(), verdict));
-        self.sets.insert(
-            svc_chain,
-            SetSync::verdict_map_raw(dispatch_map_meta(), entries),
-        );
+        // same way so the lookup matches. A Service with no endpoint `reject`s
+        // and never looks the map up, so it is not emitted (and a previously
+        // emitted one is deleted).
+        if !entries.is_empty() {
+            let entries = entries
+                .into_iter()
+                .map(|(n, verdict)| (n.to_ne_bytes().to_vec(), verdict));
+            self.sets.insert(
+                svc_chain,
+                SetSync::verdict_map_raw(dispatch_map_meta(), entries),
+            );
+        }
     }
 }
 

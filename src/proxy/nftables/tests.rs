@@ -160,8 +160,8 @@ fn dispatch_indices_are_stable_across_renders() {
 }
 
 /// Updating an EndpointSlice to carry the `service.kubernetes.io/headless`
-/// label drops its endpoints (the Service is headless), so the dispatch map
-/// ends up empty and the service chain rejects.
+/// label drops its endpoints (the Service is headless), so the service chain
+/// rejects and its dispatch map is no longer emitted at all.
 #[test]
 fn headless_slice_label_drops_endpoints() {
     let state = ready_state();
@@ -189,8 +189,8 @@ fn headless_slice_label_drops_endpoints() {
         &cfg2,
         &mut DispatchIndices::default(),
     );
-    assert!(dispatch_map(&after).is_empty(), "endpoints dropped");
-    assert!(after.sets.contains_key("svc_default_web"));
+    // the Service has no endpoints now: no dispatch map (the chain rejects)
+    assert!(!after.sets.contains_key("svc_default_web"));
 }
 
 /// Only Ready node-local endpoints count towards a Service's health-check

@@ -54,7 +54,8 @@
 
     set need_masquerade {
     	type ipv4_addr . ipv4_addr . ipv4_addr
-    	elements = { 10.244.0.5 . 10.244.0.5 . 10.96.0.20 }
+    	elements = { 10.244.0.5 . 10.244.0.5 . 192.168.1.10,
+    		     10.244.0.5 . 10.244.0.5 . 10.96.0.20 }
     }
 
     set need_masquerade6 {

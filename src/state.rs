@@ -195,6 +195,9 @@ impl LocalEndpoint {
 pub struct LocalEndpointSlice {
     pub target_ports: Map<String, u16>,
     pub endpoints: Vec<LocalEndpoint>,
+    /// Whether the backing EndpointSlice is headless-labelled (the proxy must
+    /// skip it; DNS keeps using it).
+    pub headless: bool,
 }
 impl LocalEndpointSlice {
     fn from_slice<F>(slice: &EndpointSlice, node_name: &str, mut filter: F) -> Option<Self>
@@ -213,6 +216,7 @@ impl LocalEndpointSlice {
         Some(Self {
             target_ports: slice.target_ports.clone(),
             endpoints: endpoints.into_iter().collect(),
+            headless: slice.headless,
         })
     }
 
@@ -300,6 +304,12 @@ pub struct Service {
     pub external_ips: Set<IpAddr>,
     pub session_affinity: SessionAffinity,
     pub external_allow_list: Option<Set<String>>,
+    /// The `service.kubernetes.io/service-proxy-name` label, if set: such a
+    /// service is handled by another proxy and must not be programmed by us.
+    pub service_proxy_name: Option<String>,
+    /// The `service.kubernetes.io/headless` label: the proxy must treat the
+    /// service as headless (not program it).
+    pub headless: bool,
 }
 
 impl memstore::KeyValueFrom<core::Service> for Service {
@@ -322,6 +332,8 @@ impl memstore::KeyValueFrom<core::Service> for Service {
                 external_ips: Set::new(),
                 session_affinity: SessionAffinity::None,
                 external_allow_list: None,
+                service_proxy_name: service_proxy_name(svc),
+                headless: service_headless(svc),
             });
         };
 
@@ -400,8 +412,22 @@ impl memstore::KeyValueFrom<core::Service> for Service {
             external_ips: parse_ips(&spec.external_ips),
             session_affinity,
             external_allow_list,
+            service_proxy_name: service_proxy_name(svc),
+            headless: service_headless(svc),
         })
     }
+}
+
+/// The `service.kubernetes.io/service-proxy-name` label of a Service, if set.
+fn service_proxy_name(svc: &core::Service) -> Option<String> {
+    (svc.metadata.labels.as_ref())
+        .and_then(|l| l.get("service.kubernetes.io/service-proxy-name"))
+        .cloned()
+}
+
+/// Whether a Service carries the `service.kubernetes.io/headless` label.
+fn service_headless(svc: &core::Service) -> bool {
+    (svc.metadata.labels.as_ref()).is_some_and(|l| l.contains_key("service.kubernetes.io/headless"))
 }
 
 fn parse_ips(ips: &Option<Vec<String>>) -> Set<IpAddr> {
@@ -507,6 +533,9 @@ impl ProtoPort {
 pub struct EndpointSlice {
     pub target_ports: Map<String, u16>,
     pub endpoints: Set<Endpoint>,
+    /// The `service.kubernetes.io/headless` label: this slice belongs to a
+    /// headless Service, so the proxy must not program it.
+    pub headless: bool,
 }
 impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
     type Key = keys::EndpointSlice;
@@ -529,6 +558,9 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
                 .collect(),
 
             endpoints: Endpoint::from_slice_endpoints(&eps.endpoints).collect(),
+
+            headless: (eps.metadata.labels.as_ref())
+                .is_some_and(|l| l.contains_key("service.kubernetes.io/headless")),
         })
     }
 }

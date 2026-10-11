@@ -183,10 +183,6 @@
         labels: { "kubernetes.io/service-name": web }
 
 - !verify |
-    map svc_default_web {
-    	typeof numgen random mod 1 : verdict
-    }
-
     map service_ips {
     	type ipv4_addr . inet_proto . inet_service : verdict
     	comment "ClusterIP, ExternalIP and LoadBalancer IP traffic"

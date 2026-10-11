@@ -1,6 +1,6 @@
 use k8s_openapi::api::{core::v1 as core, discovery::v1 as discovery};
 use std::{
-    collections::{HashSet, hash_set},
+    collections::{BTreeMap, HashSet, hash_set},
     fmt,
     net::IpAddr,
 };
@@ -62,11 +62,18 @@ impl From<&core::Service> for Service {
 
 pub struct Endpoint {
     ips: HashSet<IpAddr>,
+    /// The slice's port name -> target port, to validate a flow's reply port.
+    target_ports: BTreeMap<String, u16>,
 }
 
 impl Endpoint {
     pub fn contains(&self, ip: &IpAddr) -> bool {
         self.ips.contains(ip)
+    }
+
+    /// The slice's target port for a service port `name`.
+    pub fn target_port(&self, name: &str) -> Option<u16> {
+        self.target_ports.get(name).copied()
     }
 }
 
@@ -76,6 +83,9 @@ impl From<&discovery::EndpointSlice> for Endpoint {
             ips: HashSet::from_iter(parse_iter(
                 eps.endpoints.iter().flat_map(|ep| &ep.addresses),
             )),
+            target_ports: (eps.ports.iter().flatten())
+                .filter_map(|p| Some((p.name.clone().unwrap_or_default(), p.port? as u16)))
+                .collect(),
         }
     }
 }
