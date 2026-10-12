@@ -83,7 +83,7 @@ spec:
 {{- if .Values.dns }}
       - name: unbound
         args: [ "-d", "-p", "-c", "/config/unbound.conf" ]
-        image: docker.io/mcluseau/unbound:1.20.0
+        image: docker.io/mcluseau/unbound:1.25.2
         imagePullPolicy: IfNotPresent
         securityContext:
           readOnlyRootFilesystem: true
