@@ -38,11 +38,6 @@
     event: !init_done
 
 - !verify |
-    map svc_default_web {
-    	typeof numgen random mod 1 : verdict
-    	elements = { 0 : goto svc_default_web_ep_0af40005 }
-    }
-
     set affinity4_default_web {
     	type ipv4_addr . ipv4_addr
     	size 65535
@@ -77,7 +72,7 @@
 
     chain svc_default_web {
     	ip saddr . 10.244.0.5 @affinity4_default_web goto svc_default_web_ep_0af40005
-    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_web
+    	meta nfproto ipv4 goto svc_default_web_ep_0af40005
     	reject with icmpv6 port-unreachable
     }
 

@@ -669,6 +669,12 @@ impl<'a> Builder<'a> {
         let n4 = families.v4.ips.len() as u32;
         let n6 = families.v6.ips.len() as u32;
 
+        // A family with a single endpoint dispatches straight to that endpoint's
+        // chain (a `numgen` would always pick slot 0): remember the chain and skip
+        // its map entry, so no map is emitted at all when both are single (or one
+        // is absent). The affinity set is unaffected.
+        let mut single4: Option<String> = None;
+        let mut single6: Option<String> = None;
         let mut entries: Vec<(u32, Verdict)> = Vec::new();
         for (family, slots) in [(Family::V4, &families.v4), (Family::V6, &families.v6)] {
             for (i, &ip) in slots.ips.iter().enumerate() {
@@ -707,7 +713,14 @@ impl<'a> Builder<'a> {
                 }
 
                 self.add_chain(ep_chain.clone(), rules, Vec::new());
-                entries.push((i as u32, Verdict::Goto(ep_chain)));
+                if slots.ips.len() == 1 {
+                    match family {
+                        Family::V4 => single4 = Some(ep_chain),
+                        Family::V6 => single6 = Some(ep_chain),
+                    }
+                } else {
+                    entries.push((i as u32, Verdict::Goto(ep_chain)));
+                }
             }
         }
 
@@ -724,9 +737,11 @@ impl<'a> Builder<'a> {
         }
 
         let mut rules = pre_rules;
-        for (family, n) in [(Family::V4, n4), (Family::V6, n6)] {
+        for (family, n, single) in [(Family::V4, n4, single4), (Family::V6, n6, single6)] {
             if n == 0 {
                 rules.push(rules::nfproto_reject(family));
+            } else if let Some(chain) = single {
+                rules.push(rules::nfproto_goto(family, &chain));
             } else {
                 rules.push(rules::numgen_vmap(family, n, &svc_chain));
             }

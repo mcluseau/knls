@@ -63,16 +63,6 @@
     	elements = { tcp . 30080 : goto svc_default_lb_ext }
     }
 
-    map svc_default_lb {
-    	typeof numgen random mod 1 : verdict
-    	elements = { 0 : goto svc_default_lb_ep_0af40005 }
-    }
-
-    map svc_default_lb_ext {
-    	typeof numgen random mod 1 : verdict
-    	elements = { 0 : goto svc_default_lb_ext_ep_0af40005 }
-    }
-
     chain a_hook_dnat_output {
     	type nat hook output priority filter; policy accept;
     	jump dispatch
@@ -99,7 +89,7 @@
     }
 
     chain svc_default_lb {
-    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_lb
+    	meta nfproto ipv4 goto svc_default_lb_ep_0af40005
     	reject with icmpv6 port-unreachable
     }
 
@@ -110,7 +100,7 @@
 
     chain svc_default_lb_ext {
     	fib saddr type local goto svc_default_lb
-    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_lb_ext
+    	meta nfproto ipv4 goto svc_default_lb_ext_ep_0af40005
     	reject with icmpv6 port-unreachable
     }
 

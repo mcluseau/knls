@@ -942,6 +942,15 @@ pub fn nfproto_reject(family: Family) -> Vec<Expr> {
     ]
 }
 
+/// `meta nfproto <family> goto <chain>` (dispatch straight to a single endpoint).
+pub fn nfproto_goto(family: Family, chain: &str) -> Vec<Expr> {
+    vec![
+        meta_nfproto(Register::Reg1),
+        eq(Register::Reg1, family.nfproto()),
+        goto(chain),
+    ]
+}
+
 /// `ip|ip6 saddr . <addr> @set goto <chain>` — the session-affinity match that
 /// pins a client to an endpoint.
 pub fn affinity_goto(family: Family, set: &str, addr: IpAddr, chain: &str) -> Vec<Expr> {

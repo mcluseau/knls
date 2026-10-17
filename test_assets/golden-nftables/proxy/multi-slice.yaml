@@ -71,11 +71,6 @@
     	comment "NodePort traffic"
     }
 
-    map svc_default_web {
-    	typeof numgen random mod 1 : verdict
-    	elements = { 0 : goto svc_default_web_ep_0af40005 }
-    }
-
     chain a_hook_dnat_output {
     	type nat hook output priority filter; policy accept;
     	jump dispatch
@@ -102,7 +97,7 @@
     }
 
     chain svc_default_web {
-    	meta nfproto ipv4 numgen random mod 1 vmap @svc_default_web
+    	meta nfproto ipv4 goto svc_default_web_ep_0af40005
     	reject with icmpv6 port-unreachable
     }
 

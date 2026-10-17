@@ -171,7 +171,10 @@ fn headless_slice_label_drops_endpoints() {
         &cfg,
         &mut DispatchIndices::default(),
     );
-    assert!(!dispatch_map(&before).is_empty(), "endpoint dispatched");
+    assert!(
+        before.chains.contains_key("svc_default_web_ep_0af40005"),
+        "endpoint dispatched"
+    );
 
     let mut state2 = ready_state();
     let mut updated = slice();
@@ -189,7 +192,8 @@ fn headless_slice_label_drops_endpoints() {
         &cfg2,
         &mut DispatchIndices::default(),
     );
-    // the Service has no endpoints now: no dispatch map (the chain rejects)
+    // the Service has no endpoints now: neither its endpoint chain nor a map
+    assert!(!after.chains.contains_key("svc_default_web_ep_0af40005"));
     assert!(!after.sets.contains_key("svc_default_web"));
 }
 
@@ -272,9 +276,10 @@ fn render_has_base_chains_and_dispatch() {
     for name in ["service_ips", "service_nodeports", "need_masquerade"] {
         assert!(table.sets.contains_key(name), "missing set {name}");
     }
-    // the per-service map and chain share a name
+    // a single-endpoint Service dispatches straight to its endpoint chain: no map
     assert!(table.chains.contains_key("svc_default_web"));
-    assert!(table.sets.contains_key("svc_default_web"));
+    assert!(table.chains.contains_key("svc_default_web_ep_0af40005"));
+    assert!(!table.sets.contains_key("svc_default_web"));
 }
 
 /// A [`test_harness::System`] rendering the proxy as a [`TableSync`] and
