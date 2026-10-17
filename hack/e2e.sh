@@ -23,7 +23,9 @@
 #   K8S_VERSION  Kubernetes version to test, e.g. v1.31.0
 #                (default: the server version reported by the cluster)
 #   KUBECONFIG   kubeconfig to test against (default: ~/.kube/config)
-#   FOCUS, SKIP  Ginkgo focus/skip regexes (default FOCUS: \[sig-network\])
+#   FOCUS        Ginkgo focus regex (default: \[sig-network\])
+#   SKIP         extra Ginkgo skip regex, added to the built-in list below of
+#                specs that cannot pass against a knls cluster
 #   NODES        Ginkgo parallel nodes (default: 1)
 #   ARTIFACTS    report directory (default: $PWD/tmp/e2e-results)
 #   IMAGE        conformance image (default: registry.k8s.io/conformance:$K8S_VERSION)
@@ -34,7 +36,16 @@ set -euo pipefail
 
 kubeconfig=${KUBECONFIG:-${HOME}/.kube/config}
 focus=${FOCUS:-'\[sig-network\]'}
-skip=${SKIP:-}
+# Specs that cannot pass against a knls cluster (or are marked not applicable
+# upstream) are always skipped; a caller-provided SKIP adds more:
+#   - DualStack / Disruptive / LoadBalancer: single-stack, disruptive, no cloud
+#     provider
+#   - DNS `configMap nameserver`: they need a kube-dns/CoreDNS pod to edit,
+#     which knls replaces
+#   - `Networking-IPv6`: needs an IPv6/dual-stack cluster
+#   - `RelaxedServiceNameValidation`: alpha feature gate, disabled
+default_skip='DualStack|Disruptive|LoadBalancer|DNS configMap nameserver|Networking-IPv6|RelaxedServiceNameValidation'
+skip="${SKIP:+${SKIP}|}${default_skip}"
 nodes=${NODES:-1}
 artifacts=${ARTIFACTS:-${PWD}/tmp/e2e-results}
 

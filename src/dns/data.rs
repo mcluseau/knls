@@ -119,6 +119,7 @@ def_record_types!(
     MX => 15,
     TXT => 16,
     AAAA => 28,
+    SRV => 33,
     OPT => 41,
 );
 
@@ -179,6 +180,21 @@ impl Record {
         name.write_to(&mut rdata);
         Self {
             rtype: RecordType::MX,
+            class: 1,
+            ttl,
+            rdata,
+        }
+    }
+
+    /// `SRV` record: `priority weight port target`.
+    pub fn srv(ttl: u32, priority: u16, weight: u16, port: u16, target: &DomainName) -> Self {
+        let mut rdata = Vec::with_capacity(6 + target.raw_len());
+        packet::push_u16(&mut rdata, priority);
+        packet::push_u16(&mut rdata, weight);
+        packet::push_u16(&mut rdata, port);
+        target.write_to(&mut rdata);
+        Self {
+            rtype: RecordType::SRV,
             class: 1,
             ttl,
             rdata,

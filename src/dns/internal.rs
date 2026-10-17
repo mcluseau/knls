@@ -9,16 +9,21 @@ use crate::dns::{self, data, packet};
 use crate::{actions, kube_watch::EventReceiver, state::State};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Config {
     cluster_domain: String,
-    #[serde(default = "default_bind")]
     bind: String,
-
-    #[serde(default)]
     on_listen: Vec<crate::actions::Action>,
 }
-fn default_bind() -> String {
-    "127.0.0.1:1053".into()
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            cluster_domain: "cluster.local".into(),
+            bind: "127.0.0.1:1053".into(),
+            on_listen: vec![],
+        }
+    }
 }
 
 pub async fn watch(
@@ -44,8 +49,10 @@ pub async fn watch(
                 };
                 if !updated || !state.is_ready() { continue; }
 
-                let cluster_zone = dns::cluster_zone_from_state(&state);
+                let cluster_zone = dns::cluster_zone_from_state(&state, &cluster_domain);
+                root = data::Domain::new();
                 root.set(&cluster_domain, cluster_zone);
+                dns::add_reverse_records(&mut root, &state, &cluster_domain);
             },
             result = sock.readable() => {
                 if let Err(e) = result {
