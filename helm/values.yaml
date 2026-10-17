@@ -6,6 +6,17 @@ image:
 hostNetwork: true
 nodeSelector: null
 
+minReadySeconds: 60
+
+# Conntrack sysctls set by a privileged initContainer before knls starts, in
+# the host network namespace (the main container's /proc/sys is read-only).
+# These match kube-proxy: a CLOSE_WAIT entry that expires too early drops the
+# local FIN and can reset a new connection reusing the SNAT tuple
+# (kubernetes/kubernetes#32551).
+sysctls:
+  net.netfilter.nf_conntrack_tcp_timeout_close_wait: 3600
+  net.netfilter.nf_conntrack_tcp_timeout_established: 86400
+
 #extra_conf: |-
 #  on_start: ...
 #
@@ -16,9 +27,13 @@ nodeSelector: null
 #    chain: masq-pods
 #    rules: |-
 #      type nat hook postrouting priority 999; policy accept;
+#      ct status dnat return
 #      meta iifkind "veth" oifname != "kwg" masquerade
 
 #service_ips: [ 1.2.3.4 ]
+# The cluster's Service (ClusterIP) CIDR(s); used e.g. to delegate their reverse
+# DNS zones to knls, so PTR lookups for ClusterIPs resolve.
+service_cidrs: []
 cluster_domain: cluster.local
 extra_zones: {}
 
@@ -37,6 +52,9 @@ wireguard:
   ifname: kwg
   key_dir: /var/lib/knls/wireguard
   key: wireguard.key
+  # Chain the CNI `portmap` plugin so pods' `hostPort`s are reachable
+  # (requires the `portmap` CNI plugin binary on the nodes).
+  host_ports: false
 
 dns: internal
 

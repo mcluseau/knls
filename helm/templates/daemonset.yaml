@@ -6,7 +6,7 @@ metadata:
   labels:
     app: knls
 spec:
-  minReadySeconds: 60
+  minReadySeconds: {{ .Values.minReadySeconds }}
 
   updateStrategy:
 {{ if .Values.hostNetwork }}
@@ -47,6 +47,26 @@ spec:
 {{- with .Values.nodeSelector }}
       nodeSelector:
 {{ . |toYaml |indent 8 }}
+{{- end }}
+
+{{- if and .Values.hostNetwork .Values.sysctls }}
+      # kube-proxy sets these conntrack timeouts; the main container cannot
+      # (its /proc/sys is read-only), so a privileged initContainer does it in
+      # the host network namespace.
+      initContainers:
+      - name: sysctls
+        image: {{.Values.image.repo}}:{{ default (printf "v%s" .Chart.AppVersion) .Values.image.tag }}
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+{{- range $name, $value := .Values.sysctls }}
+          echo {{ $value }} > /proc/sys/{{ $name |replace "." "/" }}
+{{- end }}
+        securityContext:
+          privileged: true
 {{- end }}
 
       containers:

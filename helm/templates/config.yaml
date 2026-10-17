@@ -36,12 +36,20 @@ data:
       mtu: {{.}}
 {{-     end}}
       key_path: "/var/lib/knls/wireguard/{{.key}}"
+{{-     if .host_ports}}
+      host_ports: true
+{{-     end}}
       on_create:
       - !nft_chain
         table: knls
         chain: wireguard
+        # about `ct status dnat return`:
+        # Leave service traffic alone: the proxy already decided the source
+        # (e.g. the `Local` external-policy short-circuit keeps the local node
+        # address so the backend can reply directly).
         rules: |-
           type nat hook postrouting priority 999; policy accept;
+          ct status dnat return
           fib saddr type local oif {{ .ifname |quote }} masquerade
 {{-   end }}{{ end }}
 {{- end }}
@@ -68,6 +76,20 @@ data:
 
       domain-insecure: {{ .Values.cluster_domain |quote }}
       local-zone: {{ .Values.cluster_domain |quote }} nodefault
+      {{- /* Reverse zones delegated to the (unsigned) knls DNS below. */}}
+    {{- range .Values.service_cidrs }}
+    {{- if and (contains "/" .) (not (contains ":" .)) }}
+    {{- $spec := splitList "/" . }}
+    {{- $n := div (int (last $spec)) 8 }}
+    {{- $zone := printf "%s.in-addr.arpa" (join "." (reverse (slice (splitList "." (first $spec)) 0 $n))) }}
+      domain-insecure: {{ $zone | quote }}
+      {{- /*
+      without `nodefault`, unbound's AS112 empty zone for the private reverse
+      range shadows our stub-zone
+      */}}
+      local-zone: {{ $zone | quote }} nodefault
+    {{- end }}
+    {{- end }}
     {{- range (keys .Values.extra_zones) }}
       domain-insecure: {{ . |quote }}
       local-zone: {{ . |quote }} nodefault
@@ -79,6 +101,22 @@ data:
       name: {{ .Values.cluster_domain |quote }}
       stub-addr: 127.0.0.1@1053
       stub-no-cache: yes
+
+    {{- /*
+    Delegate the reverse (`in-addr.arpa`) zones of the Service CIDR(s) to the
+    knls DNS, which serves the PTR records for Service ClusterIPs.
+    */}}
+    {{- range .Values.service_cidrs }}
+    {{- if and (contains "/" .) (not (contains ":" .)) }}
+    {{- $spec := splitList "/" . }}
+    {{- $n := div (int (last $spec)) 8 }}
+    {{- $zone := printf "%s.in-addr.arpa" (join "." (reverse (slice (splitList "." (first $spec)) 0 $n))) }}
+    stub-zone:
+      name: {{ $zone | quote }}
+      stub-addr: 127.0.0.1@1053
+      stub-no-cache: yes
+    {{- end }}
+    {{- end }}
 
     {{- range (keys .Values.extra_zones) }}
     auth-zone:
