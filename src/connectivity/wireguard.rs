@@ -246,10 +246,13 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     let mut state = State::new();
 
     loop {
-        let Some(updated) = state.ingest_events(&mut events).await else {
-            return Ok(());
-        };
-        if !updated || !state.is_ready() {
+        use std::ops::ControlFlow::*;
+        match state.ingest_events(&mut events).await {
+            Some(Break(())) => return Ok(()),
+            Some(Continue(())) => continue,
+            None => {}
+        }
+        if !state.is_ready() {
             continue;
         }
 

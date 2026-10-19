@@ -2,11 +2,19 @@ use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::{
     core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
 };
-use kube::{Client, api::Api, runtime::watcher};
+use kube::{api::Api, runtime::watcher, Client};
 use log::{error, info};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout, Duration, Instant},
+};
+
+/// How long a burst of events is coalesced into a single update.
+const COALESCE_WINDOW: Duration = Duration::from_millis(10);
+/// How long to wait for the next event before re-checking the coalescing window.
+const COALESCE_WAIT: Duration = Duration::from_millis(1);
 
 pub type EventReceiver = mpsc::Receiver<Event>;
 
@@ -35,8 +43,8 @@ pub enum Change<K> {
 
 impl<K> From<watcher::Event<K>> for Change<K> {
     fn from(event: watcher::Event<K>) -> Self {
-        use Change as C;
         use watcher::Event as E;
+        use Change as C;
         match event {
             E::Init => C::Init,
             E::InitApply(v) => C::InitApply(Arc::new(v)),
@@ -145,8 +153,25 @@ pub async fn ingest_events(
     };
     let mut updated = ingest(event);
 
-    while let Ok(event) = events.try_recv() {
-        updated |= ingest(event);
+    // Coalesce a burst (e.g. a watch (re)list re-emitting thousands of
+    // `InitApply`s) into one update instead of one per buffered batch: keep
+    // consuming for up to `COALESCE_WINDOW`, waiting at most `COALESCE_WAIT`
+    // for the next event. `try_recv` drains whatever is already queued.
+    let deadline = Instant::now() + COALESCE_WINDOW;
+    loop {
+        while let Ok(event) = events.try_recv() {
+            updated |= ingest(event);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        match timeout(COALESCE_WAIT, events.recv()).await {
+            Ok(Some(event)) => updated |= ingest(event),
+            // the stream closed; the next call reports it
+            Ok(None) => break,
+            // nothing in flight right now, keep the window open for the rest
+            Err(_) => {}
+        }
     }
 
     (!updated).then_some(ControlFlow::Continue(()))
@@ -170,7 +195,7 @@ async fn watch_to_events<K>(
             Ok(v) => v,
             Err(e) => {
                 error!("watch error: {resource}: {e}");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };

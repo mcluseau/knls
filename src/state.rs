@@ -144,14 +144,8 @@ impl State {
     pub async fn ingest_events(
         &mut self,
         rx: &mut crate::kube_watch::EventReceiver,
-    ) -> Option<bool> {
-        let mut updated = self.ingest(&rx.recv().await?);
-
-        while let Ok(e) = rx.try_recv() {
-            updated |= self.ingest(&e);
-        }
-
-        Some(updated)
+    ) -> Option<std::ops::ControlFlow<()>> {
+        crate::kube_watch::ingest_events(rx, |e| self.ingest(&e)).await
     }
 }
 

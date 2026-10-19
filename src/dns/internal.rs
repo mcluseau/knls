@@ -44,10 +44,13 @@ pub async fn watch(
     loop {
         tokio::select!(
             updated = state.ingest_events(&mut events) => {
-                let Some(updated) = updated else {
-                    return Ok(())
-                };
-                if !updated || !state.is_ready() { continue; }
+                use std::ops::ControlFlow::*;
+                match updated {
+                    Some(Break(())) => return Ok(()),
+                    Some(Continue(())) => continue,
+                    None => {}
+                }
+                if !state.is_ready() { continue; }
 
                 let cluster_zone = dns::cluster_zone_from_state(&state, &cluster_domain);
                 root = data::Domain::new();

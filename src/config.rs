@@ -35,7 +35,7 @@ pub struct Config {
     pub network_policy: Option<NetworkPolicy>,
 }
 fn default_event_buffer() -> usize {
-    100
+    1024
 }
 
 impl Config {

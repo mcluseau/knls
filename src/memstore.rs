@@ -39,17 +39,14 @@ macro_rules! multimap {
                 }
             }
 
-            /// ingest pending events, waiting for them.
-            /// Returns None at the end of stream.
-            /// Returns Some(true) iff at least one map was updated.
-            pub async fn ingest_events(&mut self, rx: &mut $crate::kube_watch::EventReceiver) -> Option<bool> {
-                let mut updated = self.ingest(&rx.recv().await?);
-
-                while let Ok(e) = rx.try_recv() {
-                    updated |= self.ingest(&e);
-                }
-
-                Some(updated)
+            /// Ingest events, waiting for them, coalescing a burst into one pass.
+            /// Returns `None` when at least one map was updated, `Some(Break)`
+            /// at the end of stream, `Some(Continue)` when nothing was updated.
+            pub async fn ingest_events(
+                &mut self,
+                rx: &mut $crate::kube_watch::EventReceiver,
+            ) -> Option<std::ops::ControlFlow<()>> {
+                $crate::kube_watch::ingest_events(rx, |e| self.ingest(&e)).await
             }
         }
     };
