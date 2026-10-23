@@ -2,13 +2,13 @@ use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::{
     core::v1 as core, discovery::v1 as discovery, networking::v1 as networking,
 };
-use kube::{api::Api, runtime::watcher, Client};
+use kube::{Client, api::Api, runtime::watcher};
 use log::{error, info};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::{
     sync::mpsc,
-    time::{sleep, timeout, Duration, Instant},
+    time::{Duration, Instant, sleep, timeout},
 };
 
 /// How long a burst of events is coalesced into a single update.
@@ -43,8 +43,8 @@ pub enum Change<K> {
 
 impl<K> From<watcher::Event<K>> for Change<K> {
     fn from(event: watcher::Event<K>) -> Self {
-        use watcher::Event as E;
         use Change as C;
+        use watcher::Event as E;
         match event {
             E::Init => C::Init,
             E::InitApply(v) => C::InitApply(Arc::new(v)),

@@ -91,13 +91,16 @@ fn raise_rcvbuf(socket: &impl AsFd, target: usize) {
 }
 
 /// Iterator splitting messages into datagrams bounded by their cumulative
-/// serialized size.
+/// serialized size and their message count.
 ///
 /// A message is never split, and every batch contains at least one message
-/// (even if that single message exceeds `max_bytes`).
+/// (even if that single message exceeds `max_bytes`). The message cap keeps the
+/// number of per-message ACKs a single request can queue within the socket's
+/// receive buffer (see [`ACK_BYTES_PER_MESSAGE`]).
 struct Batches<T, I> {
     msgs: I,
     max_bytes: usize,
+    max_messages: usize,
     /// message that did not fit in the previous batch
     pending: Option<NetlinkMessage<T>>,
 }
@@ -123,7 +126,9 @@ where
             let len = msg.buffer_len();
 
             // a batch always holds at least one message, even oversized
-            if !batch.is_empty() && bytes + len > self.max_bytes {
+            if !batch.is_empty()
+                && (bytes + len > self.max_bytes || batch.len() >= self.max_messages)
+            {
                 self.pending = Some(msg);
                 break;
             }
@@ -136,14 +141,17 @@ where
     }
 }
 
-/// Split messages into datagrams bounded by their cumulative serialized size.
+/// Split messages into datagrams bounded by their cumulative serialized size
+/// and their message count.
 fn batches<T: NetlinkSerializable>(
     msgs: impl IntoIterator<Item = NetlinkMessage<T>>,
     max_bytes: usize,
+    max_messages: usize,
 ) -> Batches<T, impl Iterator<Item = NetlinkMessage<T>>> {
     Batches {
         msgs: msgs.into_iter(),
         max_bytes,
+        max_messages,
         pending: None,
     }
 }
@@ -217,11 +225,14 @@ where
         self.max_batch_bytes
     }
 
-    /// Send messages in as few datagrams as possible, yielding every response.
+    /// Send messages in datagrams bounded by size and message count, yielding
+    /// every response.
     ///
     /// The returned stream yields the responses of every message across every
     /// datagram, as well as any send error (so a failure of one datagram does
-    /// not abort the remaining ones).
+    /// not abort the remaining ones). Each datagram is sent and its responses
+    /// drained before the next is sent, so at most `MAX_TX_MESSAGES` ACKs are
+    /// outstanding and the socket's receive buffer cannot overrun.
     ///
     /// Caller MUST consume ALL responses to drain the socket.
     pub fn send_batched<'a>(
@@ -233,7 +244,7 @@ where
     {
         let handle = &self.handle;
         let dest = self.dest;
-        stream::iter(batches(msgs, self.max_batch_bytes)).flat_map(move |batch| {
+        stream::iter(batches(msgs, self.max_batch_bytes, MAX_TX_MESSAGES)).flat_map(move |batch| {
             match handle.request_batch(batch, dest) {
                 Ok(responses) => responses.map(Ok).boxed(),
                 Err(e) => stream::once(async move { Err(e) }).boxed(),
@@ -335,14 +346,14 @@ mod tests {
 
     #[test]
     fn empty() {
-        assert!(batches::<Fake>([], 100).next().is_none());
+        assert!(batches::<Fake>([], 100, usize::MAX).next().is_none());
     }
 
     #[test]
     fn exact_fit() {
         let unit = total(&Fake::new(0));
         let msgs = (0..3).map(|_| Fake::new(0)).collect::<Vec<_>>();
-        let out = batches(msgs, unit * 3).collect::<Vec<_>>();
+        let out = batches(msgs, unit * 3, usize::MAX).collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         assert_eq!(batch_sizes(&out[0]), [unit; 3]);
     }
@@ -351,10 +362,21 @@ mod tests {
     fn one_over_splits() {
         let unit = total(&Fake::new(0));
         let msgs = (0..3).map(|_| Fake::new(0)).collect::<Vec<_>>();
-        let out = batches(msgs, unit * 3 - 1).collect::<Vec<_>>();
+        let out = batches(msgs, unit * 3 - 1, usize::MAX).collect::<Vec<_>>();
         assert_eq!(out.len(), 2);
         assert_eq!(batch_sizes(&out[0]), [unit; 2]);
         assert_eq!(batch_sizes(&out[1]), [unit]);
+    }
+
+    #[test]
+    fn max_messages_splits() {
+        // a huge byte budget: only the message count should split
+        let msgs = (0..5).map(|_| Fake::new(0)).collect::<Vec<_>>();
+        let out = batches(msgs, usize::MAX, 2).collect::<Vec<_>>();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].len(), 2);
+        assert_eq!(out[1].len(), 2);
+        assert_eq!(out[2].len(), 1);
     }
 
     #[test]
@@ -362,7 +384,7 @@ mod tests {
         let small = total(&Fake::new(0));
         let big = total(&Fake::new(small * 4));
         let msgs = vec![Fake::new(small * 4), Fake::new(0)];
-        let out = batches(msgs, small).collect::<Vec<_>>();
+        let out = batches(msgs, small, usize::MAX).collect::<Vec<_>>();
         assert_eq!(out.len(), 2);
         assert_eq!(batch_sizes(&out[0]), [big]);
         assert_eq!(batch_sizes(&out[1]), [small]);
