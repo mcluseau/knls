@@ -33,7 +33,7 @@
 
     chain ingress_pod_x_x1 {
     	jump ingress_netpol_x_np
-    	reject
+    	counter packets 0 bytes 0 reject
     }
 
     chain pods_filter {

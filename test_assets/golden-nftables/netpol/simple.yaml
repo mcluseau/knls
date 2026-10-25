@@ -52,7 +52,7 @@
 
     chain ingress_pod_default_a {
     	jump ingress_netpol_default_np
-    	reject
+    	counter packets 0 bytes 0 reject
     }
 
     chain ingress_netpol_default_np {

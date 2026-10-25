@@ -58,7 +58,7 @@
 
     chain egress_pod_x_a {
     	jump egress_netpol_x_allow-egress
-    	reject
+    	counter packets 0 bytes 0 reject
     }
 
     chain pods_filter {

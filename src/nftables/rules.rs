@@ -120,6 +120,14 @@ pub fn reject() -> Expr {
     Reject::default().into()
 }
 
+/// An anonymous per-rule counter (`counter`).
+///
+/// The kernel allocates the counter state; `nft list` prints it inline, e.g.
+/// `counter packets 0 bytes 0 reject`.
+pub fn counter() -> Expr {
+    other("counter", Vec::new())
+}
+
 /// `accept`.
 pub fn accept() -> Expr {
     verdict(Verdict::Accept)

@@ -65,12 +65,12 @@
 
     chain ingress_pod_default_db {
     	jump ingress_netpol_default_test-network-policy
-    	reject
+    	counter packets 0 bytes 0 reject
     }
 
     chain egress_pod_default_db {
     	jump egress_netpol_default_test-network-policy
-    	reject
+    	counter packets 0 bytes 0 reject
     }
 
     chain ingress_netpol_default_test-network-policy {

@@ -30,6 +30,8 @@ pub struct Config {
     reject: RejectAction,
     /// reject action (for egress rules)
     egress_reject: RejectAction,
+    /// count packets rejected by rules
+    reject_counters: bool,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             table: "kube-netpol".into(),
             reject: RejectAction::Reject,
             egress_reject: RejectAction::Reject,
+            reject_counters: true,
         }
     }
 }
@@ -164,7 +167,12 @@ impl<'t> Builder<'t> {
                         vec![rules::jump(format!("ingress_netpol_{np_ns}_{np_name}"))]
                     })
                     .collect();
-                rules.push(action_rule(pod, ANN_REJECT, self.cfg.reject));
+                rules.push(action_rule(
+                    pod,
+                    ANN_REJECT,
+                    self.cfg.reject,
+                    self.cfg.reject_counters,
+                ));
                 self.add_chain(chain_name, rules, Vec::new());
             }
 
@@ -187,7 +195,12 @@ impl<'t> Builder<'t> {
                         vec![rules::jump(format!("egress_netpol_{np_ns}_{np_name}"))]
                     })
                     .collect();
-                rules.push(action_rule(pod, ANN_EGRESS_REJECT, self.cfg.egress_reject));
+                rules.push(action_rule(
+                    pod,
+                    ANN_EGRESS_REJECT,
+                    self.cfg.egress_reject,
+                    self.cfg.reject_counters,
+                ));
                 self.add_chain(chain_name, rules, Vec::new());
             }
         }
@@ -319,16 +332,22 @@ impl<'t> Builder<'t> {
 }
 
 /// The rule a pod chain applies when no netpol rule matched.
-fn action_rule(pod: &Pod, annotation: &str, default: RejectAction) -> Rule {
+fn action_rule(pod: &Pod, annotation: &str, default: RejectAction, counters: bool) -> Rule {
     let action = pod
         .annotations
         .get(annotation)
         .map(|v| RejectAction::from_annotation(v))
         .unwrap_or(default);
-    match action {
-        RejectAction::Drop => vec![rules::drop()],
-        RejectAction::Reject => vec![Reject::default().into()],
+
+    let mut rule = Vec::with_capacity(usize::from(counters) + 1);
+    if counters {
+        rule.push(rules::counter());
     }
+    rule.push(match action {
+        RejectAction::Drop => rules::drop(),
+        RejectAction::Reject => Reject::default().into(),
+    });
+    rule
 }
 
 /// Builds the rules of one netpol rule, registering its named and anonymous
@@ -1023,6 +1042,13 @@ mod tests {
     }
 
     #[test]
+    fn config_reject_counters_defaults_and_parses() {
+        assert!(Config::default().reject_counters);
+        let cfg: Config = serde_yaml::from_str("reject_counters: false").expect("should parse");
+        assert!(!cfg.reject_counters);
+    }
+
+    #[test]
     fn reject_action_defaults_and_overrides() {
         assert_eq!(RejectAction::from_annotation("drop"), RejectAction::Drop);
         assert_eq!(
@@ -1041,9 +1067,25 @@ mod tests {
             ports: Vec::new(),
         };
         p.annotations.insert(ANN_REJECT.into(), "drop".into());
-        let rule = action_rule(&p, ANN_REJECT, RejectAction::Reject);
+        let rule = action_rule(&p, ANN_REJECT, RejectAction::Reject, false);
         // `drop` is an immediate verdict, not a reject expression
         assert_eq!(rule.len(), 1);
+
+        // with counters, the action is preceded by a `counter` expression
+        let rule = action_rule(&p, ANN_REJECT, RejectAction::Reject, true);
+        assert_eq!(rule.len(), 2);
+        fn name(expr: &ListAttribute<ExpressionAttribute>) -> Option<&str> {
+            let ListAttribute::Element(attrs) = expr else {
+                return None;
+            };
+            attrs.iter().find_map(|a| match a {
+                ExpressionAttribute::Name(name) => Some(name.as_str()),
+                _ => None,
+            })
+        }
+        assert_eq!(name(&rule[0]), Some("counter"));
+        // `drop` is still the verdict, now counted
+        assert_eq!(name(&rule[1]), Some("immediate"));
     }
 
     #[test]
