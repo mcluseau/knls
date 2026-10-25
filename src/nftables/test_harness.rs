@@ -1,7 +1,6 @@
-use super::Message;
 use crate::{
     kube_watch,
-    netlink::netfilter::{self, NetlinkExt as _},
+    netlink::netfilter::{self, Group, NetlinkExt as _},
 };
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -39,20 +38,20 @@ pub trait System: Sized {
     fn ingest(&mut self, _event: kube_watch::Event) {}
     /// Selects one of the scenario's states.
     fn custom(&mut self, _id: usize) {}
-    /// The netlink messages applying the current state to the table.
+    /// The netlink message groups applying the current state to the table.
     ///
     /// Only needed by the default [`apply`](System::apply); a system that
     /// overrides `apply` need not implement it.
-    fn render(&mut self) -> Vec<Message> {
+    fn render(&mut self) -> Vec<Group> {
         unimplemented!("implement either `render` or `apply`")
     }
-    /// Renders the current state and sends the resulting messages to
-    /// `table`. Overridable, e.g. to apply through a
+    /// Renders the current state and sends the resulting groups to `table`.
+    /// Overridable, e.g. to apply through a
     /// [`TableState`](crate::nftables::table_sync::TableState).
     async fn apply(&mut self, table: &str) {
-        let messages = self.render();
+        let groups = self.render();
         let nl = netfilter::new_link().expect("netlink");
-        nl.send_as_transactions(messages.into_iter())
+        nl.send_groups(groups.into_iter())
             .await
             .unwrap_or_else(|e| panic!("apply to {table} failed: {e}"));
     }
@@ -142,17 +141,17 @@ fn compare_bodies(expected: &str, actual: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Applies `messages` to a clean `table` and returns the resulting body, as
+/// Applies `groups` to a clean `table` and returns the resulting body, as
 /// [`dump`] would. Exposed for scenario drivers that render themselves.
 ///
 /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
-pub async fn capture(table: &str, messages: Vec<Message>) -> String {
-    dump(table, messages).await
+pub async fn capture(table: &str, groups: Vec<Group>) -> String {
+    dump(table, groups).await
 }
 
-/// Applies `messages` to `table` and returns the table body (without the
+/// Applies `groups` to `table` and returns the table body (without the
 /// `table <table> { … }` wrapper) as dumped by `nft list`.
-async fn dump(table: &str, messages: Vec<Message>) -> String {
+async fn dump(table: &str, groups: Vec<Group>) -> String {
     // best-effort cleanup: the table usually does not exist yet
     let _ = Command::new("nft")
         .args(["delete", "table", "inet", table])
@@ -160,9 +159,7 @@ async fn dump(table: &str, messages: Vec<Message>) -> String {
         .status();
 
     let nl = netfilter::new_link().expect("netlink");
-    nl.send_as_transactions(messages.into_iter())
-        .await
-        .expect("apply");
+    nl.send_groups(groups.into_iter()).await.expect("apply");
 
     let out = Command::new("nft")
         .args(["list", "table", "inet", table])

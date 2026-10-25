@@ -16,6 +16,11 @@ use netlink_packet_netfilter::{
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// `sync`'s groups flattened, for asserting on the message stream.
+fn sync_all(table: &str, prev: Option<&TableSyncRef>, next: &TableSync) -> Vec<Message> {
+    sync(table, prev, next).into_iter().flatten().collect()
+}
+
 /// A coarse classification of the messages `sync` emits, for asserting the
 /// diff structure without a kernel.
 #[derive(Debug, PartialEq, Eq)]
@@ -195,7 +200,7 @@ fn table_all() -> TableSync {
 #[test]
 fn first_apply_is_a_full_create() {
     let next = table_all();
-    let msgs = sync("t", None, &next);
+    let msgs = sync_all("t", None, &next);
     let s = steps(&msgs);
 
     // recreate, then the set and the chain
@@ -221,7 +226,7 @@ fn first_apply_is_a_full_create() {
 fn noop_emits_nothing() {
     let next = table_all();
     let prev = next.reference("t");
-    assert!(sync("t", Some(&prev), &next).is_empty());
+    assert!(sync_all("t", Some(&prev), &next).is_empty());
 }
 
 #[test]
@@ -230,7 +235,7 @@ fn set_element_add_and_remove() {
     let new = table_with_set([2, 3, 4]);
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     let s = steps(&msgs);
 
     // exactly one delete (10.0.0.1) then one add (10.0.0.4), no recreate
@@ -247,7 +252,7 @@ fn unchanged_set_is_not_recreated() {
     let old = table_with_set([1, 2]);
     let new = table_with_set([1, 2]);
     let prev = old.reference("t");
-    assert!(sync("t", Some(&prev), &new).is_empty());
+    assert!(sync_all("t", Some(&prev), &new).is_empty());
 }
 
 #[test]
@@ -276,7 +281,7 @@ fn map_value_change_deletes_then_adds() {
     );
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     assert_eq!(
         steps(&msgs),
         vec![Step::Elem("m".into(), true), Step::Elem("m".into(), false)]
@@ -292,7 +297,7 @@ fn chain_rule_change_flushes_and_refills() {
     let new = table_with_chain(vec![rule("b")]);
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     assert_eq!(
         steps(&msgs),
         vec![Step::Flush("c".into()), Step::NewRule("c".into())]
@@ -304,7 +309,7 @@ fn unchanged_chain_is_not_flushed() {
     let old = table_with_chain(vec![rule("a")]);
     let new = table_with_chain(vec![rule("a")]);
     let prev = old.reference("t");
-    assert!(sync("t", Some(&prev), &new).is_empty());
+    assert!(sync_all("t", Some(&prev), &new).is_empty());
 }
 
 #[test]
@@ -316,7 +321,7 @@ fn set_metadata_change_is_a_full_recreate() {
         .insert("s".into(), SetSync::simple([Ipv6Addr::LOCALHOST], None));
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     assert_eq!(
         classify(&msgs[0]),
         Step::Recreate,
@@ -335,7 +340,7 @@ fn comment_only_change_reissues_the_set() {
     }
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     let s = steps(&msgs);
     // no recreate, no element diff; just a NewSet carrying the comment
     assert_eq!(s, vec![Step::NewSet("s".into())]);
@@ -365,7 +370,7 @@ fn base_chain_change_is_a_full_recreate() {
     });
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     assert_eq!(classify(&msgs[0]), Step::Recreate);
 }
 
@@ -392,7 +397,7 @@ fn verdict_map_goto_new_chain_orders_chain_before_map_fill() {
     );
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     let s = steps(&msgs);
 
     let chain_create = s
@@ -417,7 +422,7 @@ fn removed_set_and_chain_are_deleted_last() {
     new.chains.clear();
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     let s = steps(&msgs);
 
     assert_eq!(s, vec![Step::DeleteChain("c".into())]);
@@ -425,7 +430,7 @@ fn removed_set_and_chain_are_deleted_last() {
     // and dropping a set too
     let empty = TableSync::default();
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &empty);
+    let msgs = sync_all("t", Some(&prev), &empty);
     let s = steps(&msgs);
     assert_eq!(
         s,
@@ -678,7 +683,7 @@ fn new_verdict_map_and_chain_are_created_before_the_referencing_rule() {
     );
 
     let prev = old.reference("t");
-    let msgs = sync("t", Some(&prev), &new);
+    let msgs = sync_all("t", Some(&prev), &new);
     let s = steps(&msgs);
 
     let vm_create = s
@@ -781,7 +786,7 @@ fn sync_generates_and_resolves_anonymous_set_names() {
         },
     );
 
-    let msgs = sync("t", None, &table);
+    let msgs = sync_all("t", None, &table);
     let s = steps(&msgs);
 
     // the anonymous set is created with a sync-generated name, before the rule
@@ -796,4 +801,57 @@ fn sync_generates_and_resolves_anonymous_set_names() {
         .expect("rule added");
     assert!(create < rule, "anonymous set before its rule: {s:?}");
     assert_eq!(rule_lookup(&msgs).as_deref(), Some("__set1"));
+}
+
+/// The kernel commits an anonymous set only together with the rule that binds
+/// it, so a set, its elements and its rule are one group; rule order and the
+/// rest of the chain are preserved.
+#[test]
+fn sync_keeps_each_anonymous_set_in_its_rule_group() {
+    let anon = |port: u16| {
+        let mut set = SetSync::interval([(6u8, port)..=(6u8, port)], None);
+        set.set_anonymous();
+        set
+    };
+    let mut table = TableSync::default();
+    table.chains.insert(
+        "c".into(),
+        ChainSync {
+            base: None,
+            rules: vec![rules::l4proto_dport_anon(0), rules::l4proto_dport_anon(1)],
+            anon_sets: vec![anon(80), anon(443)],
+        },
+    );
+
+    let groups = sync("t", None, &table);
+    let group = |name: &str| {
+        let group = groups
+            .iter()
+            .find(|g| {
+                g.as_slice()
+                    .iter()
+                    .any(|m| classify(m) == Step::NewSet(name.to_string()))
+            })
+            .unwrap_or_else(|| panic!("no group with {name}: {groups:?}"));
+        steps(group.as_slice())
+    };
+
+    assert_eq!(
+        group("__set1"),
+        vec![
+            Step::NewSet("__set1".into()),
+            Step::Elem("__set1".into(), false),
+            Step::NewRule("c".into()),
+        ],
+        "a set, its elements and its binding rule must share one group"
+    );
+    assert_eq!(
+        group("__set2"),
+        vec![
+            Step::NewSet("__set2".into()),
+            Step::Elem("__set2".into(), false),
+            Step::NewRule("c".into()),
+        ],
+        "a set, its elements and its binding rule must share one group"
+    );
 }

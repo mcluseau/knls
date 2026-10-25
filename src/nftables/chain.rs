@@ -101,6 +101,14 @@ impl<'t> Chain<'t> {
         &self.rules
     }
 
+    /// The message adding `rule`, without storing it.
+    ///
+    /// Used when rules are emitted interleaved with the anonymous sets they
+    /// bind, rather than accumulated and appended in one go.
+    pub fn rule_message(&self, rule: Rule) -> Message {
+        rule_msg(self.table, &self.chain, rule, None)
+    }
+
     /// Appends a rule and updates the hash from its message.
     pub fn push(&mut self, rule: Rule) {
         self.push_commented(rule, None);

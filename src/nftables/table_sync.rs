@@ -17,7 +17,7 @@ use netlink_packet_netfilter::nftables::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::netlink::netfilter::{self, NetlinkExt as _};
+use crate::netlink::netfilter::{self, Group, NetlinkExt as _};
 
 use super::{
     Message,
@@ -395,7 +395,12 @@ fn hash_verdict(hasher: &mut Xxh3, verdict: &Verdict) {
 ///
 /// `prev == None` (or a structural change that cannot be applied in place)
 /// emits a full (re)create; otherwise an incremental sync.
-pub fn sync(table: &str, prev: Option<&TableSyncRef>, next: &TableSync) -> Vec<Message> {
+///
+/// The messages are returned in [`Group`]s. A group must be committed as one
+/// netfilter transaction; consecutive groups are packed into one transaction
+/// while they fit, so a chain fill normally reaches the kernel in a single
+/// transaction.
+pub fn sync(table: &str, prev: Option<&TableSyncRef>, next: &TableSync) -> Vec<Group> {
     let Some(prev) = prev else {
         return full_create(table, next);
     };
@@ -403,6 +408,11 @@ pub fn sync(table: &str, prev: Option<&TableSyncRef>, next: &TableSync) -> Vec<M
         return full_create(table, next);
     }
     incremental(table, prev, next)
+}
+
+/// Wraps each message of a freely splittable run into its own group.
+fn singles(msgs: impl IntoIterator<Item = Message>) -> impl Iterator<Item = Group> {
+    msgs.into_iter().map(Group::from)
 }
 
 /// Whether the change hits a structural attribute that cannot be applied in
@@ -567,8 +577,8 @@ fn set_diff(table: &str, name: &str, old: &SetSync, new: &SetSync) -> Vec<Messag
 
 /// Lowers a rule's anonymous-set references (`Lookup::SetId(i)`) to the matching
 /// generated name (`Lookup::Set(names[i])`), so the rule reaches the kernel
-/// naming the set it looks up. An out-of-range index is left untouched.
-fn resolve_anon(rule: &Rule, names: &[String]) -> Rule {
+/// naming the set it looks up. An unresolved index is left untouched.
+fn resolve_anon(rule: &Rule, names: &[Option<String>]) -> Rule {
     rule.iter()
         .map(|item| match item {
             ListAttribute::Element(attrs) => ListAttribute::Element(
@@ -581,6 +591,7 @@ fn resolve_anon(rule: &Rule, names: &[String]) -> Rule {
                                 .map(|lookup| match lookup {
                                     Lookup::SetId(index) => names
                                         .get(*index as usize)
+                                        .and_then(Option::as_ref)
                                         .map(|name| Lookup::Set(name.clone()))
                                         .unwrap_or_else(|| lookup.clone()),
                                     other => other.clone(),
@@ -597,46 +608,82 @@ fn resolve_anon(rule: &Rule, names: &[String]) -> Rule {
         .collect()
 }
 
-/// Messages replacing the chain's rules and anonymous sets, leaving its (empty)
+/// The positions of the anonymous sets `rule` references.
+fn anon_refs(rule: &Rule) -> Vec<u32> {
+    let mut out = Vec::new();
+    for item in rule {
+        let ListAttribute::Element(attrs) = item else {
+            continue;
+        };
+        for attr in attrs {
+            let ExpressionAttribute::Data(Expressions::Lookup(lookups)) = attr else {
+                continue;
+            };
+            out.extend(lookups.iter().filter_map(|lookup| match lookup {
+                Lookup::SetId(index) => Some(*index),
+                _ => None,
+            }));
+        }
+    }
+    out
+}
+
+/// Groups replacing the chain's rules and anonymous sets, leaving its (empty)
 /// existence untouched.
-fn fill_chain(table: &str, name: &str, chain: &ChainSync, id: &mut u32) -> Vec<Message> {
+fn fill_chain(table: &str, name: &str, chain: &ChainSync, id: &mut u32) -> Vec<Group> {
     let mut out = Vec::new();
     // flush first: it drops the old rules, and with them the old anonymous sets
     // they were bound to, so the fresh anonymous sets below are unbound names.
-    let mut c = Chain::new(table, name);
-    out.push(c.flush());
+    let c = Chain::new(table, name);
+    out.push(Group::from(c.flush()));
 
-    // Anonymous sets print inline, so their name is invisible; keep it short,
-    // yet unique table-wide, by reusing the per-transaction set-id counter.
-    let mut names = Vec::with_capacity(chain.anon_sets.len());
-    for set in &chain.anon_sets {
-        *id += 1;
-        let name = format!("__set{}", *id);
-        out.push(create_set_msg(table, &name, *id, set));
-        out.extend(fill_all(table, &name, set));
-        names.push(name);
-    }
-
+    // Each rule is one group, preceded by the anonymous sets it binds: the
+    // kernel refuses to commit a transaction that leaves an anonymous set
+    // unbound (`-EINVAL`) and refuses to add elements to a set once it is bound
+    // (`-EBUSY`), so a set, its elements and its binding rule must stay
+    // together. Rule order is preserved, and a chain that outgrows a
+    // transaction is split between rules, never inside one.
+    let mut names = vec![None::<String>; chain.anon_sets.len()];
     for rule in &chain.rules {
-        c.push(resolve_anon(rule, &names));
+        let mut group = Vec::new();
+        for index in anon_refs(rule) {
+            let Some(set) = chain.anon_sets.get(index as usize) else {
+                continue;
+            };
+            let slot = &mut names[index as usize];
+            if slot.is_none() {
+                *id += 1;
+                let name = format!("__set{}", *id);
+                group.push(create_set_msg(table, &name, *id, set));
+                group.extend(fill_all(table, &name, set));
+                *slot = Some(name);
+            }
+        }
+        let rule = c.rule_message(resolve_anon(rule, &names));
+        if group.is_empty() {
+            out.push(Group::from(rule));
+        } else {
+            group.push(rule);
+            out.push(Group::Atomic(group));
+        }
     }
-    out.extend(c.rules().iter().cloned());
+
     out
 }
 
 /// Emits a full (re)create: drop the table and build it in two passes so no
 /// fill ever references a container that does not exist yet.
-fn full_create(table: &str, next: &TableSync) -> Vec<Message> {
-    let mut out: Vec<Message> = table::recreate(table).to_vec();
+fn full_create(table: &str, next: &TableSync) -> Vec<Group> {
+    let mut out: Vec<Group> = vec![Group::Atomic(table::recreate(table).to_vec())];
     let mut id = 0u32;
 
     // pass 1: create every named set/map and every chain, empty.
     for (name, set) in &next.sets {
         id += 1;
-        out.push(create_set_msg(table, name, id, set));
+        out.push(Group::from(create_set_msg(table, name, id, set)));
     }
     for (name, chain) in &next.chains {
-        out.push(create_chain_msg(table, name, chain));
+        out.push(Group::from(create_chain_msg(table, name, chain)));
     }
     debug!(
         "{table}: recreate pass 1: {} empty containers created ({} sets, {} chains)",
@@ -648,19 +695,19 @@ fn full_create(table: &str, next: &TableSync) -> Vec<Message> {
     // pass 2: fill the named sets/maps, then the chains. Every chain already
     // exists, so a verdict-map entry that `goto`s one is safe.
     for (name, set) in &next.sets {
-        out.extend(fill_all(table, name, set));
+        out.extend(singles(fill_all(table, name, set)));
     }
     for (name, chain) in &next.chains {
         out.extend(fill_chain(table, name, chain, &mut id));
     }
-    debug!("{table}: recreate pass 2: {} messages total", out.len());
+    debug!("{table}: recreate pass 2: {} groups total", out.len());
 
     out
 }
 
 /// Emits the incremental diff. `prev` and `next` are known not to differ
 /// structurally.
-fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Message> {
+fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Group> {
     let mut out = Vec::new();
     let mut id = 0u32;
 
@@ -671,15 +718,15 @@ fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Messag
         if set.is_verdict_map() {
             if !prev.sets.contains_key(name) {
                 id += 1;
-                out.push(create_set_msg(table, name, id, set));
+                out.push(Group::from(create_set_msg(table, name, id, set)));
             }
             continue;
         }
         match prev.sets.get(name) {
             None => {
                 id += 1;
-                out.push(create_set_msg(table, name, id, set));
-                out.extend(fill_all(table, name, set));
+                out.push(Group::from(create_set_msg(table, name, id, set)));
+                out.extend(singles(fill_all(table, name, set)));
             }
             Some(old) => {
                 if old == set {
@@ -688,9 +735,9 @@ fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Messag
                 if old.meta().comment != set.meta().comment {
                     // re-issuing NewSet updates the userdata in place
                     id += 1;
-                    out.push(create_set_msg(table, name, id, set));
+                    out.push(Group::from(create_set_msg(table, name, id, set)));
                 }
-                out.extend(set_diff(table, name, old, set));
+                out.extend(singles(set_diff(table, name, old, set)));
             }
         }
     }
@@ -700,7 +747,7 @@ fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Messag
         if prev.chains.contains_key(name) {
             continue;
         }
-        out.push(create_chain_msg(table, name, chain));
+        out.push(Group::from(create_chain_msg(table, name, chain)));
     }
     for (name, chain) in &next.chains {
         let changed = match prev.chains.get(name) {
@@ -719,16 +766,16 @@ fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Messag
         }
         match prev.sets.get(name) {
             // created empty in step 1
-            None => out.extend(fill_all(table, name, set)),
+            None => out.extend(singles(fill_all(table, name, set))),
             Some(old) => {
                 if old == set {
                     continue;
                 }
                 if old.meta().comment != set.meta().comment {
                     id += 1;
-                    out.push(create_set_msg(table, name, id, set));
+                    out.push(Group::from(create_set_msg(table, name, id, set)));
                 }
-                out.extend(set_diff(table, name, old, set));
+                out.extend(singles(set_diff(table, name, old, set)));
             }
         }
     }
@@ -736,12 +783,12 @@ fn incremental(table: &str, prev: &TableSyncRef, next: &TableSync) -> Vec<Messag
     // 4. delete what `next` no longer references: chains then sets/maps.
     for name in prev.chains.keys() {
         if !next.chains.contains_key(name) {
-            out.push(Chain::new(table, name).delete());
+            out.push(Group::from(Chain::new(table, name).delete()));
         }
     }
     for name in prev.sets.keys() {
         if !next.sets.contains_key(name) {
-            out.push(set::delete(table, name));
+            out.push(Group::from(set::delete(table, name)));
         }
     }
 
@@ -786,9 +833,9 @@ impl TableState {
             }
         };
 
-        let messages = sync(&self.table, self.current.as_ref(), &next);
-        debug!("{}: applying {} messages", self.table, messages.len());
-        if nl.send_as_transactions(messages.into_iter()).await.is_ok() {
+        let groups = sync(&self.table, self.current.as_ref(), &next);
+        debug!("{}: applying {} groups", self.table, groups.len());
+        if nl.send_groups(groups.into_iter()).await.is_ok() {
             debug!("{}: apply done", self.table);
             self.current = Some(next.reference(&self.table));
             return Ok(());
@@ -799,13 +846,13 @@ impl TableState {
             self.table
         );
         self.current = None;
-        let messages = sync(&self.table, None, &next);
+        let groups = sync(&self.table, None, &next);
         debug!(
-            "{}: applying {} messages (from scratch)",
+            "{}: applying {} groups (from scratch)",
             self.table,
-            messages.len()
+            groups.len()
         );
-        match nl.send_as_transactions(messages.into_iter()).await {
+        match nl.send_groups(groups.into_iter()).await {
             Ok(()) => {
                 debug!("{}: recreate done", self.table);
                 self.current = Some(next.reference(&self.table));

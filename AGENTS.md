@@ -120,6 +120,15 @@ smoke tests.
   An anonymous set is bound to a single rule, so each generated rule that needs
   one gets its own (`Set::create_anonymous`). Named sets are created/filled
   independently and can be flushed and refilled.
+- An anonymous set's creation, its elements and its binding rule must share one
+  netfilter transaction: `nf_tables_commit` rejects a transaction that leaves
+  one unbound (`-EINVAL`, "nftables ruleset with unbound set"), and filling a
+  set after it is bound fails with `-EBUSY`. `table_sync::sync` therefore
+  returns message **groups** (one per rule, carrying its anonymous sets), and
+  `NetlinkExt::send_groups` packs consecutive groups into transactions without
+  splitting a group. A chain fill is normally one transaction; only a chain too
+  large for one datagram is split, between its rules. Separating a set from its
+  rule surfaces as a misleading `EINVAL` on the transaction's first message.
 - The kernel accepts interval encoding over netlink that nft's own grammar
   rejects (e.g. concatenated ranges, `udp . 0-65535`) — validate through the
   golden tests rather than assuming nft's CLI syntax is the limit.

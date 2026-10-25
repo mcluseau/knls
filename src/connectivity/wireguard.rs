@@ -826,7 +826,7 @@ mod tests {
             Self { table }
         }
 
-        fn render(&mut self) -> Vec<crate::nftables::Message> {
+        fn render(&mut self) -> Vec<crate::netlink::netfilter::Group> {
             let mut chain = Chain::new(&self.table, "wireguard-external-ips");
 
             chain.push(vec![
@@ -862,6 +862,7 @@ mod tests {
             ]
             .into_iter()
             .chain(chain.rules().iter().cloned())
+            .map(crate::netlink::netfilter::Group::from)
             .collect()
         }
     }

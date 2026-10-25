@@ -675,7 +675,7 @@ mod tests {
     use super::*;
     use crate::{
         kube_watch::{Change, Event},
-        netlink::netfilter::{self, NetlinkExt as _},
+        netlink::netfilter::{self, Group, NetlinkExt as _},
         nftables::{Message, table_sync::sync, test_harness},
     };
     use netlink_packet_core::NetlinkPayload;
@@ -746,9 +746,14 @@ mod tests {
         }
     }
 
-    /// The full-render messages for `state` (a first-apply sync).
-    fn messages(state: &State, cfg: &Config, node: &str) -> Vec<Message> {
+    /// The full-render groups for `state` (a first-apply sync).
+    fn messages(state: &State, cfg: &Config, node: &str) -> Vec<Group> {
         sync(&cfg.table, None, &render(state, cfg, node))
+    }
+
+    /// The full-render messages, flattened for inspection.
+    fn flat_messages(state: &State, cfg: &Config, node: &str) -> Vec<Message> {
+        messages(state, cfg, node).into_iter().flatten().collect()
     }
 
     /// The chain names among `msgs`, in creation order.
@@ -887,7 +892,7 @@ mod tests {
     #[test]
     fn renders_chains_base_and_vmap() {
         let state = basic_state(serde_json::json!([{ "from": [] }]));
-        let r = messages(&state, &default_cfg(), "n1");
+        let r = flat_messages(&state, &default_cfg(), "n1");
 
         let names = chain_names(&r);
         assert!(
@@ -917,7 +922,7 @@ mod tests {
         let state = basic_state(serde_json::json!([{
             "from": [{ "ipBlock": { "cidr": "192.168.42.0/24", "except": ["192.168.42.5/32"] } }],
         }]));
-        let r = messages(&state, &default_cfg(), "n1");
+        let r = flat_messages(&state, &default_cfg(), "n1");
 
         // the rule matches the cidr inline (byte-aligned /24 => payload+eq) and
         // excludes an anonymous interval set (inverted lookup)
@@ -950,7 +955,7 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP", "port": 80 }, { "protocol": "UDP", "port": 53 } ],
         }]));
-        let r = messages(&state, &default_cfg(), "n1");
+        let r = flat_messages(&state, &default_cfg(), "n1");
 
         // dport 53/80 are stored as (proto, port) elements in the set the rule
         // looks up
@@ -977,7 +982,7 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP" } ],
         }]));
-        let r = messages(&state, &default_cfg(), "n1");
+        let r = flat_messages(&state, &default_cfg(), "n1");
 
         // the rule looks the protocol . service set up
         let (_, rule) = rules(&r)
@@ -1002,7 +1007,7 @@ mod tests {
             "from": [],
             "ports": [ { "protocol": "TCP" }, { "protocol": "UDP", "port": 53 } ],
         }]));
-        let r = messages(&state, &default_cfg(), "n1");
+        let r = flat_messages(&state, &default_cfg(), "n1");
 
         let netpol_rules: Vec<_> = rules(&r)
             .into_iter()
@@ -1078,7 +1083,7 @@ mod tests {
             self.state.ingest(&event);
         }
 
-        fn render(&mut self) -> Vec<Message> {
+        fn render(&mut self) -> Vec<Group> {
             messages(&self.state, &self.cfg, "n1")
         }
     }
@@ -1171,12 +1176,10 @@ mod tests {
             table: table.into(),
             ..Default::default()
         };
-        let messages = sync(&cfg.table, None, &render(&state, &cfg, "n1"));
+        let groups = sync(&cfg.table, None, &render(&state, &cfg, "n1"));
 
         let nl = netfilter::new_link().expect("netlink");
-        nl.send_as_transactions(messages.into_iter())
-            .await
-            .expect("apply");
+        nl.send_groups(groups.into_iter()).await.expect("apply");
 
         let out = Command::new("nft")
             .args(["list", "table", "inet", table])
