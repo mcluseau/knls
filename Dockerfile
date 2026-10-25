@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-from rust:1.99.0-alpine3.24 as build
+from rust:1.99.1-alpine3.24 as build
 
 run apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static git
 
