@@ -48,16 +48,51 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: HwLabels) -> eyre::Result<()> 
     }
 }
 
+/// Turns a hardware id into a valid Kubernetes label name segment: ASCII
+/// alphanumerics plus `-`, `_` and `.`, starting and ending with an
+/// alphanumeric. Other characters become `-` (runs are collapsed).
+fn sanitize_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut prev_dash = false;
+
+    for c in id.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+            prev_dash = c == '-';
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+
+    out.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string()
+}
+
+/// A short, stable hash suffix for an id, used when the id has to be sanitized
+/// or truncated.
+fn id_suffix(id: &str) -> String {
+    let h = xxh3_64(id.as_bytes()).to_le_bytes();
+    base32::encode(base32::Alphabet::Z, &h)[..7].to_string()
+}
+
 fn hw_label(kind: &str, id: &str) -> String {
-    let id = if id.len() <= 63 {
-        id.to_string()
+    const MAX: usize = 63;
+    const HASH: usize = 7;
+
+    let sanitized = sanitize_id(id);
+    let name = if sanitized.is_empty() {
+        format!("hw-{}", id_suffix(id))
+    } else if sanitized == id && sanitized.len() <= MAX {
+        sanitized
     } else {
-        // id too long for a kube name segment
-        let h = xxh3_64(id.as_bytes()).to_le_bytes();
-        let suffix = base32::encode(base32::Alphabet::Z, &h);
-        format!("{}-{}", &id[..63 - 1 - 7], &suffix[..7])
+        // Sanitized (so distinct raw ids can't collapse onto the same label)
+        // or too long for a label name segment.
+        let prefix = &sanitized[..sanitized.len().min(MAX - 1 - HASH)];
+        format!("{prefix}-{}", id_suffix(id))
     };
-    format!("{kind}.hw.knls.eu/{id}")
+
+    format!("{kind}.hw.knls.eu/{name}")
 }
 
 fn is_hw_label(label: &str) -> bool {
