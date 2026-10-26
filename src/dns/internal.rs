@@ -1,12 +1,16 @@
 #![allow(clippy::unusual_byte_groupings)]
 
 use eyre::format_err;
-use log::{debug, error};
+use log::debug;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    sync::{oneshot, watch},
+};
 
 use crate::dns::{self, data, packet};
-use crate::{actions, kube_watch::EventReceiver, state::State};
+use crate::{actions, kube_watch::EventReceiver, state::State, worker};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -31,40 +35,95 @@ pub async fn watch(
     cfg: Config,
     mut events: EventReceiver,
 ) -> eyre::Result<()> {
-    let sock = UdpSocket::bind(cfg.bind).await?;
+    // Bind with std so the socket can be adopted by the responder's own
+    // runtime: a tokio socket is tied to the runtime that created it.
+    let sock = std::net::UdpSocket::bind(cfg.bind.as_str())?;
+    sock.set_nonblocking(true)?;
     actions::run_event(module_path!(), "on_listen", &cfg.on_listen).await?;
 
     let cluster_domain = data::DomainName::try_from(cfg.cluster_domain.as_str())
         .map_err(|_| format_err!("invalid cluster domain"))?;
 
-    let mut root = data::Domain::new();
-    let mut recv_buf = [0; 512];
+    // The responder reads the latest zone from this watch channel; state
+    // ingestion never blocks on answering queries.
+    let (domain_tx, domain_rx) = watch::channel(Arc::new(data::Domain::new()));
+
+    // Run the responder on its own thread and runtime. A busy main runtime
+    // (zone rebuilds, nftables renders) then cannot delay the socket's I/O
+    // driver and the queries queued on it.
+    let (result_tx, mut result_rx) = oneshot::channel();
+    worker::single_thread("dns-responder", move || async move {
+        let _ = result_tx.send(run_responder(sock, domain_rx).await);
+    })?;
+
     let mut state = State::new(ctx.node_name.clone());
 
     loop {
-        tokio::select!(
+        use std::ops::ControlFlow::*;
+        tokio::select! {
             updated = state.ingest_events(&mut events) => {
-                use std::ops::ControlFlow::*;
                 match updated {
                     Some(Break(())) => return Ok(()),
                     Some(Continue(())) => continue,
                     None => {}
                 }
-                if !state.is_ready() { continue; }
-
-                let cluster_zone = dns::cluster_zone_from_state(&state, &cluster_domain);
-                root = data::Domain::new();
-                root.set(&cluster_domain, cluster_zone);
-                dns::add_reverse_records(&mut root, &state, &cluster_domain);
-            },
-            result = sock.readable() => {
-                if let Err(e) = result {
-                    error!("failed waiting for next request: {e}");
-                    return Err(e.into());
+            }
+            result = &mut result_rx => {
+                // The responder only finishes on a socket error or when the
+                // watch closes; report a failure so the service restarts.
+                return match result {
+                    Ok(res) => res,
+                    Err(e) => Err(e.into()),
                 };
-                handle_req(&mut recv_buf, &sock, &root).await?;
-            },
-        );
+            }
+        }
+
+        if !state.is_ready() {
+            continue;
+        }
+
+        let cluster_zone = dns::cluster_zone_from_state(&state, &cluster_domain);
+        let mut root = data::Domain::new();
+        root.set(&cluster_domain, cluster_zone);
+        dns::add_reverse_records(&mut root, &state, &cluster_domain);
+        domain_tx.send_replace(Arc::new(root));
+    }
+}
+
+/// Adopts the pre-bound blocking socket on the worker's runtime.
+async fn run_responder(
+    sock: std::net::UdpSocket,
+    root: watch::Receiver<Arc<data::Domain>>,
+) -> eyre::Result<()> {
+    let sock = UdpSocket::from_std(sock)?;
+    respond(sock, root).await?;
+    Ok(())
+}
+
+/// Answers DNS queries from the most recently published zone until the watch
+/// closes (the service shutting down).
+async fn respond(
+    sock: UdpSocket,
+    mut root_rx: watch::Receiver<Arc<data::Domain>>,
+) -> std::io::Result<()> {
+    let mut recv_buf = [0; 512];
+    let mut root = root_rx.borrow_and_update().clone();
+    loop {
+        tokio::select! {
+            result = sock.recv_from(&mut recv_buf) => {
+                let (len, remote) = result?;
+                let pkt = &recv_buf[..len];
+                handle_req(&sock, pkt, remote, &root).await;
+            }
+            changed = root_rx.changed() => {
+                if changed.is_err() {
+                    // end of watch
+                    return Ok(());
+                }
+
+                root = root_rx.borrow_and_update().clone();
+            }
+        }
     }
 }
 
@@ -84,37 +143,26 @@ const RESPONSE_PACKET: [u8; 12] = [
     0,
 ];
 
-async fn handle_req(
-    recv_buf: &mut [u8],
-    sock: &UdpSocket,
-    root: &dns::Domain,
-) -> std::io::Result<()> {
-    use std::io::ErrorKind;
-    loop {
-        let (len, remote) = match sock.try_recv_from(recv_buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        };
+async fn handle_req(sock: &UdpSocket, pkt: &[u8], remote: SocketAddr, root: &dns::Domain) {
+    debug!("recv from {remote} ({} bytes)", pkt.len());
 
-        debug!("recv from {remote} ({len} bytes)");
-
-        let pkt = &recv_buf[0..len];
-        let resp = match try_handle_req(pkt, root) {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("request handler failed: {e:?}");
-                let mut r = Vec::from(RESPONSE_PACKET);
-                r[0] = recv_buf[0];
-                r[1] = recv_buf[1];
-                r[3] |= ((e as isize) as u8) & 0b0000_1111;
-                r
+    let resp = match try_handle_req(pkt, root) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("request handler failed: {e:?}");
+            let mut r = Vec::from(RESPONSE_PACKET);
+            if let Some(id) = pkt.get(..2) {
+                r[0] = id[0];
+                r[1] = id[1];
             }
-        };
+            r[3] |= ((e as isize) as u8) & 0b0000_1111;
+            r
+        }
+    };
 
-        sock.send_to(&resp, remote).await?;
+    if let Err(e) = sock.send_to(&resp, remote).await {
+        debug!("response to {remote} failed: {e}");
     }
-    Ok(())
 }
 
 fn try_handle_req(pkt: &[u8], data: &dns::Domain) -> packet::Result<Vec<u8>> {

@@ -12,7 +12,7 @@ use tokio::{
 };
 
 /// How long a burst of events is coalesced into a single update.
-const COALESCE_WINDOW: Duration = Duration::from_millis(10);
+const COALESCE_WINDOW: Duration = Duration::from_millis(100);
 /// How long to wait for the next event before re-checking the coalescing window.
 const COALESCE_WAIT: Duration = Duration::from_millis(1);
 

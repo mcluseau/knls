@@ -17,6 +17,7 @@ mod rtnl_exts;
 pub mod selector;
 pub mod state;
 pub mod store;
+pub mod worker;
 
 use kube::api::PatchParams;
 use std::sync::Arc;

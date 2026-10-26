@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::{
     select,
     signal::unix::{SignalKind, signal},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 use knls::kube_watch::{self, Event};
@@ -57,7 +57,7 @@ fn default_nodename() -> String {
 
 type Tasks = tokio::task::JoinSet<(String, eyre::Result<()>)>;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
@@ -146,10 +146,10 @@ async fn main() -> eyre::Result<()> {
         targets: Vec::new(),
     };
 
-    services.spawn("proxy", config.proxy);
-    services.spawn("connectivity", config.connectivity);
-    services.spawn("dns", config.dns);
-    services.spawn("network policy", config.network_policy);
+    services.spawn("proxy", config.proxy)?;
+    services.spawn("connectivity", config.connectivity)?;
+    services.spawn("dns", config.dns)?;
+    services.spawn("network policy", config.network_policy)?;
 
     if let Some(hw_labels) = config.hw_labels {
         let ctx = ctx.clone();
@@ -193,25 +193,38 @@ struct Services<'t> {
 }
 
 impl<'t> Services<'t> {
-    fn spawn<S>(&mut self, service_name: &'static str, service: Option<S>)
+    /// Runs the service on its own worker thread/runtime, so synchronous work
+    /// in one service cannot delay the I/O of another (or of the main loop).
+    fn spawn<S>(&mut self, service_name: &'static str, service: Option<S>) -> eyre::Result<()>
     where
         S: knls::Service + Send + 'static,
     {
         let Some(service) = service else {
             info!("{service_name}: no configuration, service not enabled.");
-            return;
+            return Ok(());
         };
 
         let flavor = service.impl_name();
-        info!("{service_name}: starting {flavor} implementation");
-
-        let (tx, rx) = mpsc::channel(self.event_buffer);
-        self.targets.push(tx);
+        info!("{service_name}: starting {flavor} implementation");
 
         let task_name = format!("{service_name}:{flavor}");
-
         let ctx = self.ctx.clone();
-        self.tasks
-            .spawn(async move { (task_name, service.watch(ctx, rx).await) });
+        let (tx, rx) = mpsc::channel(self.event_buffer);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        knls::worker::single_thread(&task_name, move || async move {
+            let _ = done_tx.send(service.watch(ctx, rx).await);
+        })?;
+        self.targets.push(tx);
+
+        self.tasks.spawn(async move {
+            let result = match done_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(eyre!("{task_name} worker vanished")),
+            };
+            (task_name, result)
+        });
+
+        Ok(())
     }
 }
