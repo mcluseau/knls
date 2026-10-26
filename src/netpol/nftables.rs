@@ -333,9 +333,7 @@ impl<'t> Builder<'t> {
 
 /// The rule a pod chain applies when no netpol rule matched.
 fn action_rule(pod: &Pod, annotation: &str, default: RejectAction, counters: bool) -> Rule {
-    let action = pod
-        .annotations
-        .get(annotation)
+    let action = (pod.annotations.get(annotation))
         .map(|v| RejectAction::from_annotation(v))
         .unwrap_or(default);
 
