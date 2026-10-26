@@ -43,7 +43,7 @@
     	counter packets 0 bytes 0 reject
     }
 
-    chain pods_filter {
+    chain pods_filter_ingress {
     	type filter hook forward priority filter; policy accept;
     	ct state established,related accept
     	ip daddr vmap @pods_ingress

@@ -21,19 +21,17 @@
     event: !init_done
 
 - !verify |
-    map pods_ingress {
-    	type ipv4_addr : verdict
-    	elements = { 10.0.0.1 : goto ingress_pod_default_a }
-    }
-
     map pods_egress {
     	type ipv4_addr : verdict
     	elements = { 10.0.0.1 : goto egress_pod_default_a }
     }
 
-    chain ingress_pod_default_a {
-    	jump ingress_netpol_default_default-deny-all
-    	counter packets 0 bytes 0 reject
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_default_a }
+    }
+
+    chain egress_netpol_default_default-deny-all {
     }
 
     chain egress_pod_default_a {
@@ -44,12 +42,19 @@
     chain ingress_netpol_default_default-deny-all {
     }
 
-    chain egress_netpol_default_default-deny-all {
+    chain ingress_pod_default_a {
+    	jump ingress_netpol_default_default-deny-all
+    	counter packets 0 bytes 0 reject
     }
 
-    chain pods_filter {
+    chain pods_filter_egress {
+    	type filter hook forward priority filter + 10; policy accept;
+    	ct state established,related accept
+    	ip saddr vmap @pods_egress
+    }
+
+    chain pods_filter_ingress {
     	type filter hook forward priority filter; policy accept;
     	ct state established,related accept
     	ip daddr vmap @pods_ingress
-    	ip saddr vmap @pods_egress
     }

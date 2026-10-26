@@ -40,14 +40,20 @@
     event: !init_done
 
 - !verify |
-    set np_default_np_i_1_pods_v4 {
-    	type ipv4_addr
-    	elements = { 10.0.0.2 }
-    }
-
     map pods_ingress {
     	type ipv4_addr : verdict
     	elements = { 10.0.0.1 : goto ingress_pod_default_a }
+    }
+
+    set sel_5mcn16qps98be6zt3gb6myck8h_v4 {
+    	type ipv4_addr
+    	comment "default: app=b"
+    	elements = { 10.0.0.2 }
+    }
+
+    chain ingress_netpol_default_np {
+    	meta l4proto . th dport { tcp . 80, tcp . 443, udp . 0-65535 } ip saddr @sel_5mcn16qps98be6zt3gb6myck8h_v4 accept
+    	ip saddr 192.168.42.0/24 ip saddr != { 192.168.42.5 } accept
     }
 
     chain ingress_pod_default_a {
@@ -55,12 +61,7 @@
     	counter packets 0 bytes 0 reject
     }
 
-    chain ingress_netpol_default_np {
-    	meta l4proto . th dport { tcp . 80, tcp . 443, udp . 0-65535 } ip saddr @np_default_np_i_1_pods_v4 accept
-    	ip saddr 192.168.42.0/24 ip saddr != { 192.168.42.5 } accept
-    }
-
-    chain pods_filter {
+    chain pods_filter_ingress {
     	type filter hook forward priority filter; policy accept;
     	ct state established,related accept
     	ip daddr vmap @pods_ingress

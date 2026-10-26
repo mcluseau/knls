@@ -48,9 +48,9 @@
     event: !init_done
 
 - !verify |
-    set np_default_test-network-policy_i_1_pods_v4 {
-    	type ipv4_addr
-    	elements = { 10.0.0.2, 10.0.0.3 }
+    map pods_egress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto egress_pod_default_db }
     }
 
     map pods_ingress {
@@ -58,14 +58,20 @@
     	elements = { 10.0.0.1 : goto ingress_pod_default_db }
     }
 
-    map pods_egress {
-    	type ipv4_addr : verdict
-    	elements = { 10.0.0.1 : goto egress_pod_default_db }
+    set sel_1kcep85m1ohm9tf9ritjay9i9e_v4 {
+    	type ipv4_addr
+    	comment "default: role=frontend"
+    	elements = { 10.0.0.2 }
     }
 
-    chain ingress_pod_default_db {
-    	jump ingress_netpol_default_test-network-policy
-    	counter packets 0 bytes 0 reject
+    set sel_s8m6a69ud575hrnb9j5acfra9a_v4 {
+    	type ipv4_addr
+    	comment "project=myproject: *"
+    	elements = { 10.0.0.3 }
+    }
+
+    chain egress_netpol_default_test-network-policy {
+    	meta l4proto . th dport { tcp . 5978 } ip daddr 10.0.0.0/24 accept
     }
 
     chain egress_pod_default_db {
@@ -75,16 +81,23 @@
 
     chain ingress_netpol_default_test-network-policy {
     	meta l4proto . th dport { tcp . 6379 } ip saddr 172.17.0.0/16 ip saddr != { 172.17.1.0/24 } accept
-    	meta l4proto . th dport { tcp . 6379 } ip saddr @np_default_test-network-policy_i_1_pods_v4 accept
+    	meta l4proto . th dport { tcp . 6379 } ip saddr @sel_s8m6a69ud575hrnb9j5acfra9a_v4 accept
+    	meta l4proto . th dport { tcp . 6379 } ip saddr @sel_1kcep85m1ohm9tf9ritjay9i9e_v4 accept
     }
 
-    chain egress_netpol_default_test-network-policy {
-    	meta l4proto . th dport { tcp . 5978 } ip daddr 10.0.0.0/24 accept
+    chain ingress_pod_default_db {
+    	jump ingress_netpol_default_test-network-policy
+    	counter packets 0 bytes 0 reject
     }
 
-    chain pods_filter {
+    chain pods_filter_egress {
+    	type filter hook forward priority filter + 10; policy accept;
+    	ct state established,related accept
+    	ip saddr vmap @pods_egress
+    }
+
+    chain pods_filter_ingress {
     	type filter hook forward priority filter; policy accept;
     	ct state established,related accept
     	ip daddr vmap @pods_ingress
-    	ip saddr vmap @pods_egress
     }

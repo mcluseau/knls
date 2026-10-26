@@ -33,17 +33,17 @@
     	elements = { 10.0.0.1 : goto egress_pod_default_a }
     }
 
+    chain egress_netpol_default_multi-port-egress {
+    	meta l4proto . th dport { tcp . 32000-32768 } ip daddr 10.0.0.0/24 accept
+    }
+
     chain egress_pod_default_a {
     	jump egress_netpol_default_multi-port-egress
     	counter packets 0 bytes 0 reject
     }
 
-    chain egress_netpol_default_multi-port-egress {
-    	meta l4proto . th dport { tcp . 32000-32768 } ip daddr 10.0.0.0/24 accept
-    }
-
-    chain pods_filter {
-    	type filter hook forward priority filter; policy accept;
+    chain pods_filter_egress {
+    	type filter hook forward priority filter + 10; policy accept;
     	ct state established,related accept
     	ip saddr vmap @pods_egress
     }

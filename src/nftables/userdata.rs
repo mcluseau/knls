@@ -228,7 +228,13 @@ impl SetUdata {
 
     /// `NFTNL_UDATA_SET_COMMENT`: a free-form string shown by `nft list`.
     pub fn comment(mut self, comment: &str) -> Self {
-        self.buf.put_strz(SetAttr::Comment as u8, comment);
+        // The TLV length is a single byte covering the comment and its
+        // terminating NUL.
+        let mut end = comment.len().min(254);
+        while !comment.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.buf.put_strz(SetAttr::Comment as u8, &comment[..end]);
         self
     }
 
@@ -284,6 +290,19 @@ mod tests {
             SetUdata::new().comment("hello").build(),
             b"\x07\x06hello\x00"
         );
+    }
+
+    /// The comment is truncated to what the one-byte TLV length can hold,
+    /// on a character boundary.
+    #[test]
+    fn long_comment_is_truncated() {
+        let comment = "€".repeat(100); // 300 bytes, 3 per char
+        let bytes = SetUdata::new().comment(&comment).build();
+        assert_eq!(bytes[0], SetAttr::Comment as u8);
+        let payload = &bytes[2..bytes.len() - 1];
+        assert_eq!(payload.len(), 252); // 254 rounded down to a char boundary
+        assert_eq!(bytes[1] as usize, payload.len() + 1);
+        assert!(std::str::from_utf8(payload).is_ok());
     }
 
     /// A nested TLV's length is patched to its payload, not its header.

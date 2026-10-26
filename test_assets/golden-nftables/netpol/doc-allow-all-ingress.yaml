@@ -28,16 +28,16 @@
     	elements = { 10.0.0.1 : goto ingress_pod_default_a }
     }
 
+    chain ingress_netpol_default_allow-all-ingress {
+    	accept
+    }
+
     chain ingress_pod_default_a {
     	jump ingress_netpol_default_allow-all-ingress
     	counter packets 0 bytes 0 reject
     }
 
-    chain ingress_netpol_default_allow-all-ingress {
-    	accept
-    }
-
-    chain pods_filter {
+    chain pods_filter_ingress {
     	type filter hook forward priority filter; policy accept;
     	ct state established,related accept
     	ip daddr vmap @pods_ingress

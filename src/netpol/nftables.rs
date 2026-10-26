@@ -9,17 +9,18 @@ use crate::{
         table_sync::{BaseChain, ChainSync, SetSync, TableState, TableSync},
     },
     selector::Selector,
-    state::{Namespace, Pod},
+    state::{Namespace, Pod, keys},
 };
 use cidr::IpCidr;
 use eyre::Result;
 use k8s_openapi::{api::core::v1 as core, api::networking::v1 as networking};
 use log::{debug, error};
 use netlink_packet_netfilter::nftables::Register;
-use std::collections::{BTreeMap, BTreeSet as Set};
+use std::collections::{BTreeMap, BTreeSet as Set, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -83,7 +84,7 @@ fn render(state: &State, cfg: &Config, node_name: &str) -> TableSync {
     let mut b = Builder::new(cfg);
 
     b.pod_chains(state, node_name);
-    b.netpol_chains(state);
+    b.netpol_chains(state, node_name);
     b.base_chain();
 
     b.into_table()
@@ -138,8 +139,6 @@ impl<'t> Builder<'t> {
                 continue;
             };
 
-            let (ns, name) = pod_key.as_str();
-
             let netpols: Vec<_> = (state.netpols.iter())
                 .filter(|(_, np)| np.matches_pod(pod_key, pod))
                 .collect();
@@ -147,6 +146,8 @@ impl<'t> Builder<'t> {
             if netpols.is_empty() {
                 continue; // no netpols apply to the pod, don't filter its traffic
             }
+
+            let (ns, name) = pod_key.as_str();
 
             let ingress: Vec<_> = (netpols.iter())
                 .filter(|(_, np)| np.is_ingress())
@@ -206,22 +207,23 @@ impl<'t> Builder<'t> {
         }
     }
 
-    fn netpol_chains(&mut self, state: &State) {
-        // Only netpols matching a pod on this node are materialized.
-        let mut used = Set::new();
-        for (pod_key, pod) in state.pods.iter() {
-            for (k, np) in state.netpols.iter() {
-                if np.matches_pod(pod_key, pod) {
-                    used.insert(k.as_str());
-                }
-            }
-        }
+    fn netpol_chains(&mut self, state: &State, node_name: &str) {
+        // Shared selector peer sets, by selector key. Built once per render,
+        // so every policy/rule selecting the same thing reuses one set.
+        let mut selectors = HashMap::new();
 
         for (np_key, np) in state.netpols.iter() {
-            let (ns, name) = np_key.as_str();
-            if !used.contains(&(ns, name)) {
+            // Only netpols filtering a pod on this node are materialized: a
+            // policy that only applies elsewhere is never reached from this
+            // node's filter chains.
+            let matches_a_local_pod = (state.pods.iter()).any(|(pod_key, pod)| {
+                !pod.host_network && pod.node == node_name && np.matches_pod(pod_key, pod)
+            });
+            if !matches_a_local_pod {
                 continue;
             }
+
+            let (ns, name) = np_key.as_str();
 
             // A named port in an ingress rule is a container port of a *target*
             // pod, so named-port resolution needs the policy's selected pods.
@@ -238,13 +240,10 @@ impl<'t> Builder<'t> {
                         policy_ns: ns,
                         target_pods: &target_pods,
                         named: &mut self.sets,
-                        prefix: format!("np_{ns}_{name}_i"),
-                        idx: 0,
+                        selectors: &mut selectors,
                         anon: Vec::new(),
                     };
-                    let rules: Vec<Rule> = np
-                        .ingress()
-                        .iter()
+                    let rules: Vec<Rule> = (np.ingress().iter())
                         .flat_map(|rule| helper.rule(rule, Dir::Src))
                         .collect();
                     (rules, helper.anon)
@@ -260,13 +259,10 @@ impl<'t> Builder<'t> {
                         policy_ns: ns,
                         target_pods: &target_pods,
                         named: &mut self.sets,
-                        prefix: format!("np_{ns}_{name}_e"),
-                        idx: 0,
+                        selectors: &mut selectors,
                         anon: Vec::new(),
                     };
-                    let rules: Vec<Rule> = np
-                        .egress()
-                        .iter()
+                    let rules: Vec<Rule> = (np.egress().iter())
                         .flat_map(|rule| helper.rule(rule, Dir::Dst))
                         .collect();
                     (rules, helper.anon)
@@ -277,50 +273,53 @@ impl<'t> Builder<'t> {
     }
 
     fn base_chain(&mut self) {
-        let mut rules = Vec::new();
-
-        let maps: [(Family, Dir, &str); 2] = [
-            (Family::V4, Dir::Dst, "pods_ingress"),
-            (Family::V4, Dir::Src, "pods_egress"),
+        // One base chain per direction on the forward hook. netfilter runs every
+        // base chain registered on a hook, and a packet is accepted only if all
+        // of them accept. Same-node pod traffic matches both the ingress
+        // (destination) and egress (source) maps, so it must pass both
+        // policies; a single chain would stop at the first `accept` and bypass
+        // the other direction.
+        let directions = [
+            ("pods_filter_ingress", Dir::Dst, 0),
+            ("pods_filter_egress", Dir::Src, 10),
         ];
-        for (family, dir, map) in maps {
-            if self.sets.contains_key(map) {
-                rules.push(rules::ip_vmap(family, dir, map));
-            }
-        }
-        let maps6: [(Family, Dir, &str); 2] = [
-            (Family::V6, Dir::Dst, "pods_ingress6"),
-            (Family::V6, Dir::Src, "pods_egress6"),
-        ];
-        for (family, dir, map) in maps6 {
-            if self.sets.contains_key(map) {
-                rules.push(rules::ip_vmap(family, dir, map));
-            }
-        }
+        for (name, dir, priority) in directions {
+            let maps = match dir {
+                Dir::Dst => [(Family::V4, "pods_ingress"), (Family::V6, "pods_ingress6")],
+                Dir::Src => [(Family::V4, "pods_egress"), (Family::V6, "pods_egress6")],
+            };
 
-        // Netpol only constrains *new* connections. Accept the reply/related
-        // traffic of already-allowed flows up front, otherwise the lookups below
-        // drop the replies of an allowed flow whenever the opposite direction
-        // also has a policy (netpol is stateful, per the API).
-        if !rules.is_empty() {
+            let mut rules = Vec::new();
+            for (family, map) in maps {
+                if self.sets.contains_key(map) {
+                    rules.push(rules::ip_vmap(family, dir, map));
+                }
+            }
+            if rules.is_empty() {
+                continue; // no policy for this direction
+            }
+
+            // Netpol only constrains *new* connections. Accept the reply/related
+            // traffic of already-allowed flows up front, otherwise a policy in
+            // the opposite direction would drop the replies of an allowed flow.
             let mut established = rules::ct_state_established_related(Register::Reg1);
             established.push(rules::accept());
             rules.insert(0, established);
-        }
 
-        self.chains.insert(
-            "pods_filter".into(),
-            ChainSync {
-                base: Some(BaseChain {
-                    chain_type: chain::ChainType::Filter,
-                    hook: chain::InetHookNumber::Forward,
-                    priority: 0,
-                    policy: chain::ACCEPT,
-                }),
-                rules,
-                anon_sets: Vec::new(),
-            },
-        );
+            self.chains.insert(
+                name.into(),
+                ChainSync {
+                    base: Some(BaseChain {
+                        chain_type: chain::ChainType::Filter,
+                        hook: chain::InetHookNumber::Forward,
+                        priority,
+                        policy: chain::ACCEPT,
+                    }),
+                    rules,
+                    anon_sets: Vec::new(),
+                },
+            );
+        }
     }
 
     fn into_table(self) -> TableSync {
@@ -348,20 +347,88 @@ fn action_rule(pod: &Pod, annotation: &str, default: RejectAction, counters: boo
     rule
 }
 
+/// A shared peer IP set selected by one selector, by address family.
+struct SelectorSet<'a> {
+    /// Pods matching the selector, by key, for named-port resolution.
+    pods: BTreeMap<&'a keys::Object, &'a Pod>,
+    /// Set name for each non-empty address family.
+    v4: Option<String>,
+    v6: Option<String>,
+}
+
+/// The single hash key identifying a selector peer's namespace scope and pod
+/// selector.
+fn selector_key(policy_ns: &str, ns: Option<&Selector>, pod: Option<&Selector>) -> u128 {
+    fn put_bytes(h: &mut Xxh3, bytes: &[u8]) {
+        h.update(&(bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    }
+
+    let mut h = Xxh3::new();
+    h.update(b"knls-netpol-selector\0");
+
+    // The namespace scope is part of the key: a peer without a
+    // `namespaceSelector` only selects the policy's own namespace.
+    match ns {
+        Some(sel) => {
+            h.update(&[1]);
+            let mut bytes = Vec::new();
+            sel.encode_into(&mut bytes);
+            put_bytes(&mut h, &bytes);
+        }
+        None => {
+            h.update(&[0]);
+            put_bytes(&mut h, policy_ns.as_bytes());
+        }
+    }
+    match pod {
+        Some(sel) => {
+            h.update(&[1]);
+            let mut bytes = Vec::new();
+            sel.encode_into(&mut bytes);
+            put_bytes(&mut h, &bytes);
+        }
+        None => h.update(&[0]),
+    }
+
+    h.digest128()
+}
+
+/// The name of the shared set for `key`, in `family`.
+fn selector_set_name(key: u128, family: Family) -> String {
+    // z-base-32, like the hardware labels; 128 bits fit in 26 chars.
+    let name = base32::encode(base32::Alphabet::Z, &key.to_be_bytes());
+    let family = match family {
+        Family::V4 => "v4",
+        Family::V6 => "v6",
+    };
+    format!("sel_{name}_{family}")
+}
+
+/// The set comment describing the scope and selector, e.g.
+/// `default: app in (a,b)`.
+fn selector_comment(policy_ns: &str, ns: Option<&Selector>, pod: Option<&Selector>) -> String {
+    let ns = ns
+        .map(Selector::describe)
+        .unwrap_or_else(|| policy_ns.into());
+    let pod = pod.map(Selector::describe).unwrap_or_else(|| "*".into());
+    format!("{ns}: {pod}")
+}
+
 /// Builds the rules of one netpol rule, registering its named and anonymous
 /// sets.
-struct Helper<'a> {
-    state: &'a State,
+struct Helper<'h, 's> {
+    state: &'s State,
     /// The namespace of the policy being rendered; a peer without a
     /// `namespaceSelector` is scoped to it.
-    policy_ns: &'a str,
+    policy_ns: &'s str,
     /// The pods the policy selects: a named port in an *ingress* rule is a
     /// container port of one of these (the traffic's destination).
-    target_pods: &'a [&'a Pod],
+    target_pods: &'h [&'s Pod],
     /// Named peer sets, added to the table.
-    named: &'a mut BTreeMap<String, SetSync>,
-    prefix: String,
-    idx: u32,
+    named: &'h mut BTreeMap<String, SetSync>,
+    /// Shared selector peer sets, by key.
+    selectors: &'h mut HashMap<u128, SelectorSet<'s>>,
     /// Anonymous sets this chain's rules reference, referenced by position.
     ///
     /// Their names are generated by `sync`, not here.
@@ -375,7 +442,7 @@ type Clause = (Option<Family>, Vec<Expr>);
 /// A rule's peer clauses and the pods its selector peers matched.
 type Peers<'a> = (Vec<Clause>, Vec<&'a Pod>);
 
-impl<'a> Helper<'a> {
+impl<'h, 's> Helper<'h, 's> {
     /// Registers a fresh anonymous set and returns its position, which a rule
     /// references via [`rules::lookup_anon`].
     fn push_anon(&mut self, mut set: SetSync) -> u32 {
@@ -404,20 +471,77 @@ impl<'a> Helper<'a> {
         self.push_anon(SetSync::interval(ranges, None))
     }
 
-    fn push_simple_v4(&mut self, name: String, items: Vec<Ipv4Addr>) {
-        self.named.insert(name, SetSync::simple(items, None));
+    /// The shared set selected by `ns`/`pod`, resolving it (and matching its
+    /// pods) on first use.
+    fn selector_set(&mut self, ns: &Option<Selector>, pod: &Option<Selector>) -> &SelectorSet<'s> {
+        let key = selector_key(self.policy_ns, ns.as_ref(), pod.as_ref());
+        if !self.selectors.contains_key(&key) {
+            let set = self.resolve_selector(key, ns, pod);
+            self.selectors.insert(key, set);
+        }
+        self.selectors.get(&key).expect("just inserted")
     }
 
-    fn push_simple_v6(&mut self, name: String, items: Vec<Ipv6Addr>) {
-        self.named.insert(name, SetSync::simple(items, None));
+    /// Resolves a selector into its matched pods and per-family IP sets,
+    /// registering the non-empty sets (with a descriptive comment).
+    fn resolve_selector(
+        &mut self,
+        key: u128,
+        ns: &Option<Selector>,
+        pod: &Option<Selector>,
+    ) -> SelectorSet<'s> {
+        // Explicit namespace selectors resolve to namespace names now; an
+        // absent one scopes to the policy's own namespace.
+        let namespaces: Option<Set<&'s str>> = ns.as_ref().map(|sel| {
+            (self.state.nses.iter())
+                .filter(|(_, ns)| sel.matches(&ns.labels))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        });
+
+        let mut pods = BTreeMap::new();
+        let mut ipsv4: Set<Ipv4Addr> = Set::new();
+        let mut ipsv6: Set<Ipv6Addr> = Set::new();
+        for (pod_key, pod_state) in self.state.pods.iter() {
+            let in_scope = match &namespaces {
+                Some(namespaces) => namespaces.contains(pod_key.namespace.as_str()),
+                None => pod_key.namespace == self.policy_ns,
+            };
+            if !in_scope {
+                continue;
+            }
+            if let Some(sel) = pod
+                && !sel.matches(&pod_state.labels)
+            {
+                continue;
+            }
+
+            pods.insert(pod_key, pod_state);
+            ipsv4.extend(&pod_state.ipsv4);
+            ipsv6.extend(&pod_state.ipsv6);
+        }
+
+        let comment = selector_comment(self.policy_ns, ns.as_ref(), pod.as_ref());
+        let v4 = (!ipsv4.is_empty()).then(|| {
+            let name = selector_set_name(key, Family::V4);
+            self.named
+                .insert(name.clone(), SetSync::simple(ipsv4, Some(comment.clone())));
+            name
+        });
+        let v6 = (!ipsv6.is_empty()).then(|| {
+            let name = selector_set_name(key, Family::V6);
+            self.named
+                .insert(name.clone(), SetSync::simple(ipsv6, Some(comment)));
+            name
+        });
+
+        SelectorSet { pods, v4, v6 }
     }
 
     /// Builds the rules of one netpol rule: one rule per peer clause, all
     /// `accept`. Each generated rule gets its own anonymous port set (the
     /// kernel binds an anonymous set to a single rule).
     fn rule(&mut self, rule: &PolicyRule, dir: Dir) -> Vec<Rule> {
-        self.idx += 1;
-
         let (peer_clauses, peer_pods) = self.peers(dir, rule.peers());
         // A named port is a container port of the traffic's *destination*: the
         // target pod for ingress, the peer pod for egress. With no peer
@@ -543,92 +667,56 @@ impl<'a> Helper<'a> {
 
     /// One clause per peer (OR'd by the caller); none specified matches all.
     ///
-    /// Returns each clause tagged with its address family (for pairing with a
-    /// named-port predicate) plus the pods the selector peers matched (the
-    /// named-port destinations for egress).
-    fn peers(&mut self, dir: Dir, peers: &[Peer]) -> Peers<'a> {
+    /// Selector peers share one set per `(namespace scope, pod selector)`, so a
+    /// selector used by several policies or rules is only resolved once per
+    /// render. Returns each clause tagged with its address family (for pairing
+    /// with a named-port predicate) plus the pods the selector peers matched
+    /// (the named-port destinations for egress).
+    fn peers(&mut self, dir: Dir, peers: &[Peer]) -> Peers<'s> {
         if peers.is_empty() {
             return (vec![(None, Vec::new())], Vec::new());
         }
 
         let mut clauses = Vec::new();
+        let mut pods: BTreeMap<&'s keys::Object, &'s Pod> = BTreeMap::new();
 
-        // `ipBlock` peers, in order.
         for peer in peers {
-            if let Peer::IpBlock { cidr, except } = peer {
-                let family = match cidr {
-                    IpCidr::V4(_) => Family::V4,
-                    IpCidr::V6(_) => Family::V6,
-                };
-                let mut clause = ip_prefix_clause(cidr, dir);
-                clause.extend(self.except_clause(except, dir));
-                clauses.push((Some(family), clause));
+            match peer {
+                Peer::IpBlock { cidr, except } => {
+                    let family = match cidr {
+                        IpCidr::V4(_) => Family::V4,
+                        IpCidr::V6(_) => Family::V6,
+                    };
+                    let mut clause = ip_prefix_clause(cidr, dir);
+                    clause.extend(self.except_clause(except, dir));
+                    clauses.push((Some(family), clause));
+                }
+                Peer::Selector { namespace, pod } => {
+                    let set = self.selector_set(namespace, pod);
+                    if let Some(name) = &set.v4 {
+                        clauses.push((
+                            Some(Family::V4),
+                            rules::ip_set(Family::V4, dir, name, false),
+                        ));
+                    }
+                    if let Some(name) = &set.v6 {
+                        clauses.push((
+                            Some(Family::V6),
+                            rules::ip_set(Family::V6, dir, name, false),
+                        ));
+                    }
+                    pods.extend(set.pods.iter().map(|(key, pod)| (*key, *pod)));
+                }
             }
-        }
-
-        // Selector peers, resolved in a single pass over the pods so a pod
-        // matched by several peers is neither duplicated nor dropped. A peer
-        // without a `namespaceSelector` selects the policy's own namespace; an
-        // explicit (even empty) one selects namespaces.
-        let selectors: Vec<(&Option<Selector>, Set<&str>)> = (peers.iter())
-            .filter_map(|peer| match peer {
-                Peer::Selector { namespace, pod } => Some((
-                    pod,
-                    match namespace {
-                        Some(sel) => (self.state.nses.iter())
-                            .filter(|(_, ns)| sel.matches(&ns.labels))
-                            .map(|(ns, _)| ns.as_str())
-                            .collect(),
-                        None => Set::from([self.policy_ns]),
-                    },
-                )),
-                Peer::IpBlock { .. } => None,
-            })
-            .collect();
-
-        let mut pods = Vec::new();
-        let mut ipsv4: Set<Ipv4Addr> = Set::new();
-        let mut ipsv6: Set<Ipv6Addr> = Set::new();
-        for (key, pod_state) in self.state.pods.iter() {
-            let matched = selectors.iter().any(|(pod, ns_filter)| {
-                ns_filter.contains(key.namespace.as_str())
-                    && pod
-                        .as_ref()
-                        .is_none_or(|filter| filter.matches(&pod_state.labels))
-            });
-            if !matched {
-                continue;
-            }
-
-            ipsv4.extend(&pod_state.ipsv4);
-            ipsv6.extend(&pod_state.ipsv6);
-            pods.push(pod_state);
-        }
-
-        if !ipsv4.is_empty() {
-            let name = format!("{}_{}_pods_v4", self.prefix, self.idx);
-            self.push_simple_v4(name.clone(), ipsv4.iter().copied().collect());
-            clauses.push((
-                Some(Family::V4),
-                rules::ip_set(Family::V4, dir, &name, false),
-            ));
-        }
-        if !ipsv6.is_empty() {
-            let name = format!("{}_{}_pods_v6", self.prefix, self.idx);
-            self.push_simple_v6(name.clone(), ipsv6.iter().copied().collect());
-            clauses.push((
-                Some(Family::V6),
-                rules::ip_set(Family::V6, dir, &name, false),
-            ));
         }
 
         if clauses.is_empty() {
             // Selector peers that matched no pod yield no clause: the caller
             // then emits no rule at all for this peer list, i.e. it matches
             // nothing (fails closed) rather than allowing everything.
-            (vec![], pods)
+            (vec![], Vec::new())
         } else {
-            (clauses, pods)
+            (clauses, pods.into_values().collect())
         }
     }
 
@@ -913,8 +1001,12 @@ mod tests {
 
         let names = chain_names(&r);
         assert!(
-            names.contains(&"pods_filter".to_string()),
-            "base chain missing: {names:?}"
+            names.contains(&"pods_filter_ingress".to_string()),
+            "ingress base chain missing: {names:?}"
+        );
+        assert!(
+            !names.contains(&"pods_filter_egress".to_string()),
+            "egress base chain emitted without egress policies: {names:?}"
         );
         assert!(
             names.contains(&"ingress_pod_default_a".to_string()),
@@ -1084,6 +1176,277 @@ mod tests {
         assert_eq!(name(&rule[0]), Some("counter"));
         // `drop` is still the verdict, now counted
         assert_eq!(name(&rule[1]), Some("immediate"));
+    }
+
+    fn state_with_nses(
+        pods: &[core::Pod],
+        nses: &[(&str, serde_json::Value)],
+        netpols: &[networking::NetworkPolicy],
+    ) -> State {
+        let mut state = State::new();
+        for (name, labels) in nses {
+            let ns: core::Namespace = serde_json::from_value(serde_json::json!({
+                "metadata": { "name": name, "labels": labels },
+            }))
+            .expect("namespace");
+            state.ingest(&Event::Namespace(Change::InitApply(Arc::new(ns))));
+        }
+        state.ingest(&Event::Namespace(Change::InitDone));
+        for p in pods {
+            state.ingest(&Event::Pod(Change::InitApply(Arc::new(p.clone()))));
+        }
+        state.ingest(&Event::Pod(Change::InitDone));
+        for np in netpols {
+            state.ingest(&Event::NetworkPolicy(Change::InitApply(Arc::new(
+                np.clone(),
+            ))));
+        }
+        state.ingest(&Event::NetworkPolicy(Change::InitDone));
+        state
+    }
+
+    /// The `sel_*` set names a render produces.
+    fn selector_sets(msgs: &[Message]) -> Vec<String> {
+        let mut names: Vec<_> = (set_names(msgs))
+            .into_iter()
+            .filter(|name| name.starts_with("sel_"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The set names every rule of `chain` looks up.
+    fn chain_lookups(msgs: &[Message], chain: &str) -> Vec<String> {
+        (rules(msgs))
+            .into_iter()
+            .filter(|(name, _)| name == chain)
+            .flat_map(|(_, rule)| lookups(&rule))
+            .map(|(set, _)| set)
+            .collect()
+    }
+
+    #[test]
+    fn selector_peer_sets_are_shared_across_policies() {
+        let state = state_with(
+            &[
+                pod("a1", "default", "n1", "a", &["10.0.0.1"]),
+                pod("a2", "default", "n1", "a", &["10.0.0.2"]),
+                pod("b", "default", "n1", "b", &["10.0.0.3"]),
+            ],
+            &[
+                netpol(
+                    "np1",
+                    "a",
+                    serde_json::json!([{ "from": [{ "podSelector": { "matchLabels": { "app": "b" } } }] }]),
+                ),
+                netpol(
+                    "np2",
+                    "a",
+                    serde_json::json!([{ "from": [{ "podSelector": { "matchLabels": { "app": "b" } } }] }]),
+                ),
+            ],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        let sets = selector_sets(&r);
+        assert_eq!(sets.len(), 1, "expected one shared set, got {sets:?}");
+        let name = &sets[0];
+        // sel_ + 26 base32 chars + _v4
+        assert_eq!(name.len(), 4 + 26 + 3, "name={name}");
+        assert!(name.ends_with("_v4"), "name={name}");
+
+        assert_eq!(
+            chain_lookups(&r, "ingress_netpol_default_np1"),
+            vec![name.clone()]
+        );
+        assert_eq!(
+            chain_lookups(&r, "ingress_netpol_default_np2"),
+            vec![name.clone()]
+        );
+
+        let set = find_set(&r, name).expect("shared set");
+        let comment = set
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                netlink_packet_netfilter::nftables::SetAttribute::UserData(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                _ => None,
+            })
+            .expect("set comment");
+        assert!(comment.contains("default: app=b"), "comment={comment:?}");
+    }
+
+    #[test]
+    fn selector_scope_is_part_of_the_key() {
+        // The same pod selector, implicitly scoped to a different policy
+        // namespace, selects different pods and must not share a set.
+        let mut other = netpol(
+            "np2",
+            "a",
+            serde_json::json!([{ "from": [{ "podSelector": { "matchLabels": { "app": "b" } } }] }]),
+        );
+        other.metadata.namespace = Some("other".into());
+
+        let state = state_with(
+            &[
+                pod("a1", "default", "n1", "a", &["10.0.0.1"]),
+                pod("b1", "default", "n1", "b", &["10.0.0.3"]),
+                pod("a2", "other", "n1", "a", &["10.0.1.1"]),
+                pod("b2", "other", "n1", "b", &["10.0.1.3"]),
+            ],
+            &[
+                netpol(
+                    "np1",
+                    "a",
+                    serde_json::json!([{ "from": [{ "podSelector": { "matchLabels": { "app": "b" } } }] }]),
+                ),
+                other,
+            ],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        let sets = selector_sets(&r);
+        assert_eq!(sets.len(), 2, "expected one set per scope, got {sets:?}");
+        let a = chain_lookups(&r, "ingress_netpol_default_np1");
+        let b = chain_lookups(&r, "ingress_netpol_other_np2");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_ne!(a, b, "different scopes must not share a set");
+    }
+
+    #[test]
+    fn explicit_namespace_selector_shares_across_policy_namespaces() {
+        let ingress = serde_json::json!([{ "from": [{
+            "namespaceSelector": { "matchLabels": { "team": "x" } },
+            "podSelector": { "matchLabels": { "app": "b" } },
+        }] }]);
+        let mut other = netpol("np2", "a", ingress.clone());
+        other.metadata.namespace = Some("other".into());
+
+        let state = state_with_nses(
+            &[
+                pod("a1", "default", "n1", "a", &["10.0.0.1"]),
+                pod("a2", "other", "n1", "a", &["10.0.1.1"]),
+                pod("b", "team-x", "n1", "b", &["10.0.2.3"]),
+            ],
+            &[
+                ("default", serde_json::json!({})),
+                ("other", serde_json::json!({})),
+                ("team-x", serde_json::json!({ "team": "x" })),
+            ],
+            &[netpol("np1", "a", ingress), other],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        let sets = selector_sets(&r);
+        assert_eq!(sets.len(), 1, "expected one shared set, got {sets:?}");
+        assert_eq!(
+            chain_lookups(&r, "ingress_netpol_default_np1"),
+            vec![sets[0].clone()]
+        );
+        assert_eq!(
+            chain_lookups(&r, "ingress_netpol_other_np2"),
+            vec![sets[0].clone()]
+        );
+    }
+
+    #[test]
+    fn each_selector_peer_is_its_own_clause() {
+        let state = state_with(
+            &[
+                pod("a", "default", "n1", "a", &["10.0.0.1"]),
+                pod("b", "default", "n1", "b", &["10.0.0.2"]),
+                pod("c", "default", "n1", "c", &["10.0.0.3"]),
+            ],
+            &[netpol(
+                "np",
+                "a",
+                serde_json::json!([{ "from": [
+                    { "podSelector": { "matchLabels": { "app": "b" } } },
+                    { "podSelector": { "matchLabels": { "app": "c" } } },
+                ] }]),
+            )],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        let sets = selector_sets(&r);
+        assert_eq!(sets.len(), 2, "expected one set per selector, got {sets:?}");
+        let lookups = chain_lookups(&r, "ingress_netpol_default_np");
+        assert_eq!(lookups.len(), 2, "one rule per selector peer: {lookups:?}");
+        assert_ne!(lookups[0], lookups[1]);
+    }
+
+    #[test]
+    fn unmatched_selector_peers_fail_closed() {
+        let state = state_with(
+            &[pod("a", "default", "n1", "a", &["10.0.0.1"])],
+            &[netpol(
+                "np",
+                "a",
+                serde_json::json!([{ "from": [
+                    { "podSelector": { "matchLabels": { "app": "missing" } } },
+                    { "podSelector": { "matchLabels": { "app": "b" } } },
+                ] }]),
+            )],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        // the missing selector contributes no clause/set; only `app=b` does
+        assert_eq!(selector_sets(&r).len(), 0, "no pod matches either selector");
+
+        let state = state_with(
+            &[
+                pod("a", "default", "n1", "a", &["10.0.0.1"]),
+                pod("b", "default", "n1", "b", &["10.0.0.2"]),
+            ],
+            &[netpol(
+                "np",
+                "a",
+                serde_json::json!([{ "from": [
+                    { "podSelector": { "matchLabels": { "app": "missing" } } },
+                    { "podSelector": { "matchLabels": { "app": "b" } } },
+                ] }]),
+            )],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+        assert_eq!(
+            selector_sets(&r).len(),
+            1,
+            "only the matching selector is used"
+        );
+        assert_eq!(
+            chain_lookups(&r, "ingress_netpol_default_np").len(),
+            1,
+            "one non-empty selector clause"
+        );
+    }
+
+    #[test]
+    fn policies_without_local_pods_are_not_materialized() {
+        let state = state_with(
+            &[
+                pod("a", "default", "n1", "a", &["10.0.0.1"]),
+                pod("r", "default", "n2", "r", &["10.0.1.2"]),
+            ],
+            &[netpol(
+                "np",
+                "r",
+                serde_json::json!([{ "from": [{ "podSelector": { "matchLabels": { "app": "a" } } }] }]),
+            )],
+        );
+        let r = flat_messages(&state, &default_cfg(), "n1");
+
+        let names = chain_names(&r);
+        assert!(
+            !names.iter().any(|name| name.starts_with("ingress_netpol_")),
+            "remote-only policy was materialized: {names:?}"
+        );
+        assert!(
+            selector_sets(&r).is_empty(),
+            "remote-only policy's selector set was built"
+        );
     }
 
     #[test]

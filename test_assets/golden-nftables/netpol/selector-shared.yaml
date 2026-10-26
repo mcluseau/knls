@@ -1,0 +1,78 @@
+- !ingest
+  - stream: Namespace
+    event: !init_done
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: a1, namespace: default, labels: { app: a } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.1 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: a2, namespace: default, labels: { app: a } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.2 }] }
+  - stream: Pod
+    event: !init_apply
+      metadata: { name: b, namespace: default, labels: { app: b } }
+      spec: { nodeName: n1 }
+      status: { podIPs: [{ ip: 10.0.0.3 }] }
+  - stream: Pod
+    event: !init_done
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: np1, namespace: default }
+      spec:
+        podSelector: { matchLabels: { app: a } }
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector: { matchLabels: { app: b } }
+  - stream: NetworkPolicy
+    event: !init_apply
+      metadata: { name: np2, namespace: default }
+      spec:
+        podSelector: { matchLabels: { app: a } }
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector: { matchLabels: { app: b } }
+  - stream: NetworkPolicy
+    event: !init_done
+
+- !verify |
+    map pods_ingress {
+    	type ipv4_addr : verdict
+    	elements = { 10.0.0.1 : goto ingress_pod_default_a1, 10.0.0.2 : goto ingress_pod_default_a2 }
+    }
+
+    set sel_5mcn16qps98be6zt3gb6myck8h_v4 {
+    	type ipv4_addr
+    	comment "default: app=b"
+    	elements = { 10.0.0.3 }
+    }
+
+    chain ingress_netpol_default_np1 {
+    	ip saddr @sel_5mcn16qps98be6zt3gb6myck8h_v4 accept
+    }
+
+    chain ingress_netpol_default_np2 {
+    	ip saddr @sel_5mcn16qps98be6zt3gb6myck8h_v4 accept
+    }
+
+    chain ingress_pod_default_a1 {
+    	jump ingress_netpol_default_np1
+    	jump ingress_netpol_default_np2
+    	counter packets 0 bytes 0 reject
+    }
+
+    chain ingress_pod_default_a2 {
+    	jump ingress_netpol_default_np1
+    	jump ingress_netpol_default_np2
+    	counter packets 0 bytes 0 reject
+    }
+
+    chain pods_filter_ingress {
+    	type filter hook forward priority filter; policy accept;
+    	ct state established,related accept
+    	ip daddr vmap @pods_ingress
+    }

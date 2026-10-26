@@ -61,8 +61,8 @@
     	counter packets 0 bytes 0 reject
     }
 
-    chain pods_filter {
-    	type filter hook forward priority filter; policy accept;
+    chain pods_filter_egress {
+    	type filter hook forward priority filter + 10; policy accept;
     	ct state established,related accept
     	ip saddr vmap @pods_egress
     }

@@ -25,6 +25,83 @@ impl Selector {
                 .iter()
                 .all(|expr| expr.matches(labels))
     }
+
+    /// Canonical, length-prefixed encoding, used to derive shared set names.
+    ///
+    /// `matchLabels` are already sorted; `matchExpressions` are sorted here, so
+    /// semantically identical selectors encode identically regardless of the
+    /// order they were written in.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        fn put_u32(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn put_bytes(out: &mut Vec<u8>, value: impl AsRef<[u8]>) {
+            let value = value.as_ref();
+            put_u32(out, value.len() as u32);
+            out.extend_from_slice(value);
+        }
+
+        put_u32(out, self.match_labels.len() as u32);
+        for (key, value) in &self.match_labels {
+            put_bytes(out, key);
+            put_bytes(out, value);
+        }
+
+        let mut exprs: Vec<_> = self.match_expressions.iter().collect();
+        exprs.sort();
+        put_u32(out, exprs.len() as u32);
+        for expr in exprs {
+            put_bytes(out, &expr.key);
+            out.push(expr.operator.code());
+            match &expr.values {
+                Some(values) => {
+                    out.push(1);
+                    put_u32(out, values.len() as u32);
+                    for value in values {
+                        put_bytes(out, value);
+                    }
+                }
+                None => out.push(0),
+            }
+        }
+    }
+
+    /// A k8s-ish human form, for set comments: `app=a,env in (prod)`.
+    ///
+    /// An empty selector is rendered `*` (matches everything).
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .match_labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+
+        let mut exprs: Vec<_> = self.match_expressions.iter().collect();
+        exprs.sort();
+        for expr in exprs {
+            let key = &expr.key;
+            let values = || {
+                expr.values
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            parts.push(match expr.operator {
+                SelectorOp::In => format!("{key} in ({})", values()),
+                SelectorOp::NotIn => format!("{key} notin ({})", values()),
+                SelectorOp::Exists => key.clone(),
+                SelectorOp::DoesNotExist => format!("!{key}"),
+            });
+        }
+
+        if parts.is_empty() {
+            "*".into()
+        } else {
+            parts.join(",")
+        }
+    }
 }
 
 impl TryFrom<&LabelSelector> for Selector {
@@ -42,7 +119,7 @@ impl TryFrom<&LabelSelector> for Selector {
 }
 
 /// A pre-parsed [`LabelSelectorRequirement`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct SelectorExpr {
     key: String,
     operator: SelectorOp,
@@ -81,12 +158,24 @@ impl TryFrom<&LabelSelectorRequirement> for SelectorExpr {
 }
 
 /// The operator of a [`SelectorExpr`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SelectorOp {
     In,
     NotIn,
     Exists,
     DoesNotExist,
+}
+
+impl SelectorOp {
+    /// A stable discriminant for [`Selector::encode_into`].
+    fn code(self) -> u8 {
+        match self {
+            Self::In => 0,
+            Self::NotIn => 1,
+            Self::Exists => 2,
+            Self::DoesNotExist => 3,
+        }
+    }
 }
 
 impl TryFrom<&str> for SelectorOp {
@@ -152,6 +241,48 @@ mod tests {
             ("app", "a"),
             ("deprecated", "yes")
         ])));
+    }
+
+    /// Expressions are hashed and described in a canonical (sorted) order, so
+    /// the same selector written differently names the same set.
+    #[test]
+    fn encoding_and_description_are_canonical() {
+        let a = selector(serde_json::json!({
+            "matchExpressions": [
+                { "key": "env", "operator": "In", "values": ["prod", "staging"] },
+                { "key": "app", "operator": "Exists" },
+            ]
+        }));
+        let b = selector(serde_json::json!({
+            "matchExpressions": [
+                { "key": "app", "operator": "Exists" },
+                { "key": "env", "operator": "In", "values": ["staging", "prod"] },
+            ]
+        }));
+
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        a.encode_into(&mut ea);
+        b.encode_into(&mut eb);
+        assert_eq!(ea, eb);
+        assert_eq!(a.describe(), b.describe());
+    }
+
+    #[test]
+    fn describe_is_k8s_ish() {
+        let s = selector(serde_json::json!({
+            "matchLabels": { "app": "a" },
+            "matchExpressions": [
+                { "key": "env", "operator": "In", "values": ["prod", "staging"] },
+                { "key": "team", "operator": "NotIn", "values": ["other"] },
+                { "key": "tracked", "operator": "Exists" },
+                { "key": "deprecated", "operator": "DoesNotExist" },
+            ]
+        }));
+        assert_eq!(
+            s.describe(),
+            "app=a,!deprecated,env in (prod,staging),team notin (other),tracked"
+        );
+        assert_eq!(selector(serde_json::json!({})).describe(), "*");
     }
 
     #[test]
