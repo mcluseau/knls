@@ -92,7 +92,7 @@ ginkgo_args=(
 # e2e.test flags, after the `--` separator. `skeleton` is the fallback provider
 # for a cluster we did not provision; reports land in the mounted /tmp/results.
 e2e_args=(
-    --kubeconfig=/cfg/config
+    --kubeconfig=/cfg/e2e-config
 	--provider=skeleton
 	--disable-log-dump
 	--report-dir=/tmp/results
@@ -108,7 +108,7 @@ echo "e2e: reports in $artifacts"
 # Override the image entrypoint (its default `kubeconformance` wrapper) so the
 # Ginkgo CLI is driven directly: `ginkgo [flags] e2e.test -- [suite flags]`.
 exec docker run --rm -w /root \
-	-v "$PWD/.kube:/cfg:ro" \
+	-v "$PWD/.kube:/cfg:ro" -w /cfg \
 	-v "$artifacts":/tmp/results \
     $docker_args \
 	--entrypoint /usr/local/bin/ginkgo \
