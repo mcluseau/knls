@@ -27,8 +27,8 @@ gethostname = "1.1.0"
 hex = "0.4.3"
 http = "1.5.0"
 http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["http1", "server"] }
-hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 hxdmp = "0.2.1"
 ipnetwork = "0.21.1"
 itertools = "0.15.0"
@@ -45,14 +45,14 @@ netlink-proto = "0.13.0"
 nix = { version = "0.31.3", features = ["socket"] }
 rtnetlink = "0.23.0"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 serde_yaml = "0.9.34"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 tokio-pipe = "0.2.12"
 urandom = "0.2.2"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
-zerocopy = { version = "0.8.57", features = ["derive"] }
-zstd = "0.14.0"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+zerocopy = { version = "0.8.63", features = ["derive"] }
+zstd = "0.14.3"
 

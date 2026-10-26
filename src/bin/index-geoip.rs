@@ -22,7 +22,7 @@ pub enum Error {
     InvalidCountryCode(String),
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 pub async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let output = args.next().unwrap_or("country_ips.db".into());
