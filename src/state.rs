@@ -188,6 +188,11 @@ impl LocalEndpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LocalEndpointSlice {
     pub target_ports: Map<String, u16>,
+    /// Named ports as they appear in the EndpointSlice, with their protocol.
+    /// Unlike `target_ports` (keyed by name for the proxy), this keeps every
+    /// named port so DNS can publish SRV records for ports that only exist in
+    /// a slice (e.g. a selectorless headless Service).
+    pub ports: Vec<(String, Protocol, u16)>,
     pub endpoints: Vec<LocalEndpoint>,
     /// Whether the backing EndpointSlice is headless-labelled (the proxy must
     /// skip it; DNS keeps using it).
@@ -209,6 +214,7 @@ impl LocalEndpointSlice {
 
         Some(Self {
             target_ports: slice.target_ports.clone(),
+            ports: slice.ports.clone(),
             endpoints: endpoints.into_iter().collect(),
             headless: slice.headless,
         })
@@ -526,6 +532,8 @@ impl ProtoPort {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EndpointSlice {
     pub target_ports: Map<String, u16>,
+    /// Named ports with their protocol, as carried by the EndpointSlice.
+    pub ports: Vec<(String, Protocol, u16)>,
     pub endpoints: Set<Endpoint>,
     /// The `service.kubernetes.io/headless` label: this slice belongs to a
     /// headless Service, so the proxy must not program it.
@@ -548,6 +556,14 @@ impl memstore::KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
                 .filter_map(|p| {
                     let name = p.name.clone().unwrap_or_default();
                     Some((name, p.port? as u16))
+                })
+                .collect(),
+
+            ports: (eps.ports.iter().flatten())
+                .filter_map(|p| {
+                    let name = p.name.clone().filter(|n| !n.is_empty())?;
+                    let protocol = Protocol::try_from(&p.protocol).ok()?;
+                    Some((name, protocol, p.port? as u16))
                 })
                 .collect(),
 

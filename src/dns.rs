@@ -1,5 +1,5 @@
 use log::error;
-use std::collections::BTreeMap as Map;
+use std::collections::{BTreeMap as Map, BTreeSet};
 use std::net::IpAddr;
 
 use crate::state::{Protocol, ServiceTarget, State};
@@ -117,14 +117,26 @@ pub fn cluster_zone_from_state(state: &State, cluster_domain: &DomainName) -> Do
 
         // `_<port-name>._<proto>.<svc>.<ns>.svc.<domain>` SRV records, one per
         // named Service port (kube-dns generates them for ClusterIP and
-        // headless Services alike).
+        // headless Services alike). A headless Service may be selectorless,
+        // with its ports defined only by the EndpointSlices; include those too.
         let target = service_fqdn(key, cluster_domain);
+        let mut srv_ports = BTreeSet::new();
         for (port, port_name) in &svc.ports {
             // kube-dns only publishes SRV records for named ports.
             if port_name.is_empty() {
                 continue;
             }
             let (proto, port) = port.protocol_port();
+            srv_ports.insert((port_name.clone(), proto, port));
+        }
+        if matches!(&svc.target, ServiceTarget::Headless) {
+            for slice in state.slices(key, svc.internal_traffic.is_local()) {
+                for (name, proto, port) in slice.ports {
+                    srv_ports.insert((name, proto, port));
+                }
+            }
+        }
+        for (port_name, proto, port) in srv_ports {
             let proto = match proto {
                 Protocol::TCP => "_tcp",
                 Protocol::UDP => "_udp",
@@ -219,6 +231,59 @@ mod tests {
             reverse_name("4321:0:1:2:3:4:567:89ab".parse().expect("ip")).to_string(),
             "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa."
         );
+    }
+
+    #[test]
+    fn headless_srv_includes_endpoint_slice_ports() {
+        let svc = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "dns-test-service", "namespace": "default" },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "None",
+                "clusterIPs": ["None"],
+                "internalTrafficPolicy": "Local",
+                "ports": [{ "name": "http", "protocol": "TCP", "port": 80 }],
+            },
+        }))
+        .expect("service");
+
+        let slice = serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "dns-test-service-abc",
+                "namespace": "default",
+                "labels": { "kubernetes.io/service-name": "dns-test-service" },
+            },
+            "addressType": "IPv4",
+            "endpoints": [{
+                "addresses": ["1.2.3.4"],
+                "conditions": { "ready": true },
+                "nodeName": "n1",
+            }],
+            "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }],
+        }))
+        .expect("endpoint slice");
+
+        let mut state = State::new("n1".into());
+        state.ingest(&Event::Service(Change::InitApply(Arc::new(svc))));
+        state.ingest(&Event::Service(Change::InitDone));
+        state.ingest(&Event::EndpointSlice(Change::InitApply(Arc::new(slice))));
+        state.ingest(&Event::EndpointSlice(Change::InitDone));
+
+        let cluster_domain = DomainName::try_from("cluster.local").expect("domain");
+        let zone = cluster_zone_from_state(&state, &cluster_domain);
+
+        assert!(has(
+            &zone,
+            "_http._tcp.dns-test-service.default.svc",
+            data::RecordType::SRV
+        ));
+        assert!(has(
+            &zone,
+            "_https._tcp.dns-test-service.default.svc",
+            data::RecordType::SRV
+        ));
     }
 
     #[test]

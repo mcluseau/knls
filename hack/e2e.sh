@@ -44,7 +44,10 @@ focus=${FOCUS:-'\[sig-network\]'}
 #     which knls replaces
 #   - `Networking-IPv6`: needs an IPv6/dual-stack cluster
 #   - `RelaxedServiceNameValidation`: alpha feature gate, disabled
-default_skip='DualStack|Disruptive|LoadBalancer|DNS configMap nameserver|Networking-IPv6|RelaxedServiceNameValidation'
+#   - `LocalhostNodePorts`: alpha `KubeProxyNFTablesLocalhostNodePorts` feature,
+#     disabled by default (upstream nftables kube-proxy does not serve these
+#     unless the gate is enabled)
+default_skip='DualStack|Disruptive|LoadBalancer|DNS configMap nameserver|Networking-IPv6|RelaxedServiceNameValidation|LocalhostNodePorts'
 skip="${SKIP:+${SKIP}|}${default_skip}"
 nodes=${NODES:-1}
 artifacts=${ARTIFACTS:-${PWD}/tmp/e2e-results}
