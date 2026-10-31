@@ -7,12 +7,13 @@ connectivity: !wireguard
     - "192.168.242.0/28"
   # chain the CNI `portmap` plugin so pods' `hostPort`s are reachable
   # host_ports: true
+  # masquerade: true
   on_create:
   - !nft_chain
     table: knls
     chain: wireguard
     rules: |-
-      # ...
+      # empty; masquerade lives in the knls-connectivity table
 
 dns: !internal
   on_listen:

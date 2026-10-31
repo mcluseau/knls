@@ -19,16 +19,6 @@ sysctls:
 
 #extra_conf: |-
 #  on_start: ...
-#
-# a common requirement would be to masq pods' outgoing traffic; pods are usually connected with veth:
-#  on_start:
-#  - !nft_chain
-#    table: knls
-#    chain: masq-pods
-#    rules: |-
-#      type nat hook postrouting priority 999; policy accept;
-#      ct status dnat return
-#      meta iifkind "veth" oifname != "kwg" masquerade
 
 #service_ips: [ 1.2.3.4 ]
 # The cluster's Service (ClusterIP) CIDR(s); used e.g. to delegate their reverse
@@ -55,6 +45,9 @@ wireguard:
   # Chain the CNI `portmap` plugin so pods' `hostPort`s are reachable
   # (requires the `portmap` CNI plugin binary on the nodes).
   host_ports: false
+  # Masquerade pod traffic leaving the cluster. Traffic to local pods and to
+  # pods reached through the wireguard interface keeps its source address.
+  masquerade: true
 
 dns: internal
 

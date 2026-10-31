@@ -11,7 +11,9 @@ use netlink_packet_route::{
 };
 use nix::errno::Errno;
 use serde_json::json;
+use std::collections::BTreeMap as Map;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -23,7 +25,7 @@ use crate::nftables::{
     chain::{self, Chain, ChainType, InetHookNumber},
     rules,
     rules::{Dir, Family, Verdict},
-    table,
+    table_sync::{BaseChain, ChainSync, SetSync, TableState, TableSync},
 };
 use crate::rtnl_exts::ErrorExt;
 use crate::state::wireguard::{Key, Node, decode_key, encode_key};
@@ -89,6 +91,9 @@ pub struct Config {
     mtu: Option<u16>,
     /// Chain the CNI `portmap` plugin so pods' `hostPort`s are reachable.
     host_ports: bool,
+    /// Masquerade pod traffic leaving the cluster (destinations other than
+    /// local pods or pods reachable through the wireguard interface).
+    masquerade: bool,
 }
 
 impl Default for Config {
@@ -101,6 +106,7 @@ impl Default for Config {
             manual_node: None,
             mtu: None,
             host_ports: false,
+            masquerade: true,
         }
     }
 }
@@ -188,6 +194,11 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
 
     actions::run_event(module_path!(), "on_create", &cfg.on_create).await?;
 
+    // The external-IP snat chain used to live in the `knls` table and was
+    // created by this code. Delete it from there now that the connectivity
+    // table owns it.
+    remove_legacy_external_ips_chain("knls").await;
+
     let if_addrs = IfAddrs {
         id: link_id,
         rtnl: rtnl.clone(),
@@ -243,6 +254,8 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
     // start watch
     let mut warned_about_pubkey = false;
     let mut prev_cni_config = None;
+    let mut connectivity_applied: Option<ConnectivityKey> = None;
+    let mut connectivity_table = TableState::new(CONNECTIVITY_TABLE);
     let mut state = State::new();
 
     loop {
@@ -407,62 +420,181 @@ pub async fn watch(ctx: Arc<crate::Context>, cfg: Config, mut events: EventRecei
         }
         routes.update_done();
 
-        // handle pods with external IP
-        {
-            let my_ext_ips = &my_node.external_ips;
-
-            let mut chain = Chain::new("knls", "wireguard-external-ips");
-
-            // Leave traffic already egressing the wireguard interface alone:
-            // node-to-node traffic is handled by the wg routes.
-            chain.push(vec![
-                rules::meta(MetaKey::Oif, Register::Reg1),
-                rules::eq(Register::Reg1, link_id.to_ne_bytes().to_vec()),
-                rules::verdict(Verdict::Return),
-            ]);
-
-            for (k, pod) in state.pods.iter() {
-                let comment = k.to_string();
-
-                if let Some(v4) = pod.external_ipv4
-                    && my_ext_ips.contains(&v4)
-                {
-                    for ip in pod.ips.iter().filter(|ip| ip.is_ipv4()) {
-                        chain.push_commented(snat_rule(*ip, v4), Some(&comment));
-                    }
-                }
-                if let Some(v6) = pod.external_ipv6
-                    && my_ext_ips.contains(&v6)
-                {
-                    for ip in pod.ips.iter().filter(|ip| ip.is_ipv6()) {
-                        chain.push_commented(snat_rule(*ip, v6), Some(&comment));
-                    }
+        // Pods with an external IP get a source-NAT rule too. Collect those
+        // before rendering: the connectivity table owns both the external-IP
+        // chain and the pod-egress masquerade chain.
+        let mut external_ips: Vec<ExternalIpSnat> = Vec::new();
+        for (_, pod) in state.pods.iter() {
+            if let Some(v4) = pod.external_ipv4
+                && my_node.external_ips.contains(&v4)
+            {
+                for ip in pod.ips.iter().filter(|ip| ip.is_ipv4()) {
+                    external_ips.push((*ip, v4));
                 }
             }
+            if let Some(v6) = pod.external_ipv6
+                && my_node.external_ips.contains(&v6)
+            {
+                for ip in pod.ips.iter().filter(|ip| ip.is_ipv6()) {
+                    external_ips.push((*ip, v6));
+                }
+            }
+        }
 
-            // Recreate the chain (created first so the `delete` cannot fail)
-            // and add the fresh rules, priority 100 = srcnat. Merged in a single
-            // transaction so the chain is never left empty.
-            let msgs = [
-                table::ensure("knls"),
-                chain.create(),
-                chain.delete(),
-                chain.create_base_with(
-                    ChainType::Nat,
-                    InetHookNumber::PostRouting,
-                    100,
-                    chain::ACCEPT,
-                ),
-            ]
-            .into_iter()
-            .chain(chain.rules().iter().cloned());
-
-            if let Err(e) = netfilter::new_link()?.send_as_transactions(msgs).await {
-                error!("failed to update the external-IP snat chain: {e}");
-                continue;
+        let connectivity_key = (
+            cfg.masquerade,
+            link_id,
+            my_node.pod_cidrs.clone(),
+            external_ips.clone(),
+        );
+        if connectivity_applied.as_ref() != Some(&connectivity_key) {
+            let next = render_connectivity_table(
+                link_id,
+                cfg.masquerade,
+                &my_node.pod_cidrs,
+                &external_ips,
+            );
+            match connectivity_table.update(next).await {
+                Ok(()) => connectivity_applied = Some(connectivity_key),
+                Err(e) => error!("failed to update the connectivity table: {e}"),
             }
         }
     }
+}
+
+const CONNECTIVITY_TABLE: &str = "knls-connectivity";
+const SNAT_CHAIN: &str = "snat";
+const EXTERNAL_IPS_CHAIN: &str = "external-ips";
+const LEGACY_EXTERNAL_IPS_CHAIN: &str = "wireguard-external-ips";
+const LOCAL_PODS_V4: &str = "local_pods4";
+const LOCAL_PODS_V6: &str = "local_pods6";
+
+type ExternalIpSnat = (IpAddr, IpAddr);
+type ConnectivityKey = (bool, u32, Vec<IpCidr>, Vec<ExternalIpSnat>);
+
+/// Deletes the external-IP snat chain this code used to render in the `knls`
+/// table. Missing table/chain is expected and ignored.
+async fn remove_legacy_external_ips_chain(table: &str) {
+    let chain = Chain::new(table, LEGACY_EXTERNAL_IPS_CHAIN);
+    match netfilter::new_link() {
+        Ok(nl) => {
+            if let Err(e) = nl.send_as_transactions([chain.delete()].into_iter()).await {
+                debug!("no legacy external-IP chain to remove: {e}");
+            }
+        }
+        Err(e) => debug!("could not open netfilter netlink to remove legacy chain: {e}"),
+    }
+}
+
+fn pod_ranges4(pod_cidrs: &[IpCidr]) -> Vec<RangeInclusive<Ipv4Addr>> {
+    (pod_cidrs.iter())
+        .filter_map(|cidr| match cidr {
+            IpCidr::V4(c) => Some(c.first_address()..=c.last_address()),
+            IpCidr::V6(_) => None,
+        })
+        .collect()
+}
+
+fn pod_ranges6(pod_cidrs: &[IpCidr]) -> Vec<RangeInclusive<Ipv6Addr>> {
+    (pod_cidrs.iter())
+        .filter_map(|cidr| match cidr {
+            IpCidr::V4(_) => None,
+            IpCidr::V6(c) => Some(c.first_address()..=c.last_address()),
+        })
+        .collect()
+}
+
+/// Renders the connectivity-owned `knls-connectivity` table.
+///
+/// It contains two nat postrouting chains:
+///
+/// - `external-ips` (priority 100): source-NAT each pod IP to the node-assigned
+///   external IP, unless the traffic already egresses the wireguard interface.
+/// - `snat` (priority 999): masquerade pod traffic whose destination is neither
+///   a local pod nor a pod reached through the wireguard interface.
+///
+/// Node-sourced traffic is not touched by `snat`: peer `allowed_ips` include
+/// node addresses, and the proxy already handles the `externalTrafficPolicy:
+/// Local` short-circuit.
+fn render_connectivity_table(
+    ifindex: u32,
+    enabled: bool,
+    pod_cidrs: &[IpCidr],
+    external_ips: &[ExternalIpSnat],
+) -> TableSync {
+    let comment = Some("local pod CIDRs".to_string());
+    let sets = Map::from([
+        (
+            LOCAL_PODS_V4.into(),
+            SetSync::interval(pod_ranges4(pod_cidrs), comment.clone()),
+        ),
+        (
+            LOCAL_PODS_V6.into(),
+            SetSync::interval(pod_ranges6(pod_cidrs), comment),
+        ),
+    ]);
+
+    let mut external_ip_rules = vec![vec![
+        rules::meta(MetaKey::Oif, Register::Reg1),
+        rules::eq(Register::Reg1, ifindex.to_ne_bytes().to_vec()),
+        rules::verdict(Verdict::Return),
+    ]];
+    external_ip_rules.extend(
+        external_ips
+            .iter()
+            .map(|&(saddr, ext)| snat_rule(saddr, ext)),
+    );
+
+    let mut snat_rules = Vec::new();
+    if enabled {
+        for (family, set) in [(Family::V4, LOCAL_PODS_V4), (Family::V6, LOCAL_PODS_V6)] {
+            let mut rule = rules::ip_set(family, Dir::Src, set, false);
+            rule.push(rules::meta(MetaKey::Oif, Register::Reg1));
+            rule.push(rules::eq(Register::Reg1, ifindex.to_ne_bytes().to_vec()));
+            rule.push(rules::verdict(Verdict::Return));
+            snat_rules.push(rule);
+
+            let mut rule = rules::ip_set(family, Dir::Src, set, false);
+            rule.extend(rules::ip_set(family, Dir::Dst, set, false));
+            rule.push(rules::verdict(Verdict::Return));
+            snat_rules.push(rule);
+
+            let mut rule = rules::ip_set(family, Dir::Src, set, false);
+            rule.push(rules::masquerade(false));
+            snat_rules.push(rule);
+        }
+    }
+
+    let chains = Map::from([
+        (
+            EXTERNAL_IPS_CHAIN.into(),
+            ChainSync {
+                base: Some(BaseChain {
+                    chain_type: ChainType::Nat,
+                    hook: InetHookNumber::PostRouting,
+                    priority: 100,
+                    policy: chain::ACCEPT,
+                }),
+                rules: external_ip_rules,
+                anon_sets: Vec::new(),
+            },
+        ),
+        (
+            SNAT_CHAIN.into(),
+            ChainSync {
+                base: Some(BaseChain {
+                    chain_type: ChainType::Nat,
+                    hook: InetHookNumber::PostRouting,
+                    priority: 999,
+                    policy: chain::ACCEPT,
+                }),
+                rules: snat_rules,
+                anon_sets: Vec::new(),
+            },
+        ),
+    ]);
+
+    TableSync { chains, sets }
 }
 
 /// `ip|ip6 saddr <saddr> snat to <ext>`.
@@ -815,55 +947,171 @@ mod tests {
         );
     }
 
-    /// A [`test_harness::System`] rendering the external-IP
-    /// `wireguard-external-ips` chain as pure netlink messages.
+    fn masq_pod_cidrs() -> Vec<IpCidr> {
+        ["10.244.0.0/24", "fd00::/64"]
+            .into_iter()
+            .map(|cidr| cidr.parse().expect("cidr"))
+            .collect()
+    }
+
+    #[test]
+    fn masquerade_defaults_true_and_can_be_disabled() {
+        let default: Config = serde_yaml::from_str("{}").expect("config");
+        assert!(default.masquerade);
+
+        let disabled: Config = serde_yaml::from_str("masquerade: false").expect("config");
+        assert!(!disabled.masquerade);
+    }
+
+    #[test]
+    fn masq_ranges_are_split_by_family() {
+        let cidrs = masq_pod_cidrs();
+
+        assert_eq!(
+            pod_ranges4(&cidrs),
+            vec![Ipv4Addr::new(10, 244, 0, 0)..=Ipv4Addr::new(10, 244, 0, 255)]
+        );
+        assert_eq!(
+            pod_ranges6(&cidrs),
+            vec![
+                "fd00::".parse::<Ipv6Addr>().expect("ip")
+                    ..="fd00:0:0:0:ffff:ffff:ffff:ffff"
+                        .parse::<Ipv6Addr>()
+                        .expect("ip")
+            ]
+        );
+    }
+
+    fn external_ip_entries() -> Vec<ExternalIpSnat> {
+        vec![
+            (
+                "10.244.0.5".parse().expect("ip"),
+                "203.0.113.5".parse().expect("ip"),
+            ),
+            (
+                "fd00::1".parse().expect("ip"),
+                "2001:db8::5".parse().expect("ip"),
+            ),
+        ]
+    }
+
+    /// The opt-out renders the same base chains and sets, but no snat rules.
+    #[test]
+    fn masq_opt_out_emits_no_rules() {
+        let cidrs = masq_pod_cidrs();
+
+        let enabled = render_connectivity_table(7, true, &cidrs, &[]);
+        let disabled = render_connectivity_table(7, false, &cidrs, &[]);
+
+        assert_eq!(enabled.chains[SNAT_CHAIN].rules.len(), 6);
+        assert!(disabled.chains[SNAT_CHAIN].rules.is_empty());
+        assert_eq!(enabled.chains[EXTERNAL_IPS_CHAIN].rules.len(), 1);
+        assert_eq!(disabled.chains[EXTERNAL_IPS_CHAIN].rules.len(), 1);
+    }
+
+    /// A [`test_harness::System`] driving the connectivity table through a
+    /// [`TableState`], like the watch loop does.
+    struct MasqSystem {
+        enabled: bool,
+        state: TableState,
+    }
+
+    impl crate::nftables::test_harness::System for MasqSystem {
+        fn new(table: String) -> Self {
+            Self {
+                enabled: true,
+                state: TableState::new(table),
+            }
+        }
+
+        fn custom(&mut self, id: usize) {
+            self.enabled = id != 1;
+        }
+
+        async fn apply(&mut self, _table: &str) {
+            self.state
+                .update(render_connectivity_table(
+                    7,
+                    self.enabled,
+                    &masq_pod_cidrs(),
+                    &[],
+                ))
+                .await
+                .expect("apply connectivity table");
+        }
+    }
+
+    /// The old code-managed external-IP chain is deleted from the `knls` table.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
+    #[tokio::test]
+    async fn legacy_external_ips_chain_is_removed() {
+        let table = "knls-test-legacy-ext";
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "inet", table])
+            .stderr(std::process::Stdio::null())
+            .status();
+        crate::nftables::apply_script(format!(
+            "table inet {table} {{\n\
+             chain wireguard-external-ips {{\n\
+             type nat hook postrouting priority srcnat; policy accept;\n\
+             }}\n\
+             }}"
+        ))
+        .await
+        .expect("create legacy chain");
+
+        remove_legacy_external_ips_chain(table).await;
+
+        let listed = std::process::Command::new("nft")
+            .args(["list", "chain", "inet", table, "wireguard-external-ips"])
+            .output()
+            .expect("nft");
+        assert!(!listed.status.success(), "legacy chain still exists");
+
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "inet", table])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// Golden test for the pod-egress masquerade chain, including the opt-out.
+    ///
+    /// Requires `CAP_NET_ADMIN`; run with `sudo -E cargo test -- --ignored`.
+    #[ignore = "requires CAP_NET_ADMIN and a real kernel"]
+    #[tokio::test]
+    async fn masq_golden() {
+        crate::nftables::test_harness::golden_dir::<MasqSystem>(
+            "test_assets/golden-nftables/wireguard-masq",
+            "knls-test-wg-masq-",
+        )
+        .await;
+    }
+
+    /// A [`test_harness::System`] rendering the external-IP snat chain through
+    /// the same connectivity table.
     struct ExternalIpsSystem {
-        table: String,
+        state: TableState,
     }
 
     impl crate::nftables::test_harness::System for ExternalIpsSystem {
         fn new(table: String) -> Self {
-            Self { table }
+            Self {
+                state: TableState::new(table),
+            }
         }
 
-        fn render(&mut self) -> Vec<crate::netlink::netfilter::Group> {
-            let mut chain = Chain::new(&self.table, "wireguard-external-ips");
-
-            chain.push(vec![
-                rules::meta(MetaKey::Oif, Register::Reg1),
-                rules::eq(Register::Reg1, 7u32.to_ne_bytes().to_vec()),
-                rules::verdict(Verdict::Return),
-            ]);
-            chain.push_commented(
-                snat_rule(
-                    "10.0.0.1".parse().expect("ip"),
-                    "203.0.113.5".parse().expect("ip"),
-                ),
-                Some("default/pod"),
-            );
-            chain.push_commented(
-                snat_rule(
-                    "2001:db8::1".parse().expect("ip"),
-                    "fd00::1".parse().expect("ip"),
-                ),
-                Some("default/pod6"),
-            );
-
-            [
-                table::ensure(&self.table),
-                chain.create(),
-                chain.delete(),
-                chain.create_base_with(
-                    ChainType::Nat,
-                    InetHookNumber::PostRouting,
-                    100,
-                    chain::ACCEPT,
-                ),
-            ]
-            .into_iter()
-            .chain(chain.rules().iter().cloned())
-            .map(crate::netlink::netfilter::Group::from)
-            .collect()
+        async fn apply(&mut self, _table: &str) {
+            self.state
+                .update(render_connectivity_table(
+                    7,
+                    false,
+                    &masq_pod_cidrs(),
+                    &external_ip_entries(),
+                ))
+                .await
+                .expect("apply connectivity table");
         }
     }
 

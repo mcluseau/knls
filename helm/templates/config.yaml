@@ -39,18 +39,15 @@ data:
 {{-     if .host_ports}}
       host_ports: true
 {{-     end}}
+      masquerade: {{ .masquerade }}
       on_create:
       - !nft_chain
         table: knls
         chain: wireguard
-        # about `ct status dnat return`:
-        # Leave service traffic alone: the proxy already decided the source
-        # (e.g. the `Local` external-policy short-circuit keeps the local node
-        # address so the backend can reply directly).
+        # Connectivity's masquerade lives in the `knls-connectivity` table now.
+        # Recreate this config-owned chain empty so an upgrade cleans it up.
         rules: |-
-          type nat hook postrouting priority 999; policy accept;
-          ct status dnat return
-          fib saddr type local oif {{ .ifname |quote }} masquerade
+          # empty; masquerade lives in the knls-connectivity table
 {{-   end }}{{ end }}
 {{- end }}
 {{- if .Values.hw_labels}}

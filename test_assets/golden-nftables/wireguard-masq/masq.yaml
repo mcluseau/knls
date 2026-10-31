@@ -1,0 +1,86 @@
+# Connectivity table: pod egress masquerade, with the (empty) external-IP chain.
+# Local pods and pods reached over `kwg` keep their source; everything else is
+# masqueraded. `!custom 1` disables the snat rules while keeping the chains/sets.
+- !verify |
+    set local_pods4 {
+        type ipv4_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { 10.244.0.0/24 }
+    }
+
+    set local_pods6 {
+        type ipv6_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { fd00::/64 }
+    }
+
+    chain external-ips {
+        type nat hook postrouting priority srcnat; policy accept;
+        oif 7 return
+    }
+
+    chain snat {
+        type nat hook postrouting priority 999; policy accept;
+        ip saddr @local_pods4 oif 7 return
+        ip saddr @local_pods4 ip daddr @local_pods4 return
+        ip saddr @local_pods4 masquerade
+        ip6 saddr @local_pods6 oif 7 return
+        ip6 saddr @local_pods6 ip6 daddr @local_pods6 return
+        ip6 saddr @local_pods6 masquerade
+    }
+- !custom 1
+- !verify |
+    set local_pods4 {
+        type ipv4_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { 10.244.0.0/24 }
+    }
+
+    set local_pods6 {
+        type ipv6_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { fd00::/64 }
+    }
+
+    chain external-ips {
+        type nat hook postrouting priority srcnat; policy accept;
+        oif 7 return
+    }
+
+    chain snat {
+        type nat hook postrouting priority 999; policy accept;
+    }
+- !custom 0
+- !verify |
+    set local_pods4 {
+        type ipv4_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { 10.244.0.0/24 }
+    }
+
+    set local_pods6 {
+        type ipv6_addr
+        flags interval
+        comment "local pod CIDRs"
+        elements = { fd00::/64 }
+    }
+
+    chain external-ips {
+        type nat hook postrouting priority srcnat; policy accept;
+        oif 7 return
+    }
+
+    chain snat {
+        type nat hook postrouting priority 999; policy accept;
+        ip saddr @local_pods4 oif 7 return
+        ip saddr @local_pods4 ip daddr @local_pods4 return
+        ip saddr @local_pods4 masquerade
+        ip6 saddr @local_pods6 oif 7 return
+        ip6 saddr @local_pods6 ip6 daddr @local_pods6 return
+        ip6 saddr @local_pods6 masquerade
+    }
